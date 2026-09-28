@@ -83,7 +83,9 @@ class TrackerNode(Node):
         :param msg: Image; The image message.
         """
         image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        ret, track_result = self.tracker.track(image, log_prefix="Track Thread")
+        ret, track_result = self.tracker.track(
+            image, header=msg.header, log_prefix="Track Thread"
+        )
         if ret:
             frame_msg, keyframe_msgs = track_result
             for keyframe_msg in keyframe_msgs:

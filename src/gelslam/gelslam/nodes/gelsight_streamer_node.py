@@ -70,11 +70,11 @@ class GelSightStreamerNode(Node):
         )
         # Flag to control the streaming thread
         self.running = True
+        # Initialize publishers before starting the streaming thread.
+        self.image_pub = self.create_publisher(Image, "image", 10)
         # Start the image streaming thread
         self.stream_thread = threading.Thread(target=self.stream_images)
         self.stream_thread.start()
-        # Initialize publishers
-        self.image_pub = self.create_publisher(Image, "image", 10)
 
     def stream_images(self):
         """
@@ -84,6 +84,8 @@ class GelSightStreamerNode(Node):
             image = self.device.get_image()
             self.video_writer.write(image)
             image_msg = self.bridge.cv2_to_imgmsg(image, encoding="bgr8")
+            image_msg.header.stamp = self.get_clock().now().to_msg()
+            image_msg.header.frame_id = "gelsight"
             if self.context.ok():
                 self.image_pub.publish(image_msg)
 

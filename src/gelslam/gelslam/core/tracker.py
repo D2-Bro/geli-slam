@@ -1,5 +1,6 @@
 import os
 import pickle
+from enum import Enum
 
 import cv2
 import numpy as np
@@ -9,6 +10,14 @@ from normalflow.registration import LoseTrackError, normalflow
 from normalflow.utils import Frame
 
 from gelslam.core.frame import create_frame_msg, create_keyframe_msg
+
+
+class TrackingMode(Enum):
+    """Tactile/IMU lifecycle states for the tracker."""
+
+    CONTACT_TRACKING = "contact_tracking"
+    NO_CONTACT_COASTING = "no_contact_coasting"
+    REACQUIRE = "reacquire"
 
 
 class Tracker:
@@ -42,9 +51,13 @@ class Tracker:
         self.prev_is_keyframe_flag = False
         self.ref_T_prev = np.eye(4, dtype=np.float32)
         self.prev_frame = None
+        self.prev_header = None
         self.curr_kid = -1
         self.ref_frame = None
+        self.ref_header = None
         self.curr_fid = -1
+        # IMU propagation will use this lifecycle once imu_config.enabled is true.
+        self.tracking_mode = TrackingMode.NO_CONTACT_COASTING
 
     def save(self, save_dir):
         """
@@ -78,13 +91,21 @@ class Tracker:
         instance.bridge = CvBridge()
         instance.recon = Reconstructor(calib_model_path)
         instance.recon.load_bg(instance.bg_image)
+        # Preserve compatibility with tracker states saved before timestamping.
+        if not hasattr(instance, "prev_header"):
+            instance.prev_header = None
+        if not hasattr(instance, "ref_header"):
+            instance.ref_header = None
+        if not hasattr(instance, "tracking_mode"):
+            instance.tracking_mode = TrackingMode.NO_CONTACT_COASTING
         return instance
 
-    def track(self, image, log_prefix="Track"):
+    def track(self, image, header=None, log_prefix="Track"):
         """
         Tracks the tactile image.
 
         :param image: np.ndarray; The tactile image.
+        :param header: std_msgs.msg.Header; Source image header, if available.
         :param log_prefix: str; The prefix for logging.
         :return: (bool, tuple or None);
             - bool: Validity of the result. Returns False if collecting background or not in contact.
@@ -147,11 +168,13 @@ class Tracker:
             if not frame.is_contacted:
                 self.logger.info("%s -- Skip Frame: Not in contact" % log_prefix)
                 self.prev_in_contact_flag = False
+                self.tracking_mode = TrackingMode.NO_CONTACT_COASTING
                 return False, None
             else:
                 self.curr_fid += 1
                 keyframe_msgs = []
                 if not self.prev_in_contact_flag:
+                    self.tracking_mode = TrackingMode.REACQUIRE
                     self.logger.info(
                         "%s -- New Trial: New contact initiated, keyframe ID: %d"
                         % (log_prefix, self.curr_kid + 1)
@@ -165,6 +188,7 @@ class Tracker:
                         fid=self.curr_fid,
                         is_new_trial=True,
                         ref_T_curr=np.eye(4, dtype=np.float32),
+                        header=header,
                     )
                     keyframe_msgs.append(keyframe_msg)
                     # Update tracker state
@@ -172,7 +196,10 @@ class Tracker:
                     self.prev_is_keyframe_flag = True
                     self.ref_T_prev = np.eye(4, dtype=np.float32)
                     self.prev_frame = frame
+                    self.prev_header = header
                     self.ref_frame = frame
+                    self.ref_header = header
+                    self.tracking_mode = TrackingMode.CONTACT_TRACKING
                 else:
                     try:
                         curr_T_ref = normalflow(
@@ -194,6 +221,8 @@ class Tracker:
                         self.prev_is_keyframe_flag = False
                         self.ref_T_prev = np.linalg.inv(curr_T_ref)
                         self.prev_frame = frame
+                        self.prev_header = header
+                        self.tracking_mode = TrackingMode.CONTACT_TRACKING
                         self.logger.info(
                             "%s -- Regular Frame: frame ID: %d"
                             % (log_prefix, self.curr_fid)
@@ -214,6 +243,7 @@ class Tracker:
                                 fid=self.curr_fid,
                                 is_new_trial=True,
                                 ref_T_curr=np.eye(4, dtype=np.float32),
+                                header=header,
                             )
                             keyframe_msgs.append(keyframe_msg)
                             # Update tracker state
@@ -221,7 +251,10 @@ class Tracker:
                             self.prev_is_keyframe_flag = True
                             self.ref_T_prev = np.eye(4, dtype=np.float32)
                             self.prev_frame = frame
+                            self.prev_header = header
                             self.ref_frame = frame
+                            self.ref_header = header
+                            self.tracking_mode = TrackingMode.CONTACT_TRACKING
                         else:
                             self.logger.info(
                                 "%s -- New Keyframe, keyframe ID: %d"
@@ -236,6 +269,7 @@ class Tracker:
                                 fid=self.curr_fid - 1,
                                 is_new_trial=False,
                                 ref_T_curr=self.ref_T_prev,
+                                header=self.prev_header,
                             )
                             keyframe_msgs.append(keyframe_msg)
                             # Update tracker state
@@ -243,6 +277,7 @@ class Tracker:
                             self.prev_is_keyframe_flag = True
                             self.ref_T_prev = np.eye(4, dtype=np.float32)
                             self.ref_frame = self.prev_frame
+                            self.ref_header = self.prev_header
                             # Check if the current frame can be tracked relative to the new keyframe
                             try:
                                 curr_T_ref = normalflow(
@@ -264,6 +299,8 @@ class Tracker:
                                 self.prev_is_keyframe_flag = False
                                 self.ref_T_prev = np.linalg.inv(curr_T_ref)
                                 self.prev_frame = frame
+                                self.prev_header = header
+                                self.tracking_mode = TrackingMode.CONTACT_TRACKING
                                 self.logger.info(
                                     "%s -- Regular Frame: frame ID: %d"
                                     % (log_prefix, self.curr_fid)
@@ -283,6 +320,7 @@ class Tracker:
                                     fid=self.curr_fid,
                                     is_new_trial=True,
                                     ref_T_curr=np.eye(4, dtype=np.float32),
+                                    header=header,
                                 )
                                 keyframe_msgs.append(keyframe_msg)
                                 # Update tracker state
@@ -290,7 +328,10 @@ class Tracker:
                                 self.prev_is_keyframe_flag = True
                                 self.ref_T_prev = np.eye(4, dtype=np.float32)
                                 self.prev_frame = frame
+                                self.prev_header = header
                                 self.ref_frame = frame
+                                self.ref_header = header
+                                self.tracking_mode = TrackingMode.CONTACT_TRACKING
 
                 # Create current frame message
                 frame_msg = create_frame_msg(
@@ -299,6 +340,7 @@ class Tracker:
                     fid=self.curr_fid,
                     ref_kid=self.curr_kid,
                     ref_T_curr=self.ref_T_prev,
+                    header=header,
                 )
 
                 return True, (frame_msg, keyframe_msgs)

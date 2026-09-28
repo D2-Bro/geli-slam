@@ -15,6 +15,17 @@ device_config:
   # Calibration instruction: https://github.com/joehjhuang/gs_sdk/blob/master/calibration/README.md
   calibration_model_path: "../resources/example_calibration/model/nnmodel.pth"
 
+# IMU integration is disabled until an IMU is connected and calibrated. These
+# fields define the future ROS interface without changing tactile-only behavior.
+imu_config:
+  enabled: false
+  topic: "/imu/data"
+  frame_id: "imu_link"
+  gelsight_frame_id: "gelsight"
+  gravity_mps2: 9.81
+  # Fill with the calibrated 4x4 homogeneous transform before enabling IMU.
+  gelsight_T_imu: null
+
 # Configuration of how contact mask is thresholded
 contact_mask_config:
   color_dist_threshold: 15
@@ -33,4 +44,3 @@ gelslam_config:
     min_sift_inliers: 8
     scr_threshold: 0.3
     ccs_threshold: 0.7
-

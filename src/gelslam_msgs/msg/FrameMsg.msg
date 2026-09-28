@@ -1,5 +1,8 @@
 # FrameMsg.msg
 
+# Timestamp and source frame of the tactile image used for this frame.
+std_msgs/Header header
+
 # Height map (H, W) as an Image
 sensor_msgs/Image height_map
 # Contact mask (H, W) as an Image

@@ -5,7 +5,14 @@ from gelslam.utils import pointcloud2mesh
 from gelslam_msgs.msg import FrameMsg, KeyFrameMsg
 
 
-def create_keyframe_msg(bridge, frame, kid, fid, is_new_trial, ref_T_curr):
+def _copy_header(message, header):
+    """Copy a ROS header when a source image header is available."""
+    if header is not None:
+        message.header.stamp = header.stamp
+        message.header.frame_id = header.frame_id
+
+
+def create_keyframe_msg(bridge, frame, kid, fid, is_new_trial, ref_T_curr, header=None):
     """
     Creates a KeyFrameMsg from a Frame object.
 
@@ -15,9 +22,11 @@ def create_keyframe_msg(bridge, frame, kid, fid, is_new_trial, ref_T_curr):
     :param fid: int; Frame ID.
     :param is_new_trial: bool; Flag if this is a new trial.
     :param ref_T_curr: np.ndarray; Transformation from current to reference.
+    :param header: std_msgs.msg.Header; Source image header, if available.
     :return: KeyFrameMsg; The keyframe message.
     """
     keyframe_msg = KeyFrameMsg()
+    _copy_header(keyframe_msg, header)
     keyframe_msg.height_map = bridge.cv2_to_imgmsg(frame.H, encoding="32FC1")
     keyframe_msg.contact_mask = bridge.cv2_to_imgmsg(
         frame.C.astype(np.uint8), encoding="8UC1"
@@ -31,7 +40,7 @@ def create_keyframe_msg(bridge, frame, kid, fid, is_new_trial, ref_T_curr):
     return keyframe_msg
 
 
-def create_frame_msg(bridge, frame, fid, ref_kid, ref_T_curr):
+def create_frame_msg(bridge, frame, fid, ref_kid, ref_T_curr, header=None):
     """
     Creates a FrameMsg from a Frame object.
 
@@ -40,9 +49,11 @@ def create_frame_msg(bridge, frame, fid, ref_kid, ref_T_curr):
     :param fid: int; Frame ID.
     :param ref_kid: int; Reference Keyframe ID.
     :param ref_T_curr: np.ndarray; Transformation from current to reference.
+    :param header: std_msgs.msg.Header; Source image header, if available.
     :return: FrameMsg; The frame message.
     """
     frame_msg = FrameMsg()
+    _copy_header(frame_msg, header)
     frame_msg.height_map = bridge.cv2_to_imgmsg(frame.H, encoding="32FC1")
     frame_msg.contact_mask = bridge.cv2_to_imgmsg(
         frame.C.astype(np.uint8), encoding="8UC1"

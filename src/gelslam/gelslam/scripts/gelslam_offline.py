@@ -10,6 +10,7 @@ import numpy as np
 import open3d as o3d
 import yaml
 from cv_bridge import CvBridge
+from std_msgs.msg import Header
 
 from gelslam.core.coverage_graph import CoverageGraph, create_visible_coverage_graph_msg
 from gelslam.core.frame import center_of_frame_msg, frame_msg2mesh, pose_of_frame_msg
@@ -79,6 +80,7 @@ def main():
     # Load tactile video
     data_dir = args.data_dir
     cap = cv2.VideoCapture(os.path.join(data_dir, "gelsight.avi"))
+    fps = cap.get(cv2.CAP_PROP_FPS) or config["device_config"]["framerate"]
     images = []
     while cap.isOpened():
         ret, image = cap.read()
@@ -109,9 +111,14 @@ def main():
         vis.create_window()
 
     # Loop through all tactile images
-    for image in images:
+    for frame_index, image in enumerate(images):
         # Track the new frame
-        ret, track_result = tracker.track(image, log_prefix="Track")
+        timestamp_ns = round(frame_index * 1_000_000_000 / fps)
+        header = Header()
+        header.stamp.sec = timestamp_ns // 1_000_000_000
+        header.stamp.nanosec = timestamp_ns % 1_000_000_000
+        header.frame_id = "gelsight"
+        ret, track_result = tracker.track(image, header=header, log_prefix="Track")
         if not ret:
             continue
         frame_msg, keyframe_msgs = track_result

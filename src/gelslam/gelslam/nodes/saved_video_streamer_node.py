@@ -33,6 +33,7 @@ class SavedVideoStreamerNode(Node):
         self.image_pub = self.create_publisher(Image, "image", 10)
         # Create timer to publish images at the correct FPS
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25
+        self.frame_index = 0
         self.timer = self.create_timer(1.0 / self.fps, self.publish_image)
         # The logger
         self.logger = Logger(ros_logger=self.get_logger())
@@ -45,6 +46,11 @@ class SavedVideoStreamerNode(Node):
         ret, image = self.cap.read()
         if ret:
             image_msg = self.bridge.cv2_to_imgmsg(image, encoding="bgr8")
+            timestamp_ns = round(self.frame_index * 1_000_000_000 / self.fps)
+            image_msg.header.stamp.sec = timestamp_ns // 1_000_000_000
+            image_msg.header.stamp.nanosec = timestamp_ns % 1_000_000_000
+            image_msg.header.frame_id = "gelsight"
+            self.frame_index += 1
             self.image_pub.publish(image_msg)
         else:
             self.logger.info("Video stream ended")
