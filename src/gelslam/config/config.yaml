@@ -15,14 +15,15 @@ device_config:
   # Calibration instruction: https://github.com/joehjhuang/gs_sdk/blob/master/calibration/README.md
   calibration_model_path: "../resources/example_calibration/model/nnmodel.pth"
 
-# IMU integration is disabled until an IMU is connected and calibrated. These
-# fields define the future ROS interface without changing tactile-only behavior.
+# Enable subscription and buffering of calibrated IMU measurements. Pose
+# propagation remains disabled until the extrinsic and clock offset are known.
 imu_config:
-  enabled: false
+  enabled: true
   topic: "/imu/data"
-  frame_id: "imu_link"
+  frame_id: "ebimu_link"
   gelsight_frame_id: "gelsight"
   gravity_mps2: 9.81
+  buffer_max_samples: 6000
   # Fill with the calibrated 4x4 homogeneous transform before enabling IMU.
   gelsight_T_imu: null
 

@@ -10,6 +10,7 @@ from normalflow.registration import LoseTrackError, normalflow
 from normalflow.utils import Frame
 
 from gelslam.core.frame import create_frame_msg, create_keyframe_msg
+from gelslam.core.inertial import ImuBuffer, ImuSample
 
 
 class TrackingMode(Enum):
@@ -38,6 +39,15 @@ class Tracker:
         self.ppmm = config["device_config"]["ppmm"]
         self.contact_mask_config = config["contact_mask_config"]
         self.track_config = config["gelslam_config"]["track_config"]
+        self.imu_config = config.get("imu_config", {})
+        self.imu_enabled = bool(self.imu_config.get("enabled", False))
+        self.imu_buffer = (
+            ImuBuffer(
+                max_samples=int(self.imu_config.get("buffer_max_samples", 6000))
+            )
+            if self.imu_enabled
+            else None
+        )
         self.bridge = CvBridge()
         # Initialize reconstructor
         self.recon = Reconstructor(calib_model_path)
@@ -56,8 +66,25 @@ class Tracker:
         self.ref_frame = None
         self.ref_header = None
         self.curr_fid = -1
-        # IMU propagation will use this lifecycle once imu_config.enabled is true.
+        # IMU propagation will use this lifecycle after extrinsic/time calibration.
         self.tracking_mode = TrackingMode.NO_CONTACT_COASTING
+
+    def add_imu_sample(self, sample):
+        """Buffer one calibrated IMU sample received by the ROS tracker node.
+
+        Samples remain independent of tactile tracking until camera/IMU timing
+        and the IMU-to-GelSight transform are calibrated.  ``False`` means the
+        timestamp was duplicate or out of order and the caller safely dropped it.
+        """
+        if not self.imu_enabled or self.imu_buffer is None:
+            return False
+        if not isinstance(sample, ImuSample):
+            raise TypeError("sample must be an ImuSample")
+        try:
+            self.imu_buffer.add(sample)
+        except ValueError:
+            return False
+        return True
 
     def save(self, save_dir):
         """
@@ -98,6 +125,18 @@ class Tracker:
             instance.ref_header = None
         if not hasattr(instance, "tracking_mode"):
             instance.tracking_mode = TrackingMode.NO_CONTACT_COASTING
+        if not hasattr(instance, "imu_config"):
+            instance.imu_config = {}
+        if not hasattr(instance, "imu_enabled"):
+            instance.imu_enabled = False
+        if not hasattr(instance, "imu_buffer"):
+            instance.imu_buffer = (
+                ImuBuffer(
+                    max_samples=int(instance.imu_config.get("buffer_max_samples", 6000))
+                )
+                if instance.imu_enabled
+                else None
+            )
         return instance
 
     def track(self, image, header=None, log_prefix="Track"):

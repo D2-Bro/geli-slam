@@ -9,8 +9,9 @@ import rclpy
 import yaml
 from cv_bridge import CvBridge
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, Imu
 
+from gelslam.core.inertial import ImuSample
 from gelslam.core.tracker import Tracker
 from gelslam.utils import Logger
 from gelslam_msgs.msg import FrameMsg, KeyFrameMsg
@@ -70,6 +71,21 @@ class TrackerNode(Node):
 
         # Initialize subscribers
         self.create_subscription(Image, "image", self.image_callback, 1)
+        self.imu_sub = None
+        self._imu_dropped_samples = 0
+        if self.tracker.imu_enabled:
+            imu_config = config["imu_config"]
+            self.imu_frame_id = imu_config.get("frame_id", "")
+            self.imu_sub = self.create_subscription(
+                Imu,
+                imu_config.get("topic", "/imu/data"),
+                self.imu_callback,
+                1000,
+            )
+            self.get_logger().info(
+                "Buffering IMU samples from %s (frame_id=%s)"
+                % (imu_config.get("topic", "/imu/data"), self.imu_frame_id)
+            )
 
         # Initialize publishers
         self.keyframe_pub = self.create_publisher(KeyFrameMsg, "keyframe", 10)
@@ -93,6 +109,43 @@ class TrackerNode(Node):
                 time.sleep(0.001)
             self.frame_pub.publish(frame_msg)
             time.sleep(0.001)
+
+    def imu_callback(self, msg):
+        """Store calibrated gyro/accel measurements for future preintegration."""
+        stamp = msg.header.stamp
+        timestamp = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+        if timestamp <= 0.0:
+            self._imu_dropped_samples += 1
+            if self._imu_dropped_samples == 1:
+                self.get_logger().warning("Dropping IMU sample with an unset header stamp")
+            return
+        if self.imu_frame_id and msg.header.frame_id != self.imu_frame_id:
+            self._imu_dropped_samples += 1
+            if self._imu_dropped_samples == 1:
+                self.get_logger().warning(
+                    "Dropping IMU sample from frame_id=%s; expected %s"
+                    % (msg.header.frame_id, self.imu_frame_id)
+                )
+            return
+        sample = ImuSample(
+            timestamp=timestamp,
+            acceleration=(
+                msg.linear_acceleration.x,
+                msg.linear_acceleration.y,
+                msg.linear_acceleration.z,
+            ),
+            angular_velocity=(
+                msg.angular_velocity.x,
+                msg.angular_velocity.y,
+                msg.angular_velocity.z,
+            ),
+        )
+        if not self.tracker.add_imu_sample(sample):
+            self._imu_dropped_samples += 1
+            if self._imu_dropped_samples == 1:
+                self.get_logger().warning(
+                    "Dropping duplicate or out-of-order IMU timestamp"
+                )
 
     def destroy_node(self):
         """
