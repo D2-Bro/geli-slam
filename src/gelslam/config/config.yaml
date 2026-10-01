@@ -15,8 +15,8 @@ device_config:
   # Calibration instruction: https://github.com/joehjhuang/gs_sdk/blob/master/calibration/README.md
   calibration_model_path: "../resources/example_calibration/model/nnmodel.pth"
 
-# Enable subscription and buffering of calibrated IMU measurements. Pose
-# propagation remains disabled until the extrinsic and clock offset are known.
+# Enable subscription and buffering of calibrated IMU measurements. IMU-only
+# coasting activates only after gelsight_T_imu is calibrated and supplied.
 imu_config:
   enabled: true
   topic: "/imu/data"
@@ -24,7 +24,8 @@ imu_config:
   gelsight_frame_id: "gelsight"
   gravity_mps2: 9.81
   buffer_max_samples: 6000
-  # Fill with the calibrated 4x4 homogeneous transform before enabling IMU.
+  # 4x4 T_GI: maps IMU coordinates into GelSight chart coordinates.  Keep null
+  # until the physical mounting calibration and camera/IMU time alignment are known.
   gelsight_T_imu: null
 
 # Configuration of how contact mask is thresholded

@@ -12,7 +12,10 @@ setup(
         ("share/" + package_name + "/launch", ["launch/bag_replay_launch.py"]),
         ("share/" + package_name + "/launch", ["launch/live_replay_demo_launch.py"]),
         ("share/" + package_name + "/launch", ["launch/live_demo_launch.py"]),
-        ("share/" + package_name + "/config", ["config/config.yaml"]),
+        (
+            "share/" + package_name + "/config",
+            ["config/config.yaml", "config/bag_simulation_config.yaml"],
+        ),
         (
             "share/" + package_name + "/resources/example_calibration/model",
             ["resources/example_calibration/model/nnmodel.pth"],

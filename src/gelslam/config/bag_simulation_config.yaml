@@ -1,0 +1,39 @@
+# Configuration for the supplied simulated tactile/IMU ROS 2 bags.
+device_config:
+  device_name: "GelSight Mini simulation"
+  ppmm: 0.059
+  imgh: 240
+  imgw: 320
+  raw_imgh: 2464
+  raw_imgw: 3280
+  framerate: 20
+  calibration_model_path: "../resources/example_calibration/model/nnmodel.pth"
+
+imu_config:
+  enabled: true
+  topic: "/imu/data_raw"
+  frame_id: "imu_frame"
+  gelsight_frame_id: "virtual_depth_frame"
+  gravity_mps2: 9.80665
+  buffer_max_samples: 6000
+  # T_SI from the simulation handoff: IMU coordinates into tactile chart S.
+  gelsight_T_imu:
+    - [1.0, 0.0, 0.0, 0.0]
+    - [0.0, -1.0, 0.0, 0.0]
+    - [0.0, 0.0, -1.0, -0.040]
+    - [0.0, 0.0, 0.0, 1.0]
+
+contact_mask_config:
+  color_dist_threshold: 15
+  height_threshold: 0.2
+
+gelslam_config:
+  track_config:
+    contact_threshold: 500
+    scr_threshold: 0.3
+    ccs_threshold: 0.7
+  pose_graph_config:
+    coverage_graph_overlap_threshold: 50
+    min_sift_inliers: 8
+    scr_threshold: 0.3
+    ccs_threshold: 0.7

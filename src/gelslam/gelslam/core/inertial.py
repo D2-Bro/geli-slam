@@ -87,6 +87,60 @@ class ImuBuffer:
             if start_time <= sample.timestamp <= end_time
         )
 
+    def sample_at(self, timestamp):
+        """Return a measurement at ``timestamp``, linearly interpolating if needed.
+
+        Image and IMU clocks commonly do not land on exactly the same sample.
+        Returning ``None`` outside the buffered range keeps callers from
+        silently extrapolating an inertial measurement.
+        """
+        if not np.isfinite(timestamp):
+            raise ValueError("timestamp must be finite")
+        samples = tuple(self._samples)
+        if (
+            not samples
+            or timestamp < samples[0].timestamp
+            or timestamp > samples[-1].timestamp
+        ):
+            return None
+        for sample in samples:
+            if np.isclose(sample.timestamp, timestamp):
+                return ImuSample(timestamp, sample.acceleration, sample.angular_velocity)
+        for earlier, later in zip(samples, samples[1:]):
+            if earlier.timestamp < timestamp < later.timestamp:
+                ratio = (timestamp - earlier.timestamp) / (later.timestamp - earlier.timestamp)
+                return ImuSample(
+                    timestamp,
+                    earlier.acceleration + ratio * (later.acceleration - earlier.acceleration),
+                    earlier.angular_velocity
+                    + ratio * (later.angular_velocity - earlier.angular_velocity),
+                )
+        return None
+
+    def latest_at_or_before(self, timestamp):
+        """Return the newest received sample no later than ``timestamp``."""
+        if not np.isfinite(timestamp):
+            raise ValueError("timestamp must be finite")
+        for sample in reversed(self._samples):
+            if sample.timestamp <= timestamp:
+                return sample
+        return None
+
+    def samples_covering(self, start_time, end_time):
+        """Return samples spanning both interval endpoints without extrapolation."""
+        if end_time < start_time:
+            raise ValueError("end_time must not precede start_time")
+        start_sample = self.sample_at(start_time)
+        end_sample = self.sample_at(end_time)
+        if start_sample is None or end_sample is None:
+            return ()
+        interior = [
+            sample
+            for sample in self._samples
+            if start_time < sample.timestamp < end_time
+        ]
+        return (start_sample, *interior, end_sample)
+
     def __len__(self):
         return len(self._samples)
 

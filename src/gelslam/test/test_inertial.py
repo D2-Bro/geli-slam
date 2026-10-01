@@ -80,6 +80,21 @@ def test_buffer_rejects_duplicate_timestamps_and_returns_intervals():
         buffer.samples_between(1.0, 0.0)
 
 
+def test_buffer_interpolates_image_timestamp_boundaries_without_extrapolation():
+    buffer = ImuBuffer()
+    buffer.add(make_sample(0.0, acceleration=(0.0, 0.0, 9.81)))
+    buffer.add(make_sample(1.0, acceleration=(2.0, 0.0, 9.81)))
+
+    interpolated = buffer.sample_at(0.25)
+    assert np.allclose(interpolated.acceleration, np.array([0.5, 0.0, 9.81]))
+
+    covered = buffer.samples_covering(0.25, 0.75)
+    assert [sample.timestamp for sample in covered] == [0.25, 0.75]
+    assert buffer.latest_at_or_before(0.75).timestamp == 0.0
+    assert buffer.sample_at(-0.1) is None
+    assert buffer.sample_at(1.1) is None
+
+
 def test_propagator_returns_none_without_an_integration_interval():
     """No-contact coasting remains disabled when an IMU interval is incomplete."""
     assert InertialPropagator().propagate(make_state(), [make_sample(0.0)]) is None

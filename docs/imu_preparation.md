@@ -2,7 +2,9 @@
 
 The tracker node subscribes to `/imu/data` and buffers calibrated gyro/accel
 measurements as timestamped SI-unit `ImuSample` records. It does not yet add
-IMU factors to the pose graph or alter tactile frame poses from IMU propagation.
+IMU factors to the pose graph. When a calibrated `gelsight_T_imu` is present,
+it can dead-reckon the last tactile pose through a contact loss or a
+`LoseTrackError`; this is propagation-only, not an optimizer residual.
 
 The EBIMU publisher must use `frame_id:=ebimu_link`, which is the default in
 `ebimu_pkg`. Its `linear_acceleration` currently contains gravity (`<soa1>`),
@@ -24,7 +26,9 @@ ros2 run gelslam tracker_node --ros-args -p config_path:=/absolute/path/to/confi
 The first command changes the receiver from an intake-test profile to the ROS
 profile. The tracker logs `Buffering IMU samples` only after it has subscribed
 successfully; samples with an unset, mismatched, duplicate, or out-of-order
-header timestamp are dropped.
+header timestamp are dropped. Leave `gelsight_T_imu: null` until its physical
+mounting calibration is known: buffering remains active, but propagation stays
+disabled and the original new-trial fallback is retained.
 
 ## Tracking lifecycle
 
@@ -32,24 +36,44 @@ The tracker exposes the following lifecycle states:
 
 ```text
 CONTACT_TRACKING -> NO_CONTACT_COASTING -> REACQUIRE -> CONTACT_TRACKING
+                  \-> IMU_COASTING -----------------------------/
 ```
 
 While no tactile contact is available, there is no corrective tactile residual.
-The current implementation only buffers IMU data in this state. A later change
-will propagate the last corrected navigation state; it must not run an optimizer
-without an independent observation.
+With a calibrated transform, the tracker holds the last reliable tactile
+surface and publishes it at the propagated IMU pose. A tactile `LoseTrackError`
+uses the same path instead of immediately opening a new trial. On contact,
+normal-flow retries against the existing reference using the propagated pose as
+its initialization. A new trial is opened only when no valid IMU coast is
+available.
 
-On reacquisition, the preintegrated interval from the last contact keyframe to
-the new contact keyframe can be added to the backend together with the new
-tactile residual. Until that feature exists, the established new-trial fallback
-is unchanged.
+No IMU factor is inserted into the pose graph in this step. On reacquisition,
+a future backend can add a preintegrated IMU factor with the tactile residual.
 
 ## Timestamp contract
 
-`FrameMsg` and `KeyFrameMsg` carry the source tactile image header. Live frames
-use the node clock at image acquisition, and replay/offline frames use a stable
-frame-index/FPS timeline. Future IMU integration must use these timestamps to
-select samples in the interval between keyframes.
+`FrameMsg` and `KeyFrameMsg` carry the source tactile image header. IMU samples
+are linearly interpolated at a bracketing image timestamp when available. If
+DDS dispatches an image before the same-time IMU callback, the newest already
+received sample is used; this avoids a spurious new trial but may lag the image
+pose by one IMU period.
+
+## Simulation bag replay
+
+The supplied simulation bags use `/image` and `/imu/data_raw`. Use
+`config/bag_simulation_config.yaml`, which carries the simulation-only
+`T_SI` extrinsic, and play both observation topics:
+
+```bash
+ros2 launch gelslam bag_replay_launch.py \
+  config_path:=/home/dongjae/gelslam/src/gelslam/config/bag_simulation_config.yaml
+
+ros2 bag play /home/dongjae/dataset/GeLISLAM/fixture-rock-zigzag-gap-20260929-v1-gelslam-image/bag \
+  --clock 100 --topics /image /imu/data_raw
+```
+
+The simulation transform and noise are not a substitute for calibration of the
+physical EBIMU/GelSight rig.
 
 ## Hardware-dependent follow-up
 
