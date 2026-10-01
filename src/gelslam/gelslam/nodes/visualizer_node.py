@@ -44,7 +44,7 @@ class VisualizerNode(Node):
     """
 
     def __init__(self):
-        super().__init__("pose_graph_node")
+        super().__init__("visualizer_node")
         self.bridge = CvBridge()
         # Load the configuration
         self.declare_parameter("config_path", "")
