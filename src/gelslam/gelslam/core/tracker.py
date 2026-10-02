@@ -57,6 +57,15 @@ class Tracker:
         self.gelsight_T_imu = self._parse_gelsight_T_imu(
             self.imu_config.get("gelsight_T_imu")
         )
+        self.imu_frame_id = str(self.imu_config.get("frame_id", ""))
+        self.gelsight_frame_id = str(self.imu_config.get("gelsight_frame_id", ""))
+        self.static_tf_validation_config = self.imu_config.get(
+            "static_tf_validation", {}
+        )
+        self.static_tf_validation_enabled = bool(
+            self.static_tf_validation_config.get("enabled", False)
+        )
+        self.static_tf_validated = not self.static_tf_validation_enabled
         self.inertial_state = None
         self.inertial_propagator = None
         self.bridge = CvBridge()
@@ -101,7 +110,75 @@ class Tracker:
         return timestamp if timestamp > 0.0 else None
 
     def _imu_coasting_ready(self):
-        return self.gelsight_T_imu is not None and self.imu_buffer is not None
+        return (
+            self.gelsight_T_imu is not None
+            and self.imu_buffer is not None
+            and getattr(self, "static_tf_validated", True)
+        )
+
+    @staticmethod
+    def _config_vector(value, name):
+        """Return an optional finite three-vector from the IMU configuration."""
+        if value is None:
+            return None
+        vector = np.asarray(value, dtype=np.float64)
+        if vector.shape != (3,) or not np.all(np.isfinite(vector)):
+            raise ValueError(f"imu_config.{name} must be a finite three-vector")
+        return vector
+
+    def validate_static_transform(self, parent_frame, child_frame, translation, quaternion):
+        """Validate the replayed Gel-to-IMU static transform against config.
+
+        A transform mismatch makes raw accelerometer axes ambiguous, so IMU
+        propagation remains disabled rather than silently integrating in a
+        wrong frame.  This check is opt-in because live deployments may not
+        publish TF until their mount calibration is available.
+        """
+        if not self.static_tf_validation_enabled:
+            return None
+        if (
+            parent_frame != self.gelsight_frame_id
+            or child_frame != self.imu_frame_id
+        ):
+            return None
+        translation = self._config_vector(translation, "static_tf.translation")
+        quaternion = np.asarray(quaternion, dtype=np.float64)
+        if quaternion.shape != (4,) or not np.all(np.isfinite(quaternion)):
+            self.static_tf_validated = False
+            return False
+        norm = np.linalg.norm(quaternion)
+        if norm <= 1e-12:
+            self.static_tf_validated = False
+            return False
+        x, y, z, w = quaternion / norm
+        actual_rotation = np.array(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ]
+        )
+        expected_rotation = self.gelsight_T_imu[:3, :3]
+        translation_error = np.linalg.norm(
+            translation - self.gelsight_T_imu[:3, 3]
+        )
+        cosine = np.clip(
+            (np.trace(expected_rotation.T @ actual_rotation) - 1.0) / 2.0,
+            -1.0,
+            1.0,
+        )
+        rotation_error = np.arccos(cosine)
+        translation_tolerance = float(
+            self.static_tf_validation_config.get("translation_tolerance_m", 1e-6)
+        )
+        rotation_tolerance = float(
+            self.static_tf_validation_config.get("rotation_tolerance_rad", 1e-6)
+        )
+        self.static_tf_validated = (
+            translation_error <= translation_tolerance
+            and rotation_error <= rotation_tolerance
+        )
+        return self.static_tf_validated
 
     def _anchor_inertial_state(self, ref_T_gelsight, header, reset_reference=False):
         """Correct the navigation state with a successful tactile pose estimate.
@@ -125,23 +202,65 @@ class Tracker:
 
         ref_T_gelsight = np.asarray(ref_T_gelsight, dtype=np.float64)
         ref_T_imu = ref_T_gelsight @ self.gelsight_T_imu
-        previous_state = None if reset_reference else self.inertial_state
+        previous_state = self.inertial_state
+        navigation_previous_state = None if reset_reference else previous_state
         velocity = np.zeros(3, dtype=np.float64)
-        if previous_state is not None and timestamp > previous_state.timestamp:
-            velocity = (ref_T_imu[:3, 3] - previous_state.position) / (
-                timestamp - previous_state.timestamp
+        if (
+            navigation_previous_state is not None
+            and timestamp > navigation_previous_state.timestamp
+        ):
+            velocity = (ref_T_imu[:3, 3] - navigation_previous_state.position) / (
+                timestamp - navigation_previous_state.timestamp
             )
+        accel_bias = (
+            previous_state.accel_bias
+            if previous_state is not None
+            else self._config_vector(
+                self.imu_config.get("initial_accel_bias_mps2"),
+                "initial_accel_bias_mps2",
+            )
+        )
+        gyro_bias = (
+            previous_state.gyro_bias
+            if previous_state is not None
+            else self._config_vector(
+                self.imu_config.get("initial_gyro_bias_rps"),
+                "initial_gyro_bias_rps",
+            )
+        )
+        if accel_bias is None:
+            accel_bias = np.zeros(3, dtype=np.float64)
+        if gyro_bias is None:
+            gyro_bias = np.zeros(3, dtype=np.float64)
         self.inertial_state = InertialState(
             timestamp=sample.timestamp,
             rotation=ref_T_imu[:3, :3],
             position=ref_T_imu[:3, 3],
             velocity=velocity,
-            accel_bias=np.zeros(3),
-            gyro_bias=np.zeros(3),
+            accel_bias=accel_bias,
+            gyro_bias=gyro_bias,
         )
         if self.inertial_propagator is None or reset_reference:
             gravity_magnitude = float(self.imu_config.get("gravity_mps2", 9.81))
-            measured_gravity = ref_T_imu[:3, :3] @ sample.acceleration
+            gravity_window_s = float(
+                self.imu_config.get("gravity_initialization_window_s", 0.0)
+            )
+            samples = ()
+            if gravity_window_s > 0.0 and len(self.imu_buffer):
+                buffered_samples = self.imu_buffer.samples_between(0.0, timestamp)
+                first_timestamp = buffered_samples[0].timestamp
+                samples = self.imu_buffer.samples_between(
+                    first_timestamp,
+                    min(first_timestamp + gravity_window_s, timestamp),
+                )
+            measured_acceleration = (
+                np.mean([item.acceleration for item in samples], axis=0)
+                if samples
+                else sample.acceleration
+            )
+            measured_gravity = ref_T_imu[:3, :3] @ (
+                measured_acceleration - accel_bias
+            )
             norm = np.linalg.norm(measured_gravity)
             if norm <= 1e-9:
                 self.inertial_state = None

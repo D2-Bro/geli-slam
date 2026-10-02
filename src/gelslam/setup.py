@@ -14,7 +14,11 @@ setup(
         ("share/" + package_name + "/launch", ["launch/live_demo_launch.py"]),
         (
             "share/" + package_name + "/config",
-            ["config/config.yaml", "config/bag_simulation_config.yaml"],
+            [
+                "config/config.yaml",
+                "config/bag_simulation_config.yaml",
+                "config/gelslam_rviz.rviz",
+            ],
         ),
         (
             "share/" + package_name + "/resources/example_calibration/model",
@@ -35,6 +39,7 @@ setup(
             "tracker_node = gelslam.nodes.tracker_node:main",
             "pose_graph_node = gelslam.nodes.pose_graph_node:main",
             "visualizer_node = gelslam.nodes.visualizer_node:main",
+            "rviz_visualizer_node = gelslam.nodes.rviz_visualizer_node:main",
             "gelslam_offline = gelslam.scripts.gelslam_offline:main",
             "visualize_pose_graph = gelslam.scripts.visualize_pose_graph:main",
         ],

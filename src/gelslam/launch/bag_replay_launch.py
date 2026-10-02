@@ -30,6 +30,14 @@ def generate_launch_description():
     rendering_arg = DeclareLaunchArgument(
         "rendering", default_value="true", description="Start the Open3D visualizer"
     )
+    rviz_arg = DeclareLaunchArgument(
+        "rviz", default_value="true", description="Start RViz mesh and TF visualization"
+    )
+    publish_coverage_arg = DeclareLaunchArgument(
+        "publish_coverage",
+        default_value="true",
+        description="Publish pose-graph coverage meshes for a visualizer",
+    )
     skip_background_check_arg = DeclareLaunchArgument(
         "skip_background_check",
         default_value="true",
@@ -70,7 +78,7 @@ def generate_launch_description():
         parameters=[
             common_parameters,
             {
-                "rendering": LaunchConfiguration("rendering"),
+                "rendering": LaunchConfiguration("publish_coverage"),
                 "save_gelslam_states": LaunchConfiguration("save_states"),
             },
         ],
@@ -83,18 +91,43 @@ def generate_launch_description():
         parameters=[common_parameters],
         condition=IfCondition(LaunchConfiguration("rendering")),
     )
+    rviz_bridge_node = Node(
+        package="gelslam",
+        executable="rviz_visualizer_node",
+        name="rviz_visualizer_node",
+        output="screen",
+        parameters=[common_parameters],
+        condition=IfCondition(LaunchConfiguration("rviz")),
+    )
+    rviz_node = Node(
+        package="rviz2",
+        executable="rviz2",
+        name="rviz2",
+        output="screen",
+        arguments=[
+            "-d",
+            os.path.join(
+                get_package_share_directory("gelslam"), "config", "gelslam_rviz.rviz"
+            ),
+        ],
+        condition=IfCondition(LaunchConfiguration("rviz")),
+    )
 
     return LaunchDescription(
         [
             data_dir_arg,
             config_path_arg,
             rendering_arg,
+            rviz_arg,
+            publish_coverage_arg,
             skip_background_check_arg,
             save_states_arg,
             use_sim_time_arg,
             tracker_node,
             pose_graph_node,
             visualizer_node,
+            rviz_bridge_node,
+            rviz_node,
             RegisterEventHandler(
                 event_handler=OnProcessExit(
                     target_action=tracker_node,

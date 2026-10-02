@@ -48,6 +48,53 @@ def test_successful_tactile_anchor_can_coast_to_a_later_image_timestamp():
     )
 
 
+def test_simulation_biases_and_static_gravity_window_initialize_state():
+    """Simulation settings initialize bias without using a moving anchor sample."""
+    tracker = make_coasting_tracker()
+    tracker.imu_config.update(
+        {
+            "gravity_mps2": 9.80665,
+            "gravity_initialization_window_s": 0.5,
+            "initial_accel_bias_mps2": [0.003, -0.002, 0.004],
+            "initial_gyro_bias_rps": [0.0002, -0.0001, 0.00015],
+        }
+    )
+    tracker.imu_buffer = ImuBuffer()
+    tracker.imu_buffer.add(
+        ImuSample(0.5, (0.003, -0.002, 9.81065), (0.0, 0.0, 0.0))
+    )
+    tracker.imu_buffer.add(
+        ImuSample(1.0, (0.003, -0.002, 9.81065), (0.0, 0.0, 0.0))
+    )
+
+    assert tracker._anchor_inertial_state(np.eye(4), header(1.0), reset_reference=True)
+    assert np.allclose(tracker.inertial_state.accel_bias, [0.003, -0.002, 0.004])
+    assert np.allclose(tracker.inertial_state.gyro_bias, [0.0002, -0.0001, 0.00015])
+    assert np.allclose(tracker.inertial_propagator.gravity, [0.0, 0.0, -9.80665])
+
+
+def test_static_tf_validation_requires_the_configured_gel_to_imu_transform():
+    """A mismatched static TF must prevent unsafe IMU propagation."""
+    tracker = make_coasting_tracker()
+    tracker.gelsight_frame_id = "gel_frame"
+    tracker.imu_frame_id = "imu_frame"
+    tracker.static_tf_validation_enabled = True
+    tracker.static_tf_validation_config = {
+        "translation_tolerance_m": 1e-6,
+        "rotation_tolerance_rad": 1e-6,
+    }
+    tracker.static_tf_validated = False
+
+    assert tracker.validate_static_transform(
+        "gel_frame", "imu_frame", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
+    )
+    assert tracker._imu_coasting_ready()
+    assert not tracker.validate_static_transform(
+        "gel_frame", "imu_frame", (0.01, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
+    )
+    assert not tracker._imu_coasting_ready()
+
+
 def test_failed_tactile_update_keeps_the_existing_trial_when_imu_can_coast(
     monkeypatch,
 ):

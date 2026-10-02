@@ -69,8 +69,15 @@ ros2 launch gelslam bag_replay_launch.py \
   config_path:=/home/dongjae/gelslam/src/gelslam/config/bag_simulation_config.yaml
 
 ros2 bag play /home/dongjae/dataset/GeLISLAM/fixture-rock-zigzag-gap-20260929-v1-gelslam-image/bag \
-  --clock 100 --topics /image /imu/data_raw
+  --clock 100 --topics /image /imu/data_raw /tf_static
 ```
+
+The replay launch starts RViz by default.  For an RViz-only view (without the
+legacy Open3D window), add `rendering:=false`.  Its fixed frame is
+`gelslam_map`: gray is the pose-graph coverage mesh, red is the latest tactile
+patch, and the TF display shows `gelsight_estimate` with the configured
+`imu_estimate` child axis.  The IMU axis is the configured tactile-to-IMU
+extrinsic, not an independently estimated IMU orientation.
 
 The simulation transform and noise are not a substitute for calibration of the
 physical EBIMU/GelSight rig.

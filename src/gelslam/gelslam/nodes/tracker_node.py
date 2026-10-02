@@ -9,7 +9,9 @@ import rclpy
 import yaml
 from cv_bridge import CvBridge
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image, Imu
+from tf2_msgs.msg import TFMessage
 
 from gelslam.core.inertial import ImuSample
 from gelslam.core.tracker import Tracker
@@ -86,6 +88,35 @@ class TrackerNode(Node):
                 "Buffering IMU samples from %s (frame_id=%s)"
                 % (imu_config.get("topic", "/imu/data"), self.imu_frame_id)
             )
+            if self.tracker.static_tf_validation_enabled:
+                self._static_tf_validated_logged = False
+                self._static_tf_invalid_logged = False
+                tf_topic = self.tracker.static_tf_validation_config.get(
+                    "topic", "/tf_static"
+                )
+                # A live static-transform broadcaster is transient-local,
+                # while rosbag playback can offer the topic as volatile. Keep
+                # both compatible subscriptions alive so either source is
+                # validated before IMU propagation begins.
+                self.static_tf_subs = [
+                    self.create_subscription(
+                        TFMessage,
+                        tf_topic,
+                        self.static_tf_callback,
+                        QoSProfile(
+                            depth=1,
+                            durability=durability,
+                            reliability=ReliabilityPolicy.RELIABLE,
+                        ),
+                    )
+                    for durability in (
+                        DurabilityPolicy.TRANSIENT_LOCAL,
+                        DurabilityPolicy.VOLATILE,
+                    )
+                ]
+                self.get_logger().info(
+                    "Waiting to validate IMU extrinsic on %s" % tf_topic
+                )
 
         # Initialize publishers
         self.keyframe_pub = self.create_publisher(KeyFrameMsg, "keyframe", 10)
@@ -146,6 +177,34 @@ class TrackerNode(Node):
                 self.get_logger().warning(
                     "Dropping duplicate or out-of-order IMU timestamp"
                 )
+
+    def static_tf_callback(self, msg):
+        """Accept IMU coasting only after the configured static TF matches."""
+        for transform in msg.transforms:
+            result = self.tracker.validate_static_transform(
+                transform.header.frame_id,
+                transform.child_frame_id,
+                (
+                    transform.transform.translation.x,
+                    transform.transform.translation.y,
+                    transform.transform.translation.z,
+                ),
+                (
+                    transform.transform.rotation.x,
+                    transform.transform.rotation.y,
+                    transform.transform.rotation.z,
+                    transform.transform.rotation.w,
+                ),
+            )
+            if result is True and not self._static_tf_validated_logged:
+                self.get_logger().info("Validated configured GelSight-to-IMU static TF")
+                self._static_tf_validated_logged = True
+            elif result is False and not self._static_tf_invalid_logged:
+                self.get_logger().error(
+                    "Configured GelSight-to-IMU transform disagrees with /tf_static; "
+                    "IMU coasting is disabled"
+                )
+                self._static_tf_invalid_logged = True
 
     def destroy_node(self):
         """

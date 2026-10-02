@@ -7,14 +7,23 @@ device_config:
   raw_imgh: 2464
   raw_imgw: 3280
   framerate: 20
-  calibration_model_path: "../resources/example_calibration/model/nnmodel.pth"
+  # Simulation-only MLP supplied with the paired tactile/IMU bag.
+  # This is intentionally separate from the example real-Mini calibration.
+  calibration_model_path: "../../../ckpt/nnmodel.pth"
 
 imu_config:
   enabled: true
   topic: "/imu/data_raw"
   frame_id: "imu_frame"
-  gelsight_frame_id: "virtual_depth_frame"
+  # T_SI is declared from the gel chart (gel_frame), not the optical frame.
+  gelsight_frame_id: "gel_frame"
   gravity_mps2: 9.80665
+  # Estimate local gravity direction from the initial unloaded IMU window.
+  # The magnitude is the documented gravity_W norm; no ground-truth pose is read.
+  gravity_initialization_window_s: 0.50
+  # Documented simulation-only sensor biases, expressed in imu_frame.
+  initial_accel_bias_mps2: [0.003, -0.002, 0.004]
+  initial_gyro_bias_rps: [0.0002, -0.0001, 0.00015]
   buffer_max_samples: 6000
   # T_SI from the simulation handoff: IMU coordinates into tactile chart S.
   gelsight_T_imu:
@@ -22,6 +31,11 @@ imu_config:
     - [0.0, -1.0, 0.0, 0.0]
     - [0.0, 0.0, -1.0, -0.040]
     - [0.0, 0.0, 0.0, 1.0]
+  static_tf_validation:
+    enabled: true
+    topic: "/tf_static"
+    translation_tolerance_m: 0.000001
+    rotation_tolerance_rad: 0.000001
 
 contact_mask_config:
   color_dist_threshold: 15
