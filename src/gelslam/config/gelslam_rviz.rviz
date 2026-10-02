@@ -14,15 +14,33 @@ Visualization Manager:
       Cell Size: 0.01
       Plane Cell Count: 20
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
-      Name: Global Mesh
+      Enabled: false
+      Name: Global Mesh Triangles
       Topic:
         Value: /gelslam/rviz/global_mesh
     - Class: rviz_default_plugins/Marker
-      Enabled: true
-      Name: Current Tactile Patch
+      Enabled: false
+      Name: Current Tactile Triangles
       Topic:
         Value: /gelslam/rviz/current_mesh
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: true
+      Name: Global Surface
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: FlatColor
+      Color: 170; 180; 190
+      Topic:
+        Value: /gelslam/rviz/global_surface
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: true
+      Name: Current Tactile Surface
+      Style: Points
+      Size (Pixels): 3
+      Color Transformer: FlatColor
+      Color: 255; 60; 60
+      Topic:
+        Value: /gelslam/rviz/current_surface
     - Class: rviz_default_plugins/TF
       Enabled: true
       Name: Estimated Frames

@@ -12,6 +12,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import Point, TransformStamped
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from sensor_msgs.msg import PointCloud2, PointField
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -100,6 +101,27 @@ def mesh_to_marker(mesh, stamp, namespace, marker_id, color, triangle_stride):
     return marker
 
 
+def vertices_to_pointcloud(vertices, stamp):
+    """Create a compact XYZ point cloud that RViz renders as a smooth surface."""
+    vertices = np.ascontiguousarray(np.asarray(vertices, dtype=np.float32).reshape(-1, 3))
+    cloud = PointCloud2()
+    cloud.header.frame_id = RVIZ_FRAME
+    cloud.header.stamp = stamp
+    cloud.height = 1
+    cloud.width = len(vertices)
+    cloud.fields = [
+        PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+        PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+        PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+    ]
+    cloud.is_bigendian = False
+    cloud.point_step = 12
+    cloud.row_step = cloud.point_step * cloud.width
+    cloud.is_dense = True
+    cloud.data = vertices.tobytes()
+    return cloud
+
+
 class RvizVisualizerNode(Node):
     """Bridge GelSLAM's custom messages to RViz markers and TF."""
 
@@ -137,6 +159,12 @@ class RvizVisualizerNode(Node):
         )
         self.global_marker_pub = self.create_publisher(
             MarkerArray, "/gelslam/rviz/global_mesh", 1
+        )
+        self.current_cloud_pub = self.create_publisher(
+            PointCloud2, "/gelslam/rviz/current_surface", 1
+        )
+        self.global_cloud_pub = self.create_publisher(
+            PointCloud2, "/gelslam/rviz/global_surface", 1
         )
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
@@ -184,6 +212,11 @@ class RvizVisualizerNode(Node):
             markers.markers.append(marker)
         self.global_marker_count = len(meshes)
         self.global_marker_pub.publish(markers)
+        if meshes:
+            vertices = np.vstack([np.asarray(mesh.vertices) for mesh in meshes])
+            self.global_cloud_pub.publish(
+                vertices_to_pointcloud(vertices, self.get_clock().now().to_msg())
+            )
 
     def frame_callback(self, message):
         """Publish the current tactile patch and dynamic GelSight pose TF."""
@@ -197,6 +230,9 @@ class RvizVisualizerNode(Node):
         )
         map_T_gelsight = map_T_ref @ pose_of_frame_msg(message)
         current_mesh = frame_msg2mesh(self.bridge, message, map_T_ref, self.ppmm)
+        self.current_cloud_pub.publish(
+            vertices_to_pointcloud(current_mesh.vertices, message.header.stamp)
+        )
         self.current_marker_pub.publish(
             mesh_to_marker(
                 current_mesh,
