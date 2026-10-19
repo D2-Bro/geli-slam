@@ -12,7 +12,9 @@ def _copy_header(message, header):
         message.header.frame_id = header.frame_id
 
 
-def create_keyframe_msg(bridge, frame, kid, fid, is_new_trial, ref_T_curr, header=None):
+def create_keyframe_msg(bridge, frame, kid, fid, is_new_trial, trial_T_curr,
+                        header=None, navigation_state=None, gravity=None,
+                        imu_samples=(), tactile_valid=True):
     """
     Creates a KeyFrameMsg from a Frame object.
 
@@ -21,7 +23,7 @@ def create_keyframe_msg(bridge, frame, kid, fid, is_new_trial, ref_T_curr, heade
     :param kid: int; Keyframe ID.
     :param fid: int; Frame ID.
     :param is_new_trial: bool; Flag if this is a new trial.
-    :param ref_T_curr: np.ndarray; Transformation from current to reference.
+    :param trial_T_curr: np.ndarray; Current keyframe pose in trial coordinates.
     :param header: std_msgs.msg.Header; Source image header, if available.
     :return: KeyFrameMsg; The keyframe message.
     """
@@ -36,7 +38,21 @@ def create_keyframe_msg(bridge, frame, kid, fid, is_new_trial, ref_T_curr, heade
     keyframe_msg.kid = kid
     keyframe_msg.fid = fid
     keyframe_msg.new_trial_flag = is_new_trial
-    keyframe_msg.ref_t_curr = ref_T_curr.flatten().tolist()
+    keyframe_msg.trial_t_curr = (
+        np.asarray(trial_T_curr, dtype=np.float32).flatten().tolist()
+    )
+    keyframe_msg.tactile_valid = bool(tactile_valid)
+    if navigation_state is not None:
+        keyframe_msg.navigation_valid = True
+        keyframe_msg.navigation_timestamp = float(navigation_state.timestamp)
+        keyframe_msg.velocity = np.asarray(navigation_state.velocity).tolist()
+        keyframe_msg.accel_bias = np.asarray(navigation_state.accel_bias).tolist()
+        keyframe_msg.gyro_bias = np.asarray(navigation_state.gyro_bias).tolist()
+        keyframe_msg.gravity = np.asarray(gravity).tolist()
+        keyframe_msg.imu_measurements = [
+            float(value) for sample in imu_samples
+            for value in (sample.timestamp, *sample.acceleration, *sample.angular_velocity)
+        ]
     return keyframe_msg
 
 

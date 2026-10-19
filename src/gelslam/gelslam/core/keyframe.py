@@ -15,7 +15,8 @@ from gelslam.utils import (
 )
 
 
-def keyframe_msg2keyframe(bridge, keyframe_msg, trial_group, new_trial_flag, ppmm):
+def keyframe_msg2keyframe(bridge, keyframe_msg, trial_group, new_trial_flag, ppmm,
+                          tracker_trial_T_group=None, gelsight_T_imu=None):
     """
     Converts a KeyFrameMsg to a KeyFrame object.
 
@@ -32,10 +33,16 @@ def keyframe_msg2keyframe(bridge, keyframe_msg, trial_group, new_trial_flag, ppm
     C = bridge.imgmsg_to_cv2(keyframe_msg.contact_mask) > 0
     N = bridge.imgmsg_to_cv2(keyframe_msg.normal_map)
     L = bridge.imgmsg_to_cv2(keyframe_msg.laplacian_map)
-    # Get the transformation to the reference frame
-    ref_T_curr = np.array(keyframe_msg.ref_t_curr).reshape(4, 4)
-    if new_trial_flag:
-        ref_T_curr = np.eye(4, dtype=np.float32)
+    # Keep the tracker's world axes. Recovery changes the group origin only.
+    tracker_trial_T_curr = np.asarray(
+        keyframe_msg.trial_t_curr, dtype=np.float64
+    ).reshape(4, 4)
+    if tracker_trial_T_group is None or np.array_equal(
+        tracker_trial_T_group, np.eye(4)
+    ):
+        trial_T_curr = tracker_trial_T_curr
+    else:
+        trial_T_curr = np.linalg.inv(tracker_trial_T_group) @ tracker_trial_T_curr
     # Construct the keyframe
     keyframe = KeyFrame(
         H,
@@ -46,10 +53,38 @@ def keyframe_msg2keyframe(bridge, keyframe_msg, trial_group, new_trial_flag, ppm
         keyframe_msg.fid,
         trial_group,
         new_trial_flag,
-        ref_T_curr,
+        trial_T_curr,
         ppmm,
+        _header_timestamp(keyframe_msg.header),
     )
+    keyframe.navigation_state = None
+    keyframe.gravity = None
+    keyframe.imu_samples = ()
+    keyframe.tactile_valid = bool(getattr(keyframe_msg, "tactile_valid", True))
+    if getattr(keyframe_msg, "navigation_valid", False):
+        from gelslam.core.numpy_vi import NavigationState
+        from gelslam.core.inertial import ImuSample
+        from gelslam.core.imu_navigation import imu_pose
+        # Group recovery changes only the world origin, not velocity or gravity.
+        keyframe.navigation_state = NavigationState(
+            float(keyframe_msg.navigation_timestamp),
+            imu_pose(trial_T_curr, np.eye(4) if gelsight_T_imu is None else gelsight_T_imu),
+            np.asarray(keyframe_msg.velocity, dtype=np.float64),
+            np.asarray(keyframe_msg.accel_bias, dtype=np.float64),
+            np.asarray(keyframe_msg.gyro_bias, dtype=np.float64),
+        )
+        keyframe.gravity = np.asarray(keyframe_msg.gravity, dtype=np.float64)
+        rows = np.asarray(keyframe_msg.imu_measurements, dtype=np.float64).reshape(-1, 7)
+        keyframe.imu_samples = tuple(ImuSample(row[0], row[1:4], row[4:7]) for row in rows)
     return keyframe
+
+
+def _header_timestamp(header):
+    """Return a ROS header time in seconds, or ``None`` when it is unset."""
+    if header is None:
+        return None
+    timestamp = float(header.stamp.sec) + float(header.stamp.nanosec) * 1e-9
+    return timestamp if timestamp > 0.0 else None
 
 
 def compute_overlap_weight(tar_kidx, ref_kidx, keyframedb, pose_graph_solutions):
@@ -164,7 +199,18 @@ class KeyFrame:
     """
 
     def __init__(
-        self, H, C, N, L, kid, fid, trial_group, new_trial_flag, ref_T_curr, ppmm
+        self,
+        H,
+        C,
+        N,
+        L,
+        kid,
+        fid,
+        trial_group,
+        new_trial_flag,
+        trial_T_curr,
+        ppmm,
+        timestamp=None,
     ):
         # Set the frame information
         self.H = H
@@ -182,8 +228,11 @@ class KeyFrame:
         self.trial_group = trial_group
         # The flag of new trial
         self.new_trial_flag = new_trial_flag
-        # The estimated trnasformation to the previous keyframe, eye if head of the new trial
-        self.ref_T_curr = ref_T_curr
+        # The tracker pose in the trial's first-keyframe coordinates.
+        self.trial_T_curr = trial_T_curr
+        # IMU preintegration is associated with physical acquisition times,
+        # never the asynchronous keyframe insertion time.
+        self.timestamp = timestamp
         # Visualization Only: Compute the downsampling of the geometry, with rate=2 and 4
         self.downsampled_Cs = [self.C[::2, ::2], self.C[::4, ::4], self.C[::8, ::8]]
         self.downsampled_Ws = [self.W[::2, ::2], self.W[::4, ::4], self.W[::8, ::8]]
@@ -284,13 +333,18 @@ class KeyFrameDB:
     while kidx is the index of a keyframe in the database. They can be different in multi-threaded scenarios.
     """
 
-    def __init__(self, ppmm, logger):
+    def __init__(self, ppmm, logger, gelsight_T_imu=None, imu_max_sample_gap_s=0.05):
         self.logger = logger
+        self.gelsight_T_imu = np.eye(4) if gelsight_T_imu is None else np.asarray(gelsight_T_imu)
+        self.imu_max_sample_gap_s = float(imu_max_sample_gap_s)
         self.bridge = CvBridge()
         self.ppmm = ppmm
         # The keyframe database variables
         self.curr_trial_group = -1
         self.keyframes = []
+        # The first received keyframe can follow a dropped message. Its
+        # tracker-trial pose becomes the origin of the recovered backend group.
+        self.tracker_trial_T_group = np.eye(4, dtype=np.float64)
 
     def __getitem__(self, idx):
         return self.keyframes[idx]
@@ -325,11 +379,27 @@ class KeyFrameDB:
         keyframe_load_dir = os.path.join(load_dir, "keyframedb")
         keyframe_filenames = os.listdir(keyframe_load_dir)
         keyframe_filenames.sort()
+        trial_T_previous = np.eye(4, dtype=np.float64)
         for keyframe_filename in keyframe_filenames:
             with open(os.path.join(keyframe_load_dir, keyframe_filename), "rb") as f:
                 keyframe = pickle.load(f)
+                if not hasattr(keyframe, "trial_T_curr"):
+                    if keyframe.is_new_trial():
+                        trial_T_previous = np.eye(4, dtype=np.float64)
+                    else:
+                        trial_T_previous = trial_T_previous @ keyframe.ref_T_curr
+                    keyframe.trial_T_curr = trial_T_previous.copy()
+                    del keyframe.ref_T_curr
+                else:
+                    trial_T_previous = keyframe.trial_T_curr
                 keyframe.compute_sift_features()
                 instance.keyframes.append(keyframe)
+        if not hasattr(instance, "tracker_trial_T_group"):
+            instance.tracker_trial_T_group = np.eye(4, dtype=np.float64)
+        if not hasattr(instance, "gelsight_T_imu"):
+            instance.gelsight_T_imu = np.eye(4, dtype=np.float64)
+        if not hasattr(instance, "imu_max_sample_gap_s"):
+            instance.imu_max_sample_gap_s = 0.05
         return instance
 
     def size(self):
@@ -370,6 +440,12 @@ class KeyFrameDB:
         """
         # Detect keyframe drop
         new_trial_flag = keyframe_msg.new_trial_flag
+        if (not new_trial_flag and getattr(keyframe_msg, "navigation_valid", False)
+                and len(getattr(keyframe_msg, "imu_measurements", ())) < 14):
+            self.logger.warning(
+                "%s -- IMU keyframe interval unavailable; starting a disconnected backend group" % log_prefix
+            )
+            new_trial_flag = True
         if keyframe_msg.kid != 0:
             if len(self.keyframes) == 0:
                 self.logger.warning("%s -- Keyframe Drop Detected" % log_prefix)
@@ -377,9 +453,26 @@ class KeyFrameDB:
             elif self.keyframes[-1].kid != keyframe_msg.kid - 1:
                 self.logger.warning("%s -- Keyframe Drop Detected" % log_prefix)
                 new_trial_flag = True
+        if not new_trial_flag and getattr(keyframe_msg, "navigation_valid", False):
+            rows = np.asarray(keyframe_msg.imu_measurements, dtype=float).reshape(-1, 7)
+            previous = getattr(self.keyframes[-1], "navigation_state", None) if self.keyframes else None
+            if (previous is None or len(rows) < 2 or not np.all(np.isfinite(rows))
+                    or abs(rows[0, 0] - previous.timestamp) > 1e-8
+                    or abs(rows[-1, 0] - keyframe_msg.navigation_timestamp) > 1e-8
+                    or np.any(np.diff(rows[:, 0]) <= 0)
+                    or np.any(np.diff(rows[:, 0]) > self.imu_max_sample_gap_s)):
+                self.logger.warning(
+                    "%s -- IMU interval has missing endpoints or gaps; starting a disconnected backend group" % log_prefix
+                )
+                new_trial_flag = True
         # When New Trial Detected, update the trial group
         if new_trial_flag:
             self.curr_trial_group += 1
+            first_pose = np.asarray(
+                keyframe_msg.trial_t_curr, dtype=np.float64
+            ).reshape(4, 4)
+            self.tracker_trial_T_group = np.eye(4, dtype=np.float64)
+            self.tracker_trial_T_group[:3, 3] = first_pose[:3, 3]
         # Get the keyframe
         keyframe = keyframe_msg2keyframe(
             self.bridge,
@@ -387,6 +480,8 @@ class KeyFrameDB:
             trial_group=self.curr_trial_group,
             new_trial_flag=new_trial_flag,
             ppmm=self.ppmm,
+            tracker_trial_T_group=self.tracker_trial_T_group,
+            gelsight_T_imu=self.gelsight_T_imu,
         )
         self.logger.info(
             "%s -- keyframe ID = %d, trial group = %d"

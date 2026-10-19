@@ -1,7 +1,8 @@
 """Launch GelSLAM processing nodes for an externally played ROS 2 bag.
 
-The bag player is intentionally not launched here.  Start this launch file
-first, then play a bag that publishes tactile images on the ``/image`` topic.
+The bag player is intentionally not launched here. Start this launch file
+first, then play a bag whose tactile image topic matches
+``device_config.image_topic`` in the selected configuration file.
 """
 
 import os
@@ -20,6 +21,11 @@ def generate_launch_description():
     data_dir_arg = DeclareLaunchArgument(
         "data_dir", default_value="", description="Optional directory for saved state"
     )
+    sequence_name_arg = DeclareLaunchArgument(
+        "sequence_name",
+        default_value="",
+        description="Evaluation output folder name; defaults to the data_dir name",
+    )
     config_path_arg = DeclareLaunchArgument(
         "config_path",
         default_value=os.path.join(
@@ -29,6 +35,14 @@ def generate_launch_description():
     )
     rendering_arg = DeclareLaunchArgument(
         "rendering", default_value="true", description="Start the Open3D visualizer"
+    )
+    backend_arg = DeclareLaunchArgument(
+        "backend",
+        default_value="true",
+        description=(
+            "Enable loop closure and pose-graph optimization; false still records "
+            "keyframes and writes a raw tracker-odometry trajectory evaluation"
+        ),
     )
     rviz_arg = DeclareLaunchArgument(
         "rviz", default_value="true", description="Start RViz mesh and TF visualization"
@@ -67,6 +81,7 @@ def generate_launch_description():
             {
                 "skip_background_check": LaunchConfiguration("skip_background_check"),
                 "save_gelslam_state": LaunchConfiguration("save_states"),
+                "sequence_name": LaunchConfiguration("sequence_name"),
             },
         ],
     )
@@ -80,6 +95,8 @@ def generate_launch_description():
             {
                 "rendering": LaunchConfiguration("publish_coverage"),
                 "save_gelslam_states": LaunchConfiguration("save_states"),
+                "sequence_name": LaunchConfiguration("sequence_name"),
+                "backend_optimization": LaunchConfiguration("backend"),
             },
         ],
     )
@@ -88,7 +105,10 @@ def generate_launch_description():
         executable="visualizer_node",
         name="visualizer_node",
         output="screen",
-        parameters=[common_parameters],
+        parameters=[
+            common_parameters,
+            {"use_backend_poses": LaunchConfiguration("backend")},
+        ],
         condition=IfCondition(LaunchConfiguration("rendering")),
     )
     rviz_bridge_node = Node(
@@ -96,7 +116,10 @@ def generate_launch_description():
         executable="rviz_visualizer_node",
         name="rviz_visualizer_node",
         output="screen",
-        parameters=[common_parameters],
+        parameters=[
+            common_parameters,
+            {"use_backend_poses": LaunchConfiguration("backend")},
+        ],
         condition=IfCondition(LaunchConfiguration("rviz")),
     )
     rviz_node = Node(
@@ -116,8 +139,10 @@ def generate_launch_description():
     return LaunchDescription(
         [
             data_dir_arg,
+            sequence_name_arg,
             config_path_arg,
             rendering_arg,
+            backend_arg,
             rviz_arg,
             publish_coverage_arg,
             skip_background_check_arg,

@@ -1,8 +1,66 @@
-build/
-install/
-log/
+# ROS 2 / colcon build products
+/build/
+/install/
+/log/
+
+# Python environments, package metadata and test caches
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.venv/
+venv/
+
+# Downloaded data, local checkpoints and generated reconstruction results
+/data/
+/ckpt/
+/diagnostics/
+/output/
+gelslam_online/
+gelslam_offline/
+.matplotlib/
+
+# Local diagnostic/experiment tools and reports (not required to run GelSLAM)
+/scripts/*
+# Keep Python sources imported by the retained regression tests.
+!/scripts/analyze_imu_before_first_image.py
+!/scripts/audit_tactile_imu.py
+!/scripts/compare_normalflow_imu_gt_intervals.py
+!/scripts/diagnose_five_observations.py
+!/scripts/experiment_imu_objective_and_drift.py
+!/scripts/experiment_prior_normal_coupling.py
+!/scripts/render_five_observations.py
+/tools/
+/systemd/
+/docs/gtsam_migration_validation.md
+/docs/tactile_imu_audit.md
+
+# Machine-specific setup and agent configuration
+/gelislam_setup.sh
+/AGENTS.md
+/.agents/
+/.codex/
+/.aws/
+.env
+.env.*
+!.env.example
+
+# Accidental pip output from unquoted version constraints
+/1.11.0
+/=1.11.0
+/=2.4.2
+
+# Editor and operating system files
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

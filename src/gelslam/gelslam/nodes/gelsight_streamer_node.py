@@ -82,9 +82,13 @@ class GelSightStreamerNode(Node):
         """
         while self.running:
             image = self.device.get_image()
+            # Timestamp the capture before potentially blocking disk encoding.
+            # IMU/image association must use acquisition time, not the later
+            # time at which the recorder finishes writing this frame.
+            capture_stamp = self.get_clock().now().to_msg()
             self.video_writer.write(image)
             image_msg = self.bridge.cv2_to_imgmsg(image, encoding="bgr8")
-            image_msg.header.stamp = self.get_clock().now().to_msg()
+            image_msg.header.stamp = capture_stamp
             image_msg.header.frame_id = "gelsight"
             if self.context.ok():
                 self.image_pub.publish(image_msg)

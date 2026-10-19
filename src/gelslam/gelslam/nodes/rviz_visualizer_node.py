@@ -1,4 +1,4 @@
-"""Publish GelSLAM meshes and estimated GelSight/IMU poses for RViz."""
+"""Publish GelSLAM point clouds and estimated GelSight/IMU poses for RViz."""
 
 import os
 
@@ -8,25 +8,27 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 import numpy as np
 import rclpy
 import yaml
-from cv_bridge import CvBridge
-from geometry_msgs.msg import Point, TransformStamped
+from geometry_msgs.msg import TransformStamped, Vector3Stamped
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2, PointField
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
-from visualization_msgs.msg import Marker, MarkerArray
 
-from gelslam.core.frame import frame_msg2mesh, pose_of_frame_msg
+from gelslam.core.frame import pose_of_frame_msg
+from gelslam.core.inertial import rotation_aligning_gravity_to_negative_z
 from gelslam.core.keyframe import KeyFrameDB
 from gelslam.utils import Logger
 from gelslam.visualization.visible_coverage_meshes import (
     VisibleCoverageMeshes,
+    compute_frontend_tracking_meshes,
     compute_visible_coverage_meshes,
 )
 from gelslam_msgs.msg import FrameMsg, KeyFrameMsg, VisibleCoverageGraphMsg
 
 
 RVIZ_FRAME = "gelslam_map"
+GRAVITY_ALIGNED_FRAME = "gelslam_gravity_aligned"
 GELSIGHT_FRAME = "gelsight_estimate"
 IMU_FRAME = "imu_estimate"
 
@@ -77,30 +79,6 @@ def rotation_matrix_to_quaternion(rotation):
     )
 
 
-def mesh_to_marker(mesh, stamp, namespace, marker_id, color, triangle_stride):
-    """Convert an Open3D triangle mesh into a bounded RViz TRIANGLE_LIST."""
-    marker = Marker()
-    marker.header.frame_id = RVIZ_FRAME
-    marker.header.stamp = stamp
-    marker.ns = namespace
-    marker.id = marker_id
-    marker.type = Marker.TRIANGLE_LIST
-    marker.action = Marker.ADD
-    marker.pose.orientation.w = 1.0
-    marker.scale.x = marker.scale.y = marker.scale.z = 1.0
-    marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
-
-    vertices = np.asarray(mesh.vertices)
-    triangles = np.asarray(mesh.triangles)
-    for triangle in triangles[:: max(1, triangle_stride)]:
-        for vertex_index in triangle:
-            vertex = vertices[vertex_index]
-            marker.points.append(
-                Point(x=float(vertex[0]), y=float(vertex[1]), z=float(vertex[2]))
-            )
-    return marker
-
-
 def vertices_to_pointcloud(vertices, stamp):
     """Create a compact XYZ point cloud that RViz renders as a smooth surface."""
     vertices = np.ascontiguousarray(np.asarray(vertices, dtype=np.float32).reshape(-1, 3))
@@ -123,7 +101,7 @@ def vertices_to_pointcloud(vertices, stamp):
 
 
 class RvizVisualizerNode(Node):
-    """Bridge GelSLAM's custom messages to RViz markers and TF."""
+    """Bridge GelSLAM's custom messages to RViz point clouds and TF."""
 
     def __init__(self):
         super().__init__("rviz_visualizer_node")
@@ -141,25 +119,16 @@ class RvizVisualizerNode(Node):
         if self.gelsight_T_imu is not None and self.gelsight_T_imu.shape != (4, 4):
             raise ValueError("imu_config.gelsight_T_imu must be a 4x4 matrix")
 
-        self.declare_parameter("current_triangle_stride", 2)
-        self.declare_parameter("global_triangle_stride", 8)
-        self.current_triangle_stride = int(
-            self.get_parameter("current_triangle_stride").value
+        self.declare_parameter("use_backend_poses", True)
+        self.use_backend_poses = bool(
+            self.get_parameter("use_backend_poses").value
         )
-        self.global_triangle_stride = int(
-            self.get_parameter("global_triangle_stride").value
-        )
-        self.bridge = CvBridge()
         self.keyframedb = KeyFrameDB(self.ppmm, Logger())
         self.visible_coverage_meshes = VisibleCoverageMeshes()
-        self.global_marker_count = 0
+        self.pending_frame_msg = None
+        self.latest_map_T_gelsight = np.eye(4, dtype=np.float64)
+        self.latest_contact_local_cloud = None
 
-        self.current_marker_pub = self.create_publisher(
-            Marker, "/gelslam/rviz/current_mesh", 1
-        )
-        self.global_marker_pub = self.create_publisher(
-            MarkerArray, "/gelslam/rviz/global_mesh", 1
-        )
         self.current_cloud_pub = self.create_publisher(
             PointCloud2, "/gelslam/rviz/current_surface", 1
         )
@@ -168,55 +137,103 @@ class RvizVisualizerNode(Node):
         )
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
+        self.gravity_alignment = None
+        self.publish_static_imu_transform()
+        frontend_vi_enabled = (
+            imu_config.get("enabled", False)
+            and imu_config.get("frontend_optimization", False)
+            and self.gelsight_T_imu is not None
+        )
+        if frontend_vi_enabled:
+            self.create_subscription(
+                Vector3Stamped,
+                imu_config.get("frontend_gravity_topic", "/gelslam/frontend/gravity"),
+                self.frontend_gravity_callback,
+                QoSProfile(
+                    depth=1,
+                    reliability=ReliabilityPolicy.RELIABLE,
+                    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                ),
+            )
+        else:
+            gravity = (
+                imu_config.get(
+                    "frontend_gravity_mps2",
+                    (0.0, 0.0, -float(imu_config.get("gravity_mps2", 9.81))),
+                )
+                if frontend_vi_enabled
+                else (0.0, 0.0, -1.0)
+            )
+            self.set_gravity_alignment(gravity)
 
         self.create_subscription(KeyFrameMsg, "keyframe", self.keyframe_callback, 10)
         self.create_subscription(FrameMsg, "frame", self.frame_callback, 1)
+        self.create_subscription(
+            PointCloud2, "/gelslam/current_contact_local",
+            self.current_contact_callback, 1,
+        )
         self.create_subscription(
             VisibleCoverageGraphMsg,
             "visible_coverage_graph",
             self.visible_coverage_graph_callback,
             1,
         )
+
+    def frontend_gravity_callback(self, message):
+        """Set the RViz map rotation from first-trial frontend gravity."""
+        if self.gravity_alignment is not None:
+            return
+        if message.header.frame_id != "gelslam_first_trial":
+            self.get_logger().warning("Ignored gravity in an unexpected frame")
+            return
+        self.set_gravity_alignment(
+            (message.vector.x, message.vector.y, message.vector.z)
+        )
+
+    def set_gravity_alignment(self, gravity):
+        """Align a legacy map, or use identity for an already aligned VI world."""
+        try:
+            rotation = rotation_aligning_gravity_to_negative_z(gravity)
+        except ValueError as error:
+            self.get_logger().warning("Ignored invalid frontend gravity: %s" % error)
+            return
+        self.gravity_alignment = np.eye(4)
+        self.gravity_alignment[:3, :3] = rotation
         self.publish_static_imu_transform()
+        self.get_logger().info("RViz map aligned to first-trial frontend gravity")
 
     def keyframe_callback(self, message):
-        """Store keyframes needed to place current and global meshes."""
+        """Store a keyframe and update the tracker-only surface when selected."""
         self.keyframedb.insert(message)
+        if not self.use_backend_poses:
+            self.visible_coverage_meshes = compute_frontend_tracking_meshes(
+                self.keyframedb, create_meshes=False
+            )
+            self._publish_global_surface()
+        if self.pending_frame_msg is not None:
+            pending = self.pending_frame_msg
+            if self.keyframedb.find_kidx_from_kid(
+                pending.ref_kid, self.keyframedb.size()
+            ) is not None:
+                self.frame_callback(pending)
 
     def visible_coverage_graph_callback(self, message):
-        """Rebuild global mesh markers only when pose-graph coverage changes."""
+        """Rebuild global point clouds when pose-graph coverage changes."""
+        if not self.use_backend_poses:
+            return
         kid2kidx = self.keyframedb.get_kid2kidx()
         self.visible_coverage_meshes = compute_visible_coverage_meshes(
-            message, self.keyframedb, kid2kidx
+            message, self.keyframedb, kid2kidx, create_meshes=False
         )
-        markers = MarkerArray()
-        meshes = self.visible_coverage_meshes.visible_coverage_meshes
-        for marker_id, mesh in enumerate(meshes):
-            markers.markers.append(
-                mesh_to_marker(
-                    mesh,
-                    self.get_clock().now().to_msg(),
-                    "gelslam_global_mesh",
-                    marker_id,
-                    (0.65, 0.70, 0.75, 0.70),
-                    self.global_triangle_stride,
-                )
-            )
-        for marker_id in range(len(meshes), self.global_marker_count):
-            marker = Marker()
-            marker.header.frame_id = RVIZ_FRAME
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = "gelslam_global_mesh"
-            marker.id = marker_id
-            marker.action = Marker.DELETE
-            markers.markers.append(marker)
-        self.global_marker_count = len(meshes)
-        self.global_marker_pub.publish(markers)
-        if meshes:
-            vertices = np.vstack([np.asarray(mesh.vertices) for mesh in meshes])
-            self.global_cloud_pub.publish(
-                vertices_to_pointcloud(vertices, self.get_clock().now().to_msg())
-            )
+        self._publish_global_surface()
+
+    def _publish_global_surface(self):
+        """Publish XYZ data directly, including an empty cloud to clear RViz."""
+        pointclouds = self.visible_coverage_meshes.visible_coverage_pointclouds
+        vertices = np.vstack(pointclouds) if pointclouds else np.empty((0, 3))
+        self.global_cloud_pub.publish(
+            vertices_to_pointcloud(vertices, self.get_clock().now().to_msg())
+        )
 
     def frame_callback(self, message):
         """Publish the current tactile patch and dynamic GelSight pose TF."""
@@ -224,25 +241,17 @@ class RvizVisualizerNode(Node):
             message.ref_kid, self.keyframedb.size()
         )
         if ref_kidx is None:
+            # Keyframe and frame use different topics. Their callbacks can
+            # arrive in either order, so keep the newest frame until its
+            # reference keyframe is in the local database.
+            self.pending_frame_msg = message
             return
+        self.pending_frame_msg = None
         _, map_T_ref = self.visible_coverage_meshes.get_keyframe_pose(
             ref_kidx, self.keyframedb
         )
         map_T_gelsight = map_T_ref @ pose_of_frame_msg(message)
-        current_mesh = frame_msg2mesh(self.bridge, message, map_T_ref, self.ppmm)
-        self.current_cloud_pub.publish(
-            vertices_to_pointcloud(current_mesh.vertices, message.header.stamp)
-        )
-        self.current_marker_pub.publish(
-            mesh_to_marker(
-                current_mesh,
-                message.header.stamp,
-                "gelslam_current_mesh",
-                0,
-                (0.95, 0.15, 0.15, 0.85),
-                self.current_triangle_stride,
-            )
-        )
+        self.latest_map_T_gelsight = map_T_gelsight
         self.tf_broadcaster.sendTransform(
             self.matrix_to_transform(
                 map_T_gelsight,
@@ -251,19 +260,47 @@ class RvizVisualizerNode(Node):
                 GELSIGHT_FRAME,
             )
         )
+        local_cloud = self.latest_contact_local_cloud
+        if local_cloud is not None and local_cloud.header.stamp == message.header.stamp:
+            self._publish_current_contact_cloud(local_cloud)
+
+    def current_contact_callback(self, message):
+        """Update the red surface from the latest reconstructed contact mask."""
+        self.latest_contact_local_cloud = message
+        self._publish_current_contact_cloud(message)
+
+    def _publish_current_contact_cloud(self, message):
+        if message.point_step != 12 or len(message.data) != message.width * 12:
+            self.get_logger().warning("Ignored invalid current contact cloud")
+            return
+        local_points = np.frombuffer(message.data, dtype=np.float32).reshape(-1, 3)
+        map_T_gelsight = self.latest_map_T_gelsight
+        map_points = (
+            local_points @ map_T_gelsight[:3, :3].T
+            + map_T_gelsight[:3, 3]
+        )
+        self.current_cloud_pub.publish(
+            vertices_to_pointcloud(map_points, message.header.stamp)
+        )
 
     def publish_static_imu_transform(self):
-        """Publish the configured GelSight-to-IMU relation under estimate frames."""
-        if self.gelsight_T_imu is None:
-            return
-        self.static_tf_broadcaster.sendTransform(
-            self.matrix_to_transform(
-                self.gelsight_T_imu,
-                self.get_clock().now().to_msg(),
-                GELSIGHT_FRAME,
-                IMU_FRAME,
+        """Publish all static transforms together for late TF subscribers."""
+        stamp = self.get_clock().now().to_msg()
+        transforms = []
+        if self.gelsight_T_imu is not None:
+            transforms.append(
+                self.matrix_to_transform(
+                    self.gelsight_T_imu, stamp, GELSIGHT_FRAME, IMU_FRAME
+                )
             )
-        )
+        if self.gravity_alignment is not None:
+            transforms.append(
+                self.matrix_to_transform(
+                    self.gravity_alignment, stamp, GRAVITY_ALIGNED_FRAME, RVIZ_FRAME
+                )
+            )
+        if transforms:
+            self.static_tf_broadcaster.sendTransform(transforms)
 
     @staticmethod
     def matrix_to_transform(matrix, stamp, parent_frame, child_frame):

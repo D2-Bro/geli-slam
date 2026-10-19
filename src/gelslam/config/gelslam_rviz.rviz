@@ -10,19 +10,9 @@ Visualization Manager:
       Enabled: true
       Name: Grid
       Plane: XY
-      Reference Frame: gelslam_map
+      Reference Frame: gelslam_gravity_aligned
       Cell Size: 0.01
       Plane Cell Count: 20
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: false
-      Name: Global Mesh Triangles
-      Topic:
-        Value: /gelslam/rviz/global_mesh
-    - Class: rviz_default_plugins/Marker
-      Enabled: false
-      Name: Current Tactile Triangles
-      Topic:
-        Value: /gelslam/rviz/current_mesh
     - Class: rviz_default_plugins/PointCloud2
       Enabled: true
       Name: Global Surface
@@ -41,6 +31,14 @@ Visualization Manager:
       Color: 255; 60; 60
       Topic:
         Value: /gelslam/rviz/current_surface
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: GelSight Trajectory
+      Color: 0; 255; 0
+      Line Style: Lines
+      Line Width: 0.003
+      Topic:
+        Value: /gelslam/rviz/gelsight_trajectory
     - Class: rviz_default_plugins/TF
       Enabled: true
       Name: Estimated Frames
@@ -48,8 +46,36 @@ Visualization Manager:
       Show Axes: true
       Show Names: true
       Marker Scale: 0.01
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Bag GelSight Image
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /gelsight/image_raw
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: GelSight Normal Map
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /gelslam/rviz/normal_map
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Normal Point Correspondences
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /gelslam/rviz/normal_correspondences
   Global Options:
-    Fixed Frame: gelslam_map
+    Fixed Frame: gelslam_gravity_aligned
     Background Color: 48; 48; 48
   Tools:
     - Class: rviz_default_plugins/Interact
@@ -61,7 +87,8 @@ Visualization Manager:
     Current:
       Class: rviz_default_plugins/Orbit
       Name: Current View
-      Target Frame: gelsight_estimate
+      # Keep the camera fixed in the gravity-aligned display frame.
+      Target Frame: gelslam_gravity_aligned
       Distance: 0.12
       Focal Point:
         X: 0

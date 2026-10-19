@@ -1,0 +1,726 @@
+"""Active frontend and backend GTSAM paths."""
+
+from backend_test_support import config as backend_config, frame as backend_frame
+
+from types import SimpleNamespace
+
+import numpy as np
+import gtsam
+import pytest
+from normalflow.utils import get_J, height2pointcloud, wide_remap
+
+from gelslam.core.gtsam_pose_graph import PoseGraph
+from gelslam.core.gtsam_vi import (
+    GtsamVisualInertialSolver,
+    _combined_imu_factor,
+    _imu_values,
+    _normal_huber_cost,
+    _normal_huber_linearization,
+    combined_imu_current_terms,
+    preintegrate_combined,
+)
+from gelslam.core.inertial import (
+    ImuSample, rotation_aligning_gravity_to_negative_z,
+)
+from gelslam.core.numpy_vi import DenseNormalResidual, NavigationState, adjoint
+
+
+def _state(time, pose=None):
+    return NavigationState(
+        time, np.eye(4) if pose is None else pose,
+        np.zeros(3), np.zeros(3), np.zeros(3),
+    )
+
+
+def _samples(rate=0.0):
+    return [
+        ImuSample(time, (0.0, 0.0, 9.81), (0.0, 0.0, rate))
+        for time in np.linspace(0.0, 0.1, 11)
+    ]
+
+
+class _FlatVisual:
+    def __len__(self):
+        return 10
+
+    def evaluate(self, _reference, _target):
+        return np.zeros(30), np.zeros((30, 6)), np.zeros((30, 6))
+
+    def target_z_height_correction(self, _reference, _target):
+        raise AssertionError("joint visual-IMU solve must not correct Z after optimization")
+
+
+class _MislinearizedVisual:
+    def __init__(self, jacobian_x):
+        self.jacobian_x = jacobian_x
+
+    def __len__(self):
+        return 10
+
+    def evaluate(self, _reference, target):
+        residual = np.full(30, target[0, 3] - 1.0)
+        jacobian = np.zeros((30, 6))
+        jacobian[:, 3] = self.jacobian_x
+        return residual, jacobian, jacobian
+
+
+def test_joint_solver_applies_full_step_even_when_actual_cost_increases():
+    solver = GtsamVisualInertialSolver({
+        "gtsam_vi_max_iterations": 1,
+        "gtsam_vi_normal_huber_delta": 0.0,
+        "dense_normalflow_residual_weight": 1e8,
+        "imu_residual_weight": 1e-12,
+    })
+    result = solver.refine_current(
+        _MislinearizedVisual(0.1), np.eye(4), _state(0), _state(0.1),
+        _samples(), np.eye(4),
+    )
+    trace = solver.last_optimization_trace[0]
+    assert trace["attempts"][0]["cost"] > trace["base_cost"]
+    assert trace["accepted_scale"] == 1.
+    assert len(trace["attempts"]) == 1
+    assert trace["accepted_cost"] > trace["base_cost"]
+    assert result.pose[0, 3] == pytest.approx(10., abs=1e-4)
+
+
+def test_joint_solver_does_not_retry_or_roll_back_an_uphill_full_step():
+    solver = GtsamVisualInertialSolver({
+        "gtsam_vi_max_iterations": 1,
+        "gtsam_vi_normal_huber_delta": 0.0,
+        "dense_normalflow_residual_weight": 1e8,
+        "imu_residual_weight": 1e-12,
+    })
+    result = solver.refine_current(
+        _MislinearizedVisual(-1.0), np.eye(4), _state(0), _state(0.1),
+        _samples(), np.eye(4),
+    )
+    trace = solver.last_optimization_trace[0]
+    assert trace["accepted_scale"] == 1.
+    assert len(trace["attempts"]) == 1
+    assert trace["accepted_cost"] > trace["base_cost"]
+    assert result.pose[0, 3] == pytest.approx(-1., abs=1e-5)
+
+
+@pytest.mark.parametrize('damping', [1e-6, -1., np.nan, np.inf])
+def test_frontend_rejects_nonzero_or_invalid_legacy_damping(damping):
+    with pytest.raises(ValueError, match='does not support gtsam_vi_damping'):
+        GtsamVisualInertialSolver({'gtsam_vi_damping': damping})
+
+
+def test_joint_solver_accepts_zero_damping():
+    solver = GtsamVisualInertialSolver({
+        "gtsam_vi_damping": 0.0,
+        "gtsam_vi_max_iterations": 2,
+    })
+    initial = _state(0.1)
+    initial.pose[0, 3] = 0.001
+    result = solver.refine_current(
+        _FlatVisual(), np.eye(4), _state(0.0), initial,
+        _samples(), np.eye(4),
+    )
+    assert result is not None
+    assert solver.last_optimization_trace
+    assert np.all(np.isfinite(result.pose))
+    assert np.all(np.isfinite(result.velocity))
+
+
+def test_frontend_predicts_pose_and_velocity_from_the_same_imu_interval():
+    previous = _state(0.0)
+    previous.velocity = np.array([0.3, -0.1, 0.0])
+    previous.accel_bias = np.array([0.2, 0.0, 0.0])
+    previous.gyro_bias = np.array([0.0, 0.0, 0.1])
+    samples = [
+        ImuSample(float(t), (0.2, 0.0, 9.81), (0.0, 0.0, 0.1))
+        for t in np.linspace(0.0, 0.1, 11)
+    ]
+    solver = GtsamVisualInertialSolver({"gtsam_vi_max_iterations": 2})
+
+    prediction = solver.predict_current(previous, samples, np.eye(4))
+
+    assert prediction is not None
+    current, preintegrated = prediction
+    assert np.isclose(current.timestamp, 0.1)
+    assert np.allclose(current.pose[:3, 3], [0.03, -0.01, 0.0], atol=1e-8)
+    assert np.allclose(current.pose[:3, :3], np.eye(3), atol=1e-8)
+    assert np.allclose(current.velocity, previous.velocity, atol=1e-8)
+    assert np.allclose(current.accel_bias, previous.accel_bias)
+    assert np.allclose(current.gyro_bias, previous.gyro_bias)
+    assert np.isclose(preintegrated.deltaTij(), 0.1)
+
+
+def test_frontend_can_initialize_from_previous_state_with_imu_factor_retained():
+    previous = _state(0.0)
+    previous.pose[0, 3] = 0.4
+    previous.velocity[:] = [0.3, -0.1, 0.0]
+    previous.accel_bias[:] = [0.2, 0.0, 0.0]
+    previous.gyro_bias[:] = [0.0, 0.0, 0.1]
+    samples = _samples()
+    solver = GtsamVisualInertialSolver({
+        "frontend_initialize_from_imu_preintegration": False,
+    })
+
+    current, preintegrated = solver.predict_current(
+        previous, samples, np.eye(4)
+    )
+
+    assert np.isclose(current.timestamp, samples[-1].timestamp)
+    for field in ("pose", "velocity", "accel_bias", "gyro_bias"):
+        assert np.array_equal(getattr(current, field), getattr(previous, field))
+        assert not np.shares_memory(getattr(current, field), getattr(previous, field))
+    assert np.isclose(preintegrated.deltaTij(), 0.1)
+    refined = solver.refine_current(
+        _FlatVisual(), np.eye(4), previous, current, samples, np.eye(4),
+        preintegrated=preintegrated,
+    )
+    assert refined is not None
+    assert solver.last_optimization_trace
+
+
+def test_frontend_prediction_retains_stationary_imu_pose_with_rotated_mount():
+    gelsight_T_imu = np.eye(4)
+    gelsight_T_imu[:3, :3] = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0],
+        [0.0, 1.0, 0.0],
+    ])
+    gelsight_T_imu[:3, 3] = [0.02, -0.01, 0.03]
+    stationary_specific_force = gelsight_T_imu[:3, :3].T @ [0.0, 0.0, 9.81]
+    samples = [
+        ImuSample(float(t), stationary_specific_force, (0.0, 0.0, 0.0))
+        for t in np.linspace(0.0, 0.1, 11)
+    ]
+
+    current, _ = GtsamVisualInertialSolver({}).predict_current(
+        _state(0.0, gelsight_T_imu.copy()), samples, gelsight_T_imu
+    )
+
+    assert np.allclose(current.pose, gelsight_T_imu, atol=1e-8)
+    assert np.allclose(current.velocity, np.zeros(3), atol=1e-8)
+
+
+def test_normal_huber_uses_three_component_blocks_and_true_candidate_cost():
+    residual = np.array((3.0, 4.0, 0.0, 0.06, 0.08, 0.0))
+    jacobian = np.eye(6)
+    weighted_jacobian, weighted_residual, cost, count = (
+        _normal_huber_linearization(residual, jacobian, 2.0, 1.0)
+    )
+    assert count == 1
+    assert np.allclose(weighted_residual[:3], residual[:3] * 2 / np.sqrt(20))
+    assert np.allclose(weighted_residual[3:], residual[3:] * 2 / np.sqrt(2))
+    assert np.allclose(np.diag(weighted_jacobian)[:3], 2 / np.sqrt(20))
+    assert np.allclose(np.diag(weighted_jacobian)[3:], 2 / np.sqrt(2))
+    assert np.isclose(cost, 9.52 / 2)
+    assert np.isclose(_normal_huber_cost(residual, 2.0, 0.0), 50.02 / 2)
+
+
+def test_mean_normal_cost_and_information_do_not_depend_on_point_duplication():
+    residual = np.array([3., 4., 0., .06, .08, 0.])
+    J = np.arange(36, dtype=float).reshape(6,6) / 36.
+    for delta in [0., 1.]:
+        A,b,cost,_ = _normal_huber_linearization(residual,J,2.,delta)
+        repeated_A,repeated_b,repeated_cost,_ = _normal_huber_linearization(
+            np.tile(residual,7),np.tile(J,(7,1)),2.,delta)
+        assert np.isclose(repeated_cost,cost)
+        assert np.allclose(repeated_A.T@repeated_A,A.T@A)
+        assert np.allclose(repeated_A.T@repeated_b,A.T@b)
+    assert np.isinf(_normal_huber_cost(np.empty(0),1.,.4))
+
+
+def test_losing_points_without_better_residual_does_not_reduce_candidate_cost():
+    class ConstantVisual:
+        last_active_rows = np.ones(10,dtype=bool)
+        def __len__(self):return 10
+        def evaluate(self,ref,pose):
+            return np.tile([1.,0.,0.],10),np.zeros((30,6)),np.zeros((30,6))
+        def residual_on_fixed_rows(self,ref,pose,rows):
+            return np.array([1.,0.,0.])  # Nine points left contact; same error.
+    solver = GtsamVisualInertialSolver({'gtsam_vi_max_iterations':1,'gtsam_vi_normal_huber_delta':0.})
+    result = solver.refine_current(ConstantVisual(),np.eye(4),_state(0),_state(.1),_samples(),np.eye(4))
+    assert result is not None
+    trace = solver.last_optimization_trace[0]
+    assert np.isclose(trace['base_normal_cost'],.5)
+    assert trace['accepted_scale'] == 1.
+    assert len(trace['attempts']) == 1
+    assert all(np.isclose(x['cost'],trace['base_cost']) for x in trace['attempts'])
+
+
+def test_normal_huber_limits_one_large_contact_outlier_in_joint_solve():
+    class Visual:
+        def __len__(self):
+            return 10
+
+        def evaluate(self, _reference, pose):
+            residual = np.zeros((10, 3))
+            residual[:9, 0] = pose[0, 3] - 0.001
+            residual[9, 0] = pose[0, 3] - 0.1
+            jacobian = np.zeros((30, 6))
+            jacobian[0::3, 3] = 1.0
+            return residual.ravel(), jacobian, jacobian
+
+    solver = GtsamVisualInertialSolver({
+        "gtsam_vi_max_iterations": 1,
+        "gtsam_vi_normal_huber_delta": 0.002,
+        "imu_residual_weight": 1e-12,
+    })
+    result = solver.refine_current(
+        Visual(), np.eye(4), _state(0), _state(0.1), _samples(), np.eye(4)
+    )
+    trace = solver.last_optimization_trace[0]
+    assert result is not None
+    assert trace["downweighted_normal_points"] == 1
+    assert np.isclose(trace["base_normal_cost"], 0.0002025 / 10)
+    final_residual = Visual().evaluate(np.eye(4), result.pose)[0]
+    assert np.isclose(
+        trace["accepted_normal_cost"],
+        _normal_huber_cost(final_residual, 1.0, 0.002),
+    )
+    assert trace["accepted_cost"] < trace["base_cost"]
+    assert np.isclose(result.pose[0, 3], 0.00122, atol=2e-5)
+
+
+def test_native_imu_factor_stationary_and_turning():
+    previous = _state(0.0)
+    current = _state(0.1)
+    current.pose[0, 3] = 0.001
+    solver = GtsamVisualInertialSolver({"gtsam_vi_max_iterations": 2})
+    stationary = preintegrate_combined(
+        _samples(), previous, solver.config, np.eye(4), solver.gravity
+    )
+    moving = preintegrate_combined(
+        _samples(0.5), previous, solver.config, np.eye(4), solver.gravity
+    )
+    assert np.isclose(stationary.deltaTij(), 0.1)
+    assert not np.allclose(stationary.deltaRij().matrix(), moving.deltaRij().matrix())
+    blocks, rhs = combined_imu_current_terms(stationary, previous, current)
+    assert [block.shape for block in blocks.values()] == [(15, 6), (15, 3), (15, 6)]
+    assert rhs.shape == (15,)
+    assert np.all(np.isfinite(rhs))
+    assert np.isclose(
+        _combined_imu_factor(stationary).error(_imu_values(previous, current)),
+        0.5 * rhs @ rhs,
+    )
+
+
+def test_native_imu_factor_uses_nonzero_initial_velocity():
+    previous = _state(0.0)
+    previous.velocity = np.array((0.0, 0.0, 0.02))
+    current = _state(0.1)
+    current.pose[2, 3] = 0.002
+    current.velocity = previous.velocity.copy()
+    gelsight_T_imu = np.eye(4)
+    gelsight_T_imu[:3, :3] = np.array(
+        ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0))
+    )
+    gelsight_T_imu[2, 3] = -0.04
+    previous.pose = previous.pose @ gelsight_T_imu
+    current.pose = current.pose @ gelsight_T_imu
+    gravity = np.array((0.0, 0.0, -9.81))
+    sensor_acceleration = -gelsight_T_imu[:3, :3].T @ gravity
+    samples = [
+        ImuSample(time, sensor_acceleration, (0.0, 0.0, 0.0))
+        for time in np.linspace(0.0, 0.1, 11)
+    ]
+    pim = preintegrate_combined(
+        samples, previous, {}, gelsight_T_imu, gravity
+    )
+    _, correct_rhs = combined_imu_current_terms(pim, previous, current)
+    wrong_previous = previous.copy()
+    wrong_previous.velocity[:] = 0.0
+    _, wrong_rhs = combined_imu_current_terms(pim, wrong_previous, current)
+
+    assert np.linalg.norm(correct_rhs) < 1e-7
+    assert np.linalg.norm(wrong_rhs) > 1.0
+
+
+def test_combined_imu_residual_is_invariant_to_gravity_frame_alignment():
+    gravity_trial = np.array((1.444253, -4.934384, 8.350831))
+    alignment = np.eye(4)
+    alignment[:3, :3] = rotation_aligning_gravity_to_negative_z(gravity_trial)
+    previous = _state(0.0)
+    previous.velocity = np.array((0.05, -0.04, 0.03))
+    previous.accel_bias = np.array((0.003, -0.002, 0.004))
+    previous.gyro_bias = np.array((0.0002, -0.0001, 0.00015))
+    current = _state(0.1)
+    current.pose[:3, 3] = (0.01, -0.03, 0.02)
+    current.velocity = np.array((0.06, 0.01, -0.02))
+    current.accel_bias = previous.accel_bias.copy()
+    current.gyro_bias = previous.gyro_bias.copy()
+    gelsight_T_imu = np.eye(4)
+    gelsight_T_imu[:3, :3] = np.diag((1.0, -1.0, -1.0))
+    gelsight_T_imu[2, 3] = -0.04
+    sensor_acceleration = -gelsight_T_imu[:3, :3].T @ gravity_trial
+    samples = [
+        ImuSample(time, sensor_acceleration, (0.0, 0.0, 0.0))
+        for time in np.linspace(0.0, 0.1, 11)
+    ]
+    unaligned_pim = preintegrate_combined(
+        samples, previous, {}, gelsight_T_imu, gravity_trial
+    )
+    _, unaligned_rhs = combined_imu_current_terms(
+        unaligned_pim, previous, current
+    )
+
+    aligned_previous = previous.copy()
+    aligned_current = current.copy()
+    for state in (aligned_previous, aligned_current):
+        state.pose = alignment @ state.pose
+        state.velocity = alignment[:3, :3] @ state.velocity
+    aligned_gravity = alignment[:3, :3] @ gravity_trial
+    aligned_pim = preintegrate_combined(
+        samples, aligned_previous, {}, gelsight_T_imu, aligned_gravity
+    )
+    _, aligned_rhs = combined_imu_current_terms(
+        aligned_pim, aligned_previous, aligned_current
+    )
+
+    assert np.allclose(aligned_gravity, (0.0, 0.0, -np.linalg.norm(gravity_trial)))
+    assert np.allclose(aligned_rhs, unaligned_rhs, atol=1e-9)
+    assert np.allclose(
+        aligned_pim.preintMeasCov(), unaligned_pim.preintMeasCov()
+    )
+
+
+def test_joint_solver_uses_imu_and_does_not_apply_height_correction():
+    previous, current = _state(0.0), _state(0.1)
+    solver = GtsamVisualInertialSolver({"gtsam_vi_max_iterations": 2})
+    result = solver.refine_current(
+        _FlatVisual(), np.eye(4), previous, current, _samples(), np.eye(4)
+    )
+    assert result is not None
+    assert np.allclose(result.pose, np.eye(4), atol=1e-8)
+    assert solver.refine_current(
+        _FlatVisual(), np.eye(4), previous, current, [], np.eye(4)
+    ) is None
+
+
+def test_joint_solver_reduces_a_real_normal_warp_error():
+    height, width = 80, 80
+    yy, xx = np.mgrid[:height, :width]
+    normals = np.stack((
+        0.08 * np.sin(xx / 9), 0.08 * np.cos(yy / 11),
+        np.ones((height, width)),
+    ), axis=2).astype(np.float32)
+    normals /= np.linalg.norm(normals, axis=2, keepdims=True)
+    frame = SimpleNamespace(
+        N=normals,
+        C=np.ones((height, width), dtype=bool),
+        H=np.zeros((height, width), dtype=np.float32),
+        L=np.arange(height * width, dtype=np.float32).reshape(height, width),
+    )
+    seed = np.eye(4)
+    seed[0, 3] = 0.001
+    visual = DenseNormalResidual(frame, frame, 1.0, np.eye(4), seed, max_samples=1500)
+    result = GtsamVisualInertialSolver({
+        "gtsam_vi_max_iterations": 10,
+        "gtsam_vi_rotation_stop_rad": 1e-7,
+        "gtsam_vi_translation_stop_m": 1e-7,
+    }).refine_current(
+        visual, np.eye(4), _state(0), _state(0.1, seed),
+        _samples(), np.eye(4),
+    )
+    assert result is not None
+    assert abs(result.pose[0, 3]) < 1e-5
+
+
+def test_fixed_imu_reference_z_removes_normal_z_dependence_with_tilted_poses():
+    height, width = 80, 80
+    yy, xx = np.mgrid[:height, :width]
+    normals = np.stack((
+        0.12 * np.sin(xx / 8), 0.11 * np.cos(yy / 9),
+        np.ones((height, width)),
+    ), axis=2).astype(np.float32)
+    normals /= np.linalg.norm(normals, axis=2, keepdims=True)
+    frame = SimpleNamespace(
+        N=normals,
+        C=np.ones((height, width), dtype=bool),
+        H=np.zeros((height, width), dtype=np.float32),
+        L=np.arange(height * width, dtype=np.float32).reshape(height, width),
+    )
+    reference = np.eye(4)
+    reference[:3, :3] = gtsam.Rot3.Rodrigues(0.15, -0.08, 0.1).matrix()
+    target = reference @ gtsam.Pose3(
+        gtsam.Rot3.Rodrigues(-0.05, 0.04, 0.02),
+        gtsam.Point3(0.002, -0.001, 0.004),
+    ).matrix()
+    visual = DenseNormalResidual(frame, frame, 1.0, reference, target, 1500)
+    visual.set_fixed_reference_z(0.002)
+    base_residual, _, jacobian = visual.evaluate(reference, target)
+    base_rows = visual.last_active_rows.copy()
+    target_shifted = target.copy()
+    target_shifted[:3, 3] += reference[:3, 2] * 0.003
+    shifted_residual, _, _ = visual.evaluate(reference, target_shifted)
+    assert np.array_equal(base_rows, visual.last_active_rows)
+    assert np.allclose(shifted_residual, base_residual, atol=1e-9)
+    tangent_reference_z = target[:3, :3].T @ reference[:3, 2]
+    assert np.linalg.norm(jacobian[:, 3:6] @ tangent_reference_z) < 1e-10
+
+
+def test_normal_reference_z_uses_native_imu_prediction():
+    previous = _state(0.0)
+    previous.velocity[2] = 0.02
+    current = _state(0.1)
+    visual = _FlatVisual()
+    visual.set_fixed_reference_z = lambda value: setattr(visual, "fixed_z", value)
+    solver = GtsamVisualInertialSolver({
+        "gtsam_vi_max_iterations": 1,
+        "gtsam_vi_normal_reference_z_from_imu": True,
+    })
+    result = solver.refine_current(
+        visual, np.eye(4), previous, current, _samples(), np.eye(4)
+    )
+    assert result is not None
+    assert np.isclose(visual.fixed_z, 0.002, atol=1e-10)
+    assert np.isclose(solver.last_fixed_normal_reference_z_m, 0.002, atol=1e-10)
+
+
+def test_zero_pose_z_jacobian_prevents_spurious_normal_z_step():
+    class Visual:
+        def __len__(self):
+            return 10
+
+        def evaluate(self, _reference, pose):
+            residual = np.full(30, pose[0, 3] - 0.001)
+            jacobian = np.zeros((30, 6))
+            jacobian[:, 3] = 1.0
+            jacobian[:, 5] = 1.0  # The residual has no Z dependence.
+            return residual, jacobian, jacobian
+
+    solver = GtsamVisualInertialSolver({
+        "gtsam_vi_max_iterations": 1,
+        "gtsam_vi_normal_zero_pose_z_jacobian": True,
+        "dense_normalflow_residual_weight": 1e8,
+        "imu_residual_weight": 1e-12,
+    })
+    result = solver.refine_current(
+        Visual(), np.eye(4), _state(0), _state(0.1), _samples(), np.eye(4)
+    )
+    assert result is not None
+    assert np.isclose(result.pose[0, 3], 0.001, atol=1e-7)
+    assert abs(result.pose[2, 3]) < 1e-7
+
+
+def test_normalflow_rows_and_pose_jacobian_follow_original_method():
+    height, width = 40, 40
+    yy, xx = np.mgrid[:height, :width]
+    normals = np.stack((
+        0.1 * np.sin(xx / 7), 0.1 * np.cos(yy / 7),
+        np.ones((height, width)),
+    ), axis=2).astype(np.float32)
+    normals /= np.linalg.norm(normals, axis=2, keepdims=True)
+    laplacian = (xx * width + yy).astype(np.float32)
+    contact = np.ones((height, width), dtype=bool)
+    target_contact = np.zeros_like(contact)
+    target_contact[:, 5:35] = True
+    reference = SimpleNamespace(
+        N=normals, C=contact, H=np.zeros((height, width), np.float32), L=laplacian,
+    )
+    target = SimpleNamespace(
+        N=normals, C=target_contact, H=reference.H, L=laplacian,
+    )
+    reference_pose = np.eye(4)
+    target_pose = np.eye(4)
+    target_pose[0, 3] = 0.005
+    visual = DenseNormalResidual(
+        reference, target, 1.0, reference_pose, target_pose, max_samples=200
+    )
+    residual, _, target_jacobian = visual.evaluate(reference_pose, target_pose)
+    fixed_rows = visual.last_active_rows.copy()
+    assert np.allclose(
+        visual.residual_on_fixed_rows(reference_pose, target_pose, fixed_rows),
+        residual,
+    )
+    lost_contact = target_pose.copy()
+    lost_contact[0, 3] = 0.003
+    partial_residual = visual.residual_on_fixed_rows(
+        reference_pose, lost_contact, fixed_rows
+    )
+    assert partial_residual is not None
+    overlap = visual._shared_projection(reference_pose, lost_contact, min_points=1)[-1]
+    assert 0 < np.count_nonzero(overlap & fixed_rows) < np.count_nonzero(fixed_rows)
+    assert partial_residual.shape == (3 * np.count_nonzero(overlap & fixed_rows),)
+    all_lost = target_pose.copy()
+    all_lost[0, 3] = 1.
+    assert visual.residual_on_fixed_rows(reference_pose, all_lost, fixed_rows) is None
+    count = len(residual)
+    shifted = target_pose.copy()
+    shifted[0, 3] = 0.003
+    assert len(visual.evaluate(reference_pose, shifted)[0]) != count
+
+    threshold = np.partition(np.abs(laplacian).ravel(), -200)[-200] + 1e-6
+    mask = np.abs(laplacian) >= threshold
+    points = height2pointcloud(reference.H, mask, 1.0)
+    relative = np.linalg.inv(target_pose) @ reference_pose
+    projected = points @ relative[:3, :3].T + relative[:3, 3]
+    pixel_x = (projected[:, 0] * 1000.0 + width / 2 - 0.5).astype(np.float32)
+    pixel_y = (projected[:, 1] * 1000.0 + height / 2 - 0.5).astype(np.float32)
+    active = (
+        (wide_remap(target_contact.astype(np.float32), pixel_x, pixel_y,
+                    mode=0)[:, 0] > 0.5)
+        & (pixel_x >= 0) & (pixel_x < width)
+        & (pixel_y >= 0) & (pixel_y < height)
+    )
+    remapped = wide_remap(normals, pixel_x, pixel_y)[:, 0, :]
+    original_residual = (remapped - normals[mask])[active].reshape(-1)
+    original_jacobian = np.transpose(
+        get_J(normals, mask, points, 1.0), (2, 0, 1)
+    )[active].reshape(-1, 5)
+    original_six = np.zeros((len(original_residual), 6))
+    original_six[:, :3] = original_jacobian[:, :3]
+    original_six[:, 3:5] = original_jacobian[:, 3:5]
+    assert np.allclose(residual, original_residual, atol=1e-6)
+    assert np.allclose(
+        target_jacobian, -original_six @ adjoint(np.linalg.inv(relative)),
+        atol=1e-6,
+    )
+    # GTSAM uses a right Pose3 tangent. The smooth rotation direction agrees
+    # with a finite difference; OpenCV's remap quantizes subpixel translation.
+    delta = np.array((1e-6, 0, 0, 0, 0, 0))
+    moved = gtsam.Pose3(target_pose).retract(delta).matrix()
+    moved_residual = visual.evaluate(reference_pose, moved)[0]
+    assert np.allclose(
+        moved_residual - residual, target_jacobian @ delta, atol=1e-7
+    )
+    alignment = np.eye(4)
+    alignment[:3, :3] = rotation_aligning_gravity_to_negative_z(
+        np.array((1.0, -3.0, 9.0))
+    )
+    aligned_reference = alignment @ reference_pose
+    aligned_target = alignment @ target_pose
+    aligned_visual = DenseNormalResidual(
+        reference, target, 1.0, aligned_reference, aligned_target,
+        max_samples=200,
+    )
+    aligned_residual, _, aligned_jacobian = aligned_visual.evaluate(
+        aligned_reference, aligned_target
+    )
+    assert np.allclose(aligned_residual, residual, atol=1e-7)
+    assert np.allclose(aligned_jacobian, target_jacobian, atol=1e-7)
+
+
+def test_candidate_residual_accepts_one_remaining_contact_point():
+    height = width = 40
+    yy, xx = np.mgrid[:height, :width]
+    normals = np.stack((.1*np.sin(xx/7), .1*np.cos(yy/7), np.ones_like(xx)), axis=2).astype(np.float32)
+    reference = SimpleNamespace(N=normals, C=np.ones((height,width), bool),
+                                H=np.zeros((height,width), np.float32), L=(xx*width+yy).astype(np.float32))
+    target = SimpleNamespace(N=normals.copy(), C=reference.C.copy(), H=reference.H, L=reference.L)
+    visual = DenseNormalResidual(reference,target,1.,np.eye(4),np.eye(4),max_samples=200)
+    residual,_,_ = visual.evaluate(np.eye(4),np.eye(4))
+    rows = visual.last_active_rows.copy()
+    selected = int(np.flatnonzero(rows)[0])
+    px,py = visual._pixel_coordinates(visual.candidate_points)
+    x,y = int(round(float(px[selected]))),int(round(float(py[selected])))
+    target.C[:] = False
+    target.C[y,x] = True
+    target.N[y,x,0] += .2
+
+    # Candidate scoring needs just one row; the linearization minimum stays 10.
+    candidate = visual.residual_on_fixed_rows(np.eye(4),np.eye(4),rows)
+    assert candidate is not None
+    assert candidate.shape == (3,)
+    assert np.allclose(candidate, [.2,0.,0.],atol=1e-6)
+    assert visual.evaluate(np.eye(4),np.eye(4)) is None
+
+    rows_without_selected = rows.copy()
+    rows_without_selected[selected] = False
+    assert visual.residual_on_fixed_rows(np.eye(4),np.eye(4),rows_without_selected) is None
+    target.C[:] = False
+    assert visual.residual_on_fixed_rows(np.eye(4),np.eye(4),rows) is None
+
+
+def _keyframe(x, new, group):
+    pose = np.eye(4)
+    pose[0, 3] = x
+    return SimpleNamespace(
+        trial_T_curr=pose,
+        trial_group=group,
+        is_new_trial=lambda: new,
+    )
+
+
+def _graph():
+    return PoseGraph({"gelslam_config": {"pose_graph_config": {
+        "loop_closure_only_optimization": True,
+    }}})
+
+
+def test_pose_graph_keeps_aligned_anchor_during_solve_and_reload(tmp_path):
+    rotation = rotation_aligning_gravity_to_negative_z([1., -3., 9.])
+    keyframes = [backend_frame(0, new=True), backend_frame(1)]
+    for keyframe in keyframes:
+        keyframe.trial_T_curr[:3, :3] = rotation
+        keyframe.navigation_state.pose[:3, :3] = rotation
+        keyframe.gravity = -rotation @ np.array([0., 0., 9.81])
+    graph = PoseGraph(backend_config())
+    graph.add_keyframes(keyframes, 0, 2)
+    graph.solve(global_optimization=True)
+    assert np.allclose(graph.poses[0], keyframes[0].trial_T_curr, atol=1e-10)
+    graph.save(tmp_path)
+    loaded = PoseGraph.load(tmp_path)
+    loaded.solve(global_optimization=True)
+    assert np.allclose(loaded.poses, graph.poses, atol=1e-8)
+    assert np.allclose(loaded.prior_poses[0], keyframes[0].trial_T_curr)
+
+def test_navigation_graph_direct_loop_merge_and_reload(tmp_path):
+    graph = PoseGraph(backend_config())
+    keyframes = [backend_frame(0, new=True), backend_frame(1),
+                 backend_frame(2, new=True, group=1), backend_frame(3, group=1)]
+    graph.add_keyframes(keyframes, 0, 4)
+    assert graph.factor_kinds.count('imu') == 2
+    assert graph.factor_kinds.count('normal') == 2
+    assert all(edge[2] is None for edge in graph.edges)
+    assert graph._add_loop_pair(1, 3, np.eye(4))
+    graph.remove_prior_factors([1])
+    solution = graph.solve(global_optimization=True)
+    assert graph.prior_keys == [0, -1]
+    graph.save(tmp_path)
+    loaded = PoseGraph.load(tmp_path)
+    assert np.allclose(loaded.poses, graph.poses)
+    assert loaded.prior_keys == [0, -1]
+    assert len(loaded.edges) == 3
+    keyframes.append(backend_frame(4, group=1))
+    loaded.add_keyframes(keyframes, 4, 5)
+    assert loaded.states[4].timestamp == pytest.approx(1.4)
+
+def test_pose_graph_loop_only_and_local_window_modes():
+    graph = PoseGraph(backend_config(loop_closure_only_optimization=True))
+    keyframes = [backend_frame(0, new=True), backend_frame(1, z=.002), backend_frame(2)]
+    graph.add_keyframes(keyframes, 0, 3)
+    assert np.isclose(graph.solve()[1][2, 3], .002)
+    graph.pose_graph_config['loop_closure_only_optimization'] = False
+    result = graph.solve()
+    assert abs(result[1][2, 3]) < 1e-6
+
+def test_tactile_noise_uses_explicit_normal_and_height_settings():
+    from gelslam.core.backend_factors import TactilePair
+    first, second = backend_frame(), backend_frame(1)
+    pair = TactilePair(first, second, np.eye(4), np.eye(4), np.eye(4),
+                       {'tactile_normal_sigma': .2, 'tactile_height_sigma_m': .0003})
+    assert pair.normal_sigma == .2 and pair.height_sigma == .0003
+    with pytest.raises(ValueError, match='tactile sigmas'):
+        TactilePair(first, second, np.eye(4), np.eye(4), np.eye(4),
+                    {'tactile_height_sigma_m': 0})
+
+def test_loop_registration_initializes_pose_but_adds_direct_observation_factors(monkeypatch):
+    import gelslam.core.gtsam_pose_graph as module
+    graph = PoseGraph(backend_config())
+    anchors = [backend_frame(0, new=True), backend_frame(1, new=True, group=1)]
+    graph.add_keyframes(anchors, 0, 2)
+    points = [SimpleNamespace(pt=(float(i), 0.0)) for i in range(8)]
+    for keyframe in anchors:
+        keyframe.kp = points
+        keyframe.des = np.zeros((8, 2), dtype=np.float32)
+    matches = [SimpleNamespace(queryIdx=i, trainIdx=i) for i in range(8)]
+    monkeypatch.setattr(module.cv2, 'BFMatcher',
+                        lambda *_a, **_k: SimpleNamespace(match=lambda *_: matches))
+    monkeypatch.setattr(module.cv2, 'estimateAffinePartial2D',
+                        lambda *_a, **_k: (np.eye(2, 3), np.ones((8, 1))))
+    target_from_reference = np.eye(4)
+    target_from_reference[0, 3] = -.002
+    monkeypatch.setattr(module, 'normalflow', lambda *_a, **_k: target_from_reference)
+    graph.pose_graph_config.update(min_sift_inliers=8, scr_threshold=.3, ccs_threshold=.7)
+    matched = graph.detect_and_add_loops(anchors, 1, SimpleNamespace(size=lambda: 0))
+    assert matched == [0]
+    assert graph.poses[1][0, 3] == pytest.approx(.002)
+    assert graph.edges[-1][2] is None
+    assert graph.factor_kinds[-3:-1] == ['normal', 'height']

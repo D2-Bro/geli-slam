@@ -5,7 +5,61 @@ from gelslam.core.pose_graph import PoseGraphSolutions
 from gelslam.utils import pointcloud2mesh
 
 
-def compute_visible_coverage_meshes(visible_coverage_graph_msg, keyframedb, kid2kidx):
+def compute_frontend_tracking_meshes(keyframedb, *, create_meshes=True):
+    """Build the current trial mesh from tracker odometry only.
+
+    This path deliberately does not use loop closures, coverage selection, or
+    pose-graph solutions. Each keyframe point cloud uses the trial pose that
+    the tracker published. A new trial
+    has no tracked transform to an earlier trial, so only the newest trial is
+    displayed in its own local map frame.
+    Set create_meshes=False to keep only XYZ point arrays for RViz.
+    """
+    if keyframedb.size() == 0:
+        return VisibleCoverageMeshes()
+
+    trial_start_kidx = 0
+    for kidx in range(keyframedb.size() - 1, -1, -1):
+        if keyframedb[kidx].is_new_trial():
+            trial_start_kidx = kidx
+            break
+    kidxs = list(range(trial_start_kidx, keyframedb.size()))
+
+    n_points = sum(keyframedb[kidx].pointcloud.shape[0] for kidx in kidxs)
+    if n_points > 1000000:
+        viz_level = 3
+    elif n_points > 350000:
+        viz_level = 2
+    elif n_points > 150000:
+        viz_level = 1
+    else:
+        viz_level = 0
+
+    meshes = []
+    pointclouds = []
+    for kidx in kidxs:
+        keyframe = keyframedb[kidx]
+        start_T_curr = keyframe.trial_T_curr
+        pointcloud = keyframe.get_pointcloud(viz_level)
+        pointcloud = (
+            start_T_curr[:3, :3] @ pointcloud.T
+        ).T + start_T_curr[:3, 3]
+        if create_meshes:
+            meshes.append(pointcloud2mesh(pointcloud, keyframe.get_C(viz_level)))
+        else:
+            pointclouds.append(pointcloud)
+
+    return VisibleCoverageMeshes(
+        meshes,
+        trial_start_kidx,
+        np.asarray(keyframedb[trial_start_kidx].trial_T_curr, dtype=np.float32).copy(),
+        viz_level,
+        pointclouds=pointclouds,
+    )
+
+
+def compute_visible_coverage_meshes(visible_coverage_graph_msg, keyframedb, kid2kidx,
+                                  *, create_meshes=True):
     """
     Compute the visible coverage meshes.
     Determines visualization level based on point count.
@@ -13,6 +67,7 @@ def compute_visible_coverage_meshes(visible_coverage_graph_msg, keyframedb, kid2
     :param visible_coverage_graph_msg: VisibleCoverageGraphMsg; The visible coverage graph message.
     :param keyframedb: KeyFrameDB; The keyframe database.
     :param kid2kidx: dict; The mapping from kid to kidx.
+    :param create_meshes: bool; False skips triangulation and retains XYZ arrays.
     :return: VisibleCoverageMeshes; The visible coverage meshes.
     """
     kidxs = []
@@ -37,7 +92,10 @@ def compute_visible_coverage_meshes(visible_coverage_graph_msg, keyframedb, kid2
     if len(kidxs) == 0:
         start_T_currs = np.zeros((0, 4, 4), dtype=np.float32)
     else:
-        start_T_currs = np.zeros((kidxs[-1] + 1, 4, 4), dtype=np.float32)
+        # Visible coverage nodes are not guaranteed to arrive in kidx order
+        # (loop-closure updates can reorder them).  Size by the largest index,
+        # not the final list element, so every mapped keyframe has a slot.
+        start_T_currs = np.zeros((max(kidxs) + 1, 4, 4), dtype=np.float32)
     for visible_coverage_node_msg in visible_coverage_graph_msg.visible_coverage_nodes:
         try:
             kidx = kid2kidx[visible_coverage_node_msg.kid]
@@ -48,6 +106,7 @@ def compute_visible_coverage_meshes(visible_coverage_graph_msg, keyframedb, kid2
     pose_graph_solutions = PoseGraphSolutions(start_T_currs)
     # Create the meshes
     meshes = []
+    pointclouds = []
     for visible_coverage_node_msg in visible_coverage_graph_msg.visible_coverage_nodes:
         try:
             kidx = kid2kidx[visible_coverage_node_msg.kid]
@@ -64,10 +123,13 @@ def compute_visible_coverage_meshes(visible_coverage_graph_msg, keyframedb, kid2
                 pose_graph_solutions,
                 viz_level,
             )
-            adjusted_mesh = pointcloud2mesh(
-                adjusted_pointcloud, keyframedb[kidx].get_C(viz_level)
-            )
-            meshes.append(adjusted_mesh)
+            if create_meshes:
+                adjusted_mesh = pointcloud2mesh(
+                    adjusted_pointcloud, keyframedb[kidx].get_C(viz_level)
+                )
+                meshes.append(adjusted_mesh)
+            else:
+                pointclouds.append(adjusted_pointcloud)
         except KeyError:
             pass
     # Create the visible coverage meshes
@@ -75,7 +137,8 @@ def compute_visible_coverage_meshes(visible_coverage_graph_msg, keyframedb, kid2
         visible_coverage_meshes = VisibleCoverageMeshes(meshes)
     else:
         visible_coverage_meshes = VisibleCoverageMeshes(
-            meshes, kidxs[-1], pose_graph_solutions[kidxs[-1]], viz_level
+            meshes, kidxs[-1], pose_graph_solutions[kidxs[-1]], viz_level,
+            pointclouds=pointclouds,
         )
     return visible_coverage_meshes
 
@@ -92,8 +155,10 @@ class VisibleCoverageMeshes:
         lc_kidx=None,
         start_T_lc=None,
         viz_level=0,
+        pointclouds=None,
     ):
         self.visible_coverage_meshes = visible_coverage_meshes
+        self.visible_coverage_pointclouds = [] if pointclouds is None else pointclouds
         # The last loop closing keyframe's kidx
         self.lc_kidx = lc_kidx
         self.start_T_lc = start_T_lc
@@ -109,13 +174,14 @@ class VisibleCoverageMeshes:
             - bool: If the keyframe is not in the same parent group as the visible coverage meshes.
             - np.ndarray: The pose of the keyframe reference to the visible coverage meshes.
         """
-        if len(self.visible_coverage_meshes) == 0:
-            return True, np.eye(4, dtype=np.float32)
-        start_T_prev = self.start_T_lc
+        if self.lc_kidx is None:
+            keyframe = keyframedb[tar_kidx]
+            return keyframe.is_new_trial(), np.asarray(
+                keyframe.trial_T_curr, dtype=np.float32
+            ).copy()
         for kidx in range(self.lc_kidx + 1, tar_kidx + 1):
-            keyframe = keyframedb[kidx]
-            if keyframe.is_new_trial():
-                return True, np.eye(4, dtype=np.float32)
-            else:
-                start_T_prev = start_T_prev @ keyframe.ref_T_curr
-        return False, start_T_prev
+            if keyframedb[kidx].is_new_trial():
+                return True, np.asarray(keyframedb[tar_kidx].trial_T_curr, dtype=np.float32).copy()
+        trial_T_lc = keyframedb[self.lc_kidx].trial_T_curr
+        trial_T_target = keyframedb[tar_kidx].trial_T_curr
+        return False, self.start_T_lc @ np.linalg.inv(trial_T_lc) @ trial_T_target

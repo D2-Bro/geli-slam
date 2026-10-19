@@ -18,5 +18,19 @@ int32 kid
 int32 fid
 # New trial flag
 bool new_trial_flag
-# Transformation matrix (4, 4) as a flattened array
-float32[] ref_t_curr
+# Pose of this keyframe in its trial's first-keyframe coordinates (4x4).
+float32[] trial_t_curr
+
+# IMU-origin navigation seed at this keyframe's synchronized IMU time.
+# World axes are the same as trial_t_curr. These are initial values, not factors.
+bool navigation_valid
+float64 navigation_timestamp
+float64[3] velocity
+float64[3] accel_bias
+float64[3] gyro_bias
+float64[3] gravity
+# False for an IMU-only recovery keyframe whose tactile match was rejected.
+bool tactile_valid true
+# Previous emitted keyframe to this keyframe, including both time endpoints.
+# Rows: [timestamp_s, ax, ay, az, wx, wy, wz], in calibrated IMU units/axes.
+float64[] imu_measurements

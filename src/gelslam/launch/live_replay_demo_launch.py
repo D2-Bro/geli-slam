@@ -19,6 +19,11 @@ def generate_launch_description():
     data_dir_arg = DeclareLaunchArgument(
         "data_dir", description="Directory of the saved data"
     )
+    sequence_name_arg = DeclareLaunchArgument(
+        "sequence_name",
+        default_value="",
+        description="Evaluation output folder name; defaults to the data_dir name",
+    )
     config_path_arg = DeclareLaunchArgument(
         "config_path",
         default_value=os.path.join(
@@ -67,6 +72,7 @@ def generate_launch_description():
                 "data_dir": LaunchConfiguration("data_dir"),
                 "rendering": LaunchConfiguration("rendering"),
                 "save_gelslam_states": LaunchConfiguration("save_gelslam_states"),
+                "sequence_name": LaunchConfiguration("sequence_name"),
             }
         ],
     )
@@ -94,6 +100,7 @@ def generate_launch_description():
     return LaunchDescription(
         [
             data_dir_arg,
+            sequence_name_arg,
             config_path_arg,
             rendering_arg,
             skip_background_check_arg,

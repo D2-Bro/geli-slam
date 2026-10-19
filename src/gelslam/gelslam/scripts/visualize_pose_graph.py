@@ -9,7 +9,7 @@ from gelslam.core.coverage_graph import CoverageGraph
 from gelslam.core.keyframe import KeyFrameDB
 from gelslam.core.parent_groups_info import ParentGroupsInfo
 from gelslam.core.pose_graph import PoseGraph, PoseGraphSolutions
-from gelslam.utils import Logger, matrix_in_m
+from gelslam.utils import Logger
 
 
 def create_edge_mesh(point1, point2, color=[0, 0, 0], radius=0.00005):
@@ -108,9 +108,8 @@ def main():
         keyframe = keyframedb[kidx]
         C = keyframe.C
         H = keyframe.H
-        start_T_curr = matrix_in_m(
-            pose_graph.graph_result.atPose3(kidx).matrix()
-        ).astype(np.float32)
+        # Graph variables are IMU poses; patch centers use GelSight poses.
+        start_T_curr = np.asarray(pose_graph.poses[kidx], dtype=np.float32)
         cy, cx = np.mean(np.column_stack(np.where(C)), axis=0)
         cz = H[int(cy), int(cx)] - 8
         center = (
@@ -134,11 +133,8 @@ def main():
         node_mesh.translate(keyframe_centers[kidx])
         vis_objects.append(node_mesh)
     # Create edge meshes
-    for i in range(pose_graph.graph.size()):
-        factor = pose_graph.graph.at(i)
-        if len(factor.keys()) == 1:
-            continue
-        kidx1, kidx2 = factor.keys()
+    for factor in pose_graph.visual_edges:
+        kidx1, kidx2 = factor.reference, factor.target
         parent_group1 = parent_groups_info.get_parent_group(kidx1, keyframedb)
         if parent_group1 != active_parent_group:
             continue

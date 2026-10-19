@@ -99,7 +99,7 @@ def main():
     tracker = Tracker(
         calib_model_path, config, skip_background_check=True, logger=logger
     )
-    keyframedb = KeyFrameDB(ppmm, logger)
+    keyframedb = KeyFrameDB(ppmm, logger, config.get("imu_config", {}).get("gelsight_T_imu"))
     pose_graph = PoseGraph(config)
     pose_graph_solutions = PoseGraphSolutions()
     parent_groups_info = ParentGroupsInfo()
@@ -131,8 +131,8 @@ def main():
                 "Loop Closure -- Begin: current keyframe database size: %d"
                 % (targeted_size)
             )
-            # Add odometry factors
-            pose_graph.add_odometry_factors(keyframedb, updated_size, targeted_size)
+            # The 15D backend requires synchronized IMU/navigation data.
+            pose_graph.add_keyframes(keyframedb, updated_size, targeted_size)
             tar_kidx = targeted_size - 1
             # Detect and add loops
             matched_kidxs = pose_graph.detect_and_add_loops(
@@ -161,7 +161,11 @@ def main():
             # Remove prior factors
             pose_graph.remove_prior_factors(removed_trial_groups)
             # Pose graph optimization
-            pose_graph_solutions = pose_graph.solve()
+            # Loop factors can affect any prior keyframe.  Use a full solve
+            # when this iteration added at least one loop factor.
+            pose_graph_solutions = pose_graph.solve(
+                global_optimization=bool(matched_kidxs)
+            )
             # Add new coverage node to coverage graph that represents new keyframes
             coverage_graph.add_new_coverage_nodes(updated_size, targeted_size)
             # Update the coverage graph based on the new keyframes from other trials
@@ -206,18 +210,20 @@ def main():
                 )
                 # Update keyframe's meshes in the visualizer
                 targeted_size = keyframedb.size()
-                ref_kidx = keyframedb.find_kidx_from_kid(
-                    frame_msg.ref_kid, targeted_size
+                ref_kid = (
+                    frame_msg.ref_kid if frame_msg is not None
+                    else keyframe_msgs[-1].kid
                 )
+                ref_kidx = keyframedb.find_kidx_from_kid(ref_kid, targeted_size)
                 if ref_kidx is not None:
-                    # "None" happens when failed to track, where two keyframe_msgs are created
+                    # A dropped frame can still promote the previous frame.
                     new_trial_flag, start_T_ref = (
                         visible_coverage_meshes.get_keyframe_pose(ref_kidx, keyframedb)
                     )
                     vis.clear_geometries()
                     vis.add_visible_coverage_meshes(visible_coverage_meshes)
         # Visualize current frame and update viewing pose
-        if args.rendering:
+        if args.rendering and frame_msg is not None:
             # Update keyframe meshes
             if len(keyframe_msgs) > 0:
                 if new_trial_flag:

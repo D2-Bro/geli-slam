@@ -20,6 +20,7 @@ from gelslam.core.keyframe import KeyFrameDB
 from gelslam.utils import Logger
 from gelslam.visualization.visible_coverage_meshes import (
     VisibleCoverageMeshes,
+    compute_frontend_tracking_meshes,
     compute_visible_coverage_meshes,
 )
 from gelslam.visualization.visualizer import Visualizer
@@ -60,6 +61,10 @@ class VisualizerNode(Node):
         data_dir = self.get_parameter("data_dir").get_parameter_value().string_value
         data_dir = os.path.abspath(os.path.expanduser(data_dir))
         self.save_dir = os.path.join(data_dir, "gelslam_online")
+        self.declare_parameter("use_backend_poses", True)
+        self.use_backend_poses = bool(
+            self.get_parameter("use_backend_poses").value
+        )
 
         # The overall running flag
         self.running = True
@@ -72,7 +77,8 @@ class VisualizerNode(Node):
         self.add_keyframe_lock = threading.Lock()
         self.keyframedb = KeyFrameDB(self.ppmm, Logger())
 
-        # Visible coverage meshes are updated only in M thread (triggered by loop closure).
+        # Backend mode updates these from pose-graph messages.  Tracker-only
+        # mode updates them from each new keyframe's tracked pose.
         self.visible_coverage_meshes_update_lock = threading.Lock()
         self.visible_coverage_meshes = VisibleCoverageMeshes()
         self.visible_coverage_meshes_update_count = 0
@@ -136,6 +142,16 @@ class VisualizerNode(Node):
         """
         with self.add_keyframe_lock:
             self.keyframedb.insert(keyframe_msg)
+            if not self.use_backend_poses:
+                visible_coverage_meshes = compute_frontend_tracking_meshes(
+                    self.keyframedb
+                )
+            else:
+                visible_coverage_meshes = None
+        if visible_coverage_meshes is not None:
+            with self.visible_coverage_meshes_update_lock:
+                self.visible_coverage_meshes = visible_coverage_meshes
+                self.visible_coverage_meshes_update_count += 1
 
     def visible_coverage_graph_callback(self, msg):
         """
@@ -143,6 +159,8 @@ class VisualizerNode(Node):
 
         :param msg: VisibleCoverageGraphMsg; The visible coverage graph message.
         """
+        if not self.use_backend_poses:
+            return
         # Get mapping from kid to kidx
         with self.add_keyframe_lock:
             kid2kidx = self.keyframedb.get_kid2kidx()

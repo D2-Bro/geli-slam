@@ -10,6 +10,7 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", ["launch/bag_replay_launch.py"]),
+        ("share/" + package_name + "/launch", ["launch/imu_propagation_launch.py"]),
         ("share/" + package_name + "/launch", ["launch/live_replay_demo_launch.py"]),
         ("share/" + package_name + "/launch", ["launch/live_demo_launch.py"]),
         (
@@ -17,6 +18,7 @@ setup(
             [
                 "config/config.yaml",
                 "config/bag_simulation_config.yaml",
+                "config/real_config.yaml",
                 "config/gelslam_rviz.rviz",
             ],
         ),
@@ -25,7 +27,7 @@ setup(
             ["resources/example_calibration/model/nnmodel.pth"],
         ),
     ],
-    install_requires=["setuptools"],
+    install_requires=["setuptools", "gtsam>=4.3.0,<5"],
     zip_safe=True,
     maintainer="rpl",
     maintainer_email="hungjuih@andrew.cmu.edu",
@@ -40,6 +42,7 @@ setup(
             "pose_graph_node = gelslam.nodes.pose_graph_node:main",
             "visualizer_node = gelslam.nodes.visualizer_node:main",
             "rviz_visualizer_node = gelslam.nodes.rviz_visualizer_node:main",
+            "imu_propagation_node = gelslam.nodes.imu_propagation_node:main",
             "gelslam_offline = gelslam.scripts.gelslam_offline:main",
             "visualize_pose_graph = gelslam.scripts.visualize_pose_graph:main",
         ],
