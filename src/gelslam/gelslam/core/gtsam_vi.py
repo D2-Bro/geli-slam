@@ -6,7 +6,7 @@ from contextlib import nullcontext
 import gtsam
 import numpy as np
 
-from gelslam.core.numpy_vi import NavigationState, adjoint
+from gelslam.core.numpy_vi import NavigationState, adjoint, gelsight_z_pose_jacobian
 from gelslam.core.marginal_prior import (
     NavigationPrior, marginalize_rows, marginalize_rows_system,
 )
@@ -157,6 +157,9 @@ def _new_preintegration(previous, config, gravity, combined=False):
     if not hasattr(params, "setImuFactorErrorMode"):
         raise RuntimeError("Separated IMU errors require GTSAM ImuFactorErrorMode support")
     params.setImuFactorErrorMode(gtsam.ImuFactorErrorMode.ComponentWise)
+    if not hasattr(params, "setUseMidpointIntegration"):
+        raise RuntimeError("IMU midpoint integration requires the patched GTSAM API")
+    params.setUseMidpointIntegration(True)
     accel = float(config.get("accelerometer_noise_density", 0.02))
     gyro = float(config.get("gyroscope_noise_density", 0.002))
     accel_walk = float(config.get("accelerometer_bias_random_walk", 0.0002))
@@ -184,7 +187,8 @@ def _integrate_measurements(pim, samples):
     for current, following in zip(samples, samples[1:]):
         dt = float(following.timestamp - current.timestamp)
         # samples_covering() already interpolates both image-time endpoints.
-        # Average adjacent measurements as in ORB-SLAM3 PreintegrateIMU().
+        # Native Tangent preintegration rotates these interval averages with
+        # the half-step attitude, including bias/noise Jacobians.
         acceleration = 0.5 * (current.acceleration + following.acceleration)
         angular_velocity = 0.5 * (current.angular_velocity + following.angular_velocity)
         pim.integrateMeasurement(acceleration, angular_velocity, dt)
@@ -494,7 +498,7 @@ class GtsamVisualInertialSolver:
     def _joint_rows(self, factors, prior, previous, current, *, values=None):
         # Huber is restricted to the normal measurements. IMU, bias and prior
         # retain their ordinary whitened least-squares rows in every iteration.
-        Ap, bp = prior.linearize(previous)
+        Ap, bp = (np.empty((0, 15)), np.empty(0)) if prior is None else prior.linearize(previous)
         if values is None:
             values = _imu_values(previous, current)
         rows = [navigation_factor_terms(factor, previous, current, values=values)
@@ -507,9 +511,7 @@ class GtsamVisualInertialSolver:
                 np.concatenate([bp] + [row[2] * scale for row in rows]))
 
     def _height_z_jacobian(self, gel_from_imu_increment):
-        jacobian = np.zeros((1, 6))
-        jacobian[0, 5] = 1.0 / self.height_z_sigma
-        return jacobian @ gel_from_imu_increment
+        return gelsight_z_pose_jacobian(gel_from_imu_increment, self.height_z_sigma)
 
     def _height_z_linearization(self, visual, reference_pose, target_pose,
                                 gel_from_imu_increment, *, jacobian=None):
@@ -576,7 +578,7 @@ class GtsamVisualInertialSolver:
         )
 
     def refine_current(self, visual, reference_pose, previous, current, samples,
-                       gelsight_T_imu, preintegrated=None):
+                       gelsight_T_imu, preintegrated=None, *, fixed_anchor=False):
         """Optimize IMU states; evaluate tactile observations with GelSight poses.
 
         reference_pose is the fixed GelSight reference pose in the navigation world.
@@ -593,10 +595,14 @@ class GtsamVisualInertialSolver:
         with cache() if cache is not None else nullcontext():
             return self._refine_current(
                 visual, reference_pose, previous, current, samples,
-                gelsight_T_imu, preintegrated=preintegrated)
+                gelsight_T_imu, preintegrated=preintegrated, fixed_anchor=fixed_anchor)
+
+    def refine_from_keyframe(self, *args, **kwargs):
+        """Condition on corrected K_k and form a fresh prior for target F_j."""
+        return self.refine_current(*args, **kwargs, fixed_anchor=True)
 
     def _refine_current(self, visual, reference_pose, previous, current, samples,
-                        gelsight_T_imu, preintegrated=None):
+                        gelsight_T_imu, preintegrated=None, fixed_anchor=False):
         """Run the solve while its image-pair projection cache is active."""
         self.last_optimization_trace = []
         self.last_fixed_normal_reference_z_m = None
@@ -614,8 +620,10 @@ class GtsamVisualInertialSolver:
             self.last_prior_source = 'imu_prediction_only'
             self.marginal_prior = None
             return current.copy()
-        self.last_prior_source = 'fixed_previous' if self.fix_previous_state else 'none'
-        if self.fix_previous_state:
+        fixed_previous = self.fix_previous_state or fixed_anchor
+        self.last_prior_source = ('backend_keyframe' if fixed_anchor else
+                                  'fixed_previous' if fixed_previous else 'none')
+        if fixed_previous and not fixed_anchor:
             # The anchor is a constant, not an uncertain state to eliminate.
             # Do not retain a posterior from a prior joint solve or startup seed.
             self.marginal_prior = None
@@ -651,7 +659,7 @@ class GtsamVisualInertialSolver:
         current = current.copy()
         previous = previous.copy()
         prior = None
-        if self.marginalization_enabled and not self.fix_previous_state:
+        if self.marginalization_enabled and not fixed_previous:
             prior = self.marginal_prior
             # A new trial or a tactile-only fallback has no continuous VI
             # posterior. Initialize at that accepted state, not an old time.
@@ -945,7 +953,7 @@ class GtsamVisualInertialSolver:
                 return None
             if step_converged:
                 break
-        if prior is not None:
+        if prior is not None or (fixed_anchor and self.marginalization_enabled):
             evaluated = normal_evaluator(
                 reference_pose, target_gelsight_pose)
             if evaluated is None:
@@ -984,7 +992,8 @@ class GtsamVisualInertialSolver:
             if self.height_z_enabled:
                 Ac[normal_end:, :6] = height_A
                 rhs[normal_end:] = -height_b
-            information = marginalize_rows_system(Ap, Ac, rhs).information
+            information = (Ac.T @ Ac if fixed_anchor else
+                           marginalize_rows_system(Ap, Ac, rhs).information)
             if self.fix_bias:
                 # Keep the public 15D prior format with no bias information.
                 information = np.pad(information, ((0, 6), (0, 6)))

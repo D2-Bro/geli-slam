@@ -3,6 +3,7 @@ import pickle
 from bisect import bisect_left
 from collections import Counter
 from enum import Enum
+from time import monotonic
 
 import cv2
 import numpy as np
@@ -926,12 +927,26 @@ class Tracker:
             navigation = dict(navigation_state=state, gravity=solver.gravity,
                               imu_samples=samples, tactile_valid=tactile_valid)
             self._backend_keyframe_timestamp = state.timestamp
-            if buffer is not None:
-                buffer.begin_online_interval(state.timestamp)
+            # Retain raw IMU for delayed K_k -> F_j backend feedback.
+            # ImuBuffer.max_samples remains the explicit retention bound.
         message = create_keyframe_msg(
             self.bridge, frame, kid=kid, fid=fid, is_new_trial=is_new_trial,
             trial_T_curr=trial_T_curr, header=header, **navigation,
         )
+        if getattr(self.bridge, "internal_packets", False):
+            from dataclasses import replace
+            snapshot = getattr(self, "_tracking_map_snapshot", None)
+            anchor_kid = getattr(self, "_tracking_anchor_kid", -1)
+            anchor_state = getattr(self, "_tracking_anchor_state", None)
+            from gelslam.core.shared_map import frozen_state
+            seeds = getattr(self, "_keyframe_seed_states", {})
+            if state is not None:
+                seeds[kid] = frozen_state(state)
+            self._keyframe_seed_states = seeds
+            message = replace(message, trial_id=getattr(self, "_trial_index", -1),
+                              session_id=getattr(self, "_ros_session_id", ""),
+                              anchor_kid=anchor_kid, anchor_state=anchor_state,
+                              solution_revision=0 if snapshot is None else snapshot.revision)
         if timestamp is not None:
             self._last_keyframe_timestamp = timestamp
         return message
@@ -1209,6 +1224,93 @@ class Tracker:
         self.logger.info("Frontend tracking failed: " + reason)
         raise LoseTrackError("frontend tracking failed: " + reason)
 
+    def apply_map_snapshot(self, snapshot, header):
+        """At the F_j boundary, read corrected K_k in this trial's axes.
+
+        Return False when the complete raw t_k -> t_j interval is unavailable.
+        The retained F_i prior is not used by the subsequent fixed-K_k solve.
+        """
+        self._tracking_map_snapshot = snapshot
+        trial = getattr(self, "_trial_index", -1)
+        candidates = [packet for packet in snapshot.observations
+                      if packet.trial_id == trial and packet.kid <= self.curr_kid
+                      and packet.kid in snapshot.estimates
+                      and snapshot.estimates[packet.kid].state is not None]
+        self._tracking_anchor_kid = -1
+        self._tracking_anchor_state = None
+        if not candidates or self.frontend_visual_inertial is None:
+            return False
+        packet = candidates[-1]
+        estimate = snapshot.estimates[packet.kid]
+        self._tracking_anchor_kid = packet.kid
+        # This is the basis used by new seeds, not an additional measurement.
+        self._tracking_anchor_state = getattr(self, "_keyframe_seed_states", {}).get(packet.kid)
+        token = (snapshot.epoch, packet.kid, estimate.revision)
+        if token == getattr(self, "_backend_feedback_token", None):
+            return False
+        anchor = estimate.state
+        timestamp = self._imu_timestamp(header)
+        buffer = getattr(self, "_backend_imu_buffer", None)
+        if timestamp is None or timestamp <= anchor.timestamp or buffer is None:
+            return False
+        samples = buffer.samples_covering(anchor.timestamp, timestamp)
+        max_gap = float(self.imu_config.get("backend_feedback_max_sample_gap_s", .05))
+        if len(samples) < 2 or np.any(np.diff([s.timestamp for s in samples]) > max_gap):
+            self._count_frontend_event("backend_feedback_interval_unavailable")
+            return False
+        ref = snapshot.estimates.get(self.curr_kid)
+        if ref is None:
+            return False
+        # An initial backend seed identical to the tracking anchor needs no reset.
+        old_anchor = getattr(self, "_backend_feedback_anchor", None)
+        basis = self._tracking_anchor_state
+        if basis is None and old_anchor is not None and old_anchor[0] == packet.kid:
+            basis = old_anchor[1]
+        # Compare with the seed actually sent for K_k, including its first
+        # feedback. Comparing only with a previous feedback treats an identity
+        # result as a correction and discards later tactile updates at F_i.
+        # Use the seed's calibrated pose, not a possibly float32 display pose.
+        unchanged = (basis is not None and abs(basis.timestamp - anchor.timestamp) < 1e-9
+                     and np.allclose(ref.trial_pose, gelsight_pose(basis.pose, self.gelsight_T_imu),
+                                     rtol=0, atol=1e-10)
+                     and all(np.allclose(getattr(basis, field), getattr(anchor, field),
+                                         rtol=0, atol=1e-10)
+                             for field in ('pose', 'velocity', 'accel_bias', 'gyro_bias')))
+        self._backend_feedback_token = token
+        self._backend_feedback_anchor = (packet.kid, anchor)
+        if unchanged:
+            self._count_frontend_event("backend_feedback_unchanged")
+            return False
+        reference_shift = ref.trial_pose @ np.linalg.inv(self.trial_T_ref)
+        self._tracking_anchor_state = anchor
+        self._keyframe_seed_states[packet.kid] = anchor
+        self.trial_T_ref = ref.trial_pose.copy()
+        self._backend_correction_anchor = anchor.copy()
+        self._backend_correction_trial = trial
+        self._frontend_imu_preintegration = None
+        self._frontend_coast_state = None
+        # Preserve the accepted K_k -> F_i relative pose when K_k changes.
+        # This is a pose update, not IMU propagation of the accepted state.
+        # F_i keeps its timestamp, velocity and sensor-frame biases. The next
+        # F_j solve still predicts from corrected K_k and builds a fresh prior.
+        previous = getattr(self, "_frontend_vi_state", None)
+        if previous is not None and previous.timestamp >= anchor.timestamp:
+            corrected = previous.copy()
+            corrected.pose = reference_shift @ previous.pose
+            self._frontend_vi_state = corrected
+            self._frontend_vi_prev_pose = corrected.pose.copy()
+            self._frontend_vi_prev_velocity = corrected.velocity.copy()
+            self._frontend_vi_prev_bias = np.r_[corrected.accel_bias, corrected.gyro_bias]
+            self._frontend_vi_prev_timestamp = corrected.timestamp
+            self.inertial_state = self.inertial_propagator = None
+            self._imu_integration_sample = None
+            self._coast_start_timestamp = None
+            self.ref_T_prev = (np.linalg.inv(self.trial_T_ref)
+                              @ gelsight_pose(corrected.pose, self.gelsight_T_imu)).astype(np.float32)
+        self.last_backend_feedback_delay_s = max(0., monotonic() - estimate.committed_at)
+        self._count_frontend_event("backend_feedback_applied")
+        return True
+
     def _refine_normalflow_with_imu(self, ref_T_curr, header, reference_frame=None,
                                     current_frame=None, reference_pose=None):
         """Solve NormalFlow rows and native GTSAM IMU residuals.
@@ -1244,6 +1346,11 @@ class Tracker:
         solver = self.frontend_visual_inertial
         timestamp = self._imu_timestamp(header)
         previous = getattr(self, "_frontend_vi_state", None)
+        correction_anchor = getattr(self, "_backend_correction_anchor", None)
+        if getattr(self, "_backend_correction_trial", None) != getattr(self, "_trial_index", -1):
+            correction_anchor = None
+        if correction_anchor is not None:
+            previous = correction_anchor
         if not (
             solver is not None
             and previous is not None
@@ -1275,7 +1382,8 @@ class Tracker:
                 solver.marginal_prior = None
                 solver.discard_pending_prior()
             self._count_frontend_event("gt_previous_state_resets")
-        samples = self.imu_buffer.samples_covering(previous.timestamp, timestamp)
+        interval_buffer = self._backend_imu_buffer if correction_anchor is not None else self.imu_buffer
+        samples = interval_buffer.samples_covering(previous.timestamp, timestamp)
         prediction = (
             self._predict_frontend_imu(previous, samples)
             if len(samples) >= 2 else None
@@ -1297,7 +1405,8 @@ class Tracker:
         self._count_frontend_event(
             "imu_prediction_only_calls" if prediction_only else "vi_solve_calls"
         )
-        refined = solver.refine_current(
+        refine = solver.refine_from_keyframe if correction_anchor is not None else solver.refine_current
+        refined = refine(
             visual, navigation_reference_pose, previous, current, samples,
             self.gelsight_T_imu, preintegrated=preintegrated,
         )
@@ -1365,6 +1474,9 @@ class Tracker:
         self._count_frontend_event(
             "imu_prediction_only_accepted" if prediction_only else "vi_accepted"
         )
+        if correction_anchor is not None:
+            self._backend_correction_anchor = None
+            self._count_frontend_event("backend_feedback_target_accepted")
         self._frontend_vi_state = refined
         self._frontend_imu_preintegration = None
         self._frontend_vi_prev_pose = refined.pose
@@ -1824,6 +1936,12 @@ class Tracker:
         :param save_dir: str; The directory to save to.
         """
         # Exclude non-picklable objects
+        self._map_snapshot_provider = None
+        self._tracking_map_snapshot = None
+        self._tracking_anchor_state = None
+        self._keyframe_seed_states = {}
+        self._backend_correction_anchor = None
+        self._backend_feedback_anchor = None
         self.logger = None
         self.bridge = None
         self.recon = None
@@ -1998,6 +2116,10 @@ class Tracker:
                   dropped after the prior frame becomes a keyframe.
                 - keyframe_msgs (list[KeyFrameMsg]): List of new keyframes.
         """
+        snapshot_provider = getattr(self, "_map_snapshot_provider", None)
+        if snapshot_provider is not None:
+            self.apply_map_snapshot(snapshot_provider(), header)
+
         self.latest_normal_correspondences = None
         if resolve_gt_state_test(self.imu_config)['enabled']:
             timestamp = self._imu_timestamp(header)
@@ -2089,6 +2211,11 @@ class Tracker:
                     if self.ref_frame is not None and (
                         self.inertial_state is not None
                         or getattr(self, "_frontend_coast_state", None) is not None
+                        # Backend feedback invalidates the temporary coast
+                        # prediction, but retains the accepted VI state.
+                        # That state still belongs to the initialized trial.
+                        or (self.frontend_visual_inertial is not None
+                            and getattr(self, "_frontend_vi_state", None) is not None)
                     ):
                         try:
                             # Dense normal-flow + IMU is the tracker itself;

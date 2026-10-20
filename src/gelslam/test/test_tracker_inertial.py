@@ -1962,6 +1962,72 @@ def test_no_contact_resets_contact_failure_sequence(monkeypatch):
     assert tracker._consecutive_tracking_failures == 0
 
 
+@pytest.mark.parametrize("registration_fails", [False, True])
+def test_recontact_after_backend_feedback_retains_initialized_trial(
+        monkeypatch, registration_fails):
+    tracker, accepted = make_failing_contact_tracker(monkeypatch, already_keyframe=True)
+    tracker._trial_index = 0
+    tracker._static_imu_settings = {"mode": "fixed_time"}
+    tracker._static_imu_collecting = False
+    tracker._backend_imu_buffer = tracker.imu_buffer
+    tracker._keyframe_seed_states = {tracker.curr_kid: accepted}
+    tracker.last_tactile_ref_T = np.eye(4)
+    tracker.last_tactile_header = header(1.)
+    assert tracker._initialize_no_contact_coast()
+    assert tracker._coast_to_header(header(1.04), TrackingMode.NO_CONTACT_COASTING)
+    tracker.prev_in_contact_flag = False
+
+    corrected = accepted.copy()
+    corrected.pose[0, 3] += .001
+    snapshot = SimpleNamespace(epoch=0,
+        observations=[SimpleNamespace(trial_id=0, kid=tracker.curr_kid)],
+        estimates={tracker.curr_kid: SimpleNamespace(
+            state=corrected, trial_pose=corrected.pose, revision=1, committed_at=0.)})
+    assert tracker.apply_map_snapshot(snapshot, header(1.08))
+    assert tracker.inertial_state is tracker._frontend_coast_state is None
+    retained = tracker._frontend_vi_state
+    assert retained.timestamp == accepted.timestamp
+
+    def unexpected_initialization(*args, **kwargs):
+        pytest.fail("backend feedback must not restart fixed-time IMU initialization")
+
+    monkeypatch.setattr(tracker, "_prepare_static_trial", unexpected_initialization)
+    monkeypatch.setattr(tracker, "_start_trial_contact", unexpected_initialization)
+
+    class FlatVisual:
+        def __len__(self):
+            return 10
+
+        def evaluate(self, _reference, _pose):
+            return np.zeros(30), np.zeros((30, 6)), np.zeros((30, 6))
+
+    monkeypatch.setattr(tracker_module, "DenseNormalResidual", lambda *a, **k: FlatVisual())
+    monkeypatch.setattr(tracker_module, "normalflow_quality", lambda *a: (1., 1.))
+    if registration_fails:
+        def reject(*args, **kwargs):
+            raise tracker_module.LoseTrackError()
+        monkeypatch.setattr(tracker, "_refine_normalflow_with_imu", reject)
+
+    image = np.zeros((1, 1, 3), dtype=np.uint8)
+    ok, result = tracker.track(image, header(1.08))
+    if registration_fails:
+        assert not ok and result is None
+        assert tracker._frontend_vi_state is retained
+        assert tracker._consecutive_tracking_failures == 1
+        # No new no-contact image recreates the temporary coast state here.
+        ok, (frame_msg, keyframes) = tracker.track(image, header(1.12))
+        assert ok and len(keyframes) == 1
+        assert not keyframes[0]["is_new_trial"]
+        assert tracker._frontend_vi_state.timestamp == pytest.approx(1.12)
+    else:
+        assert ok and result[1] == []
+        assert tracker.curr_kid == 2
+        assert tracker._frontend_vi_state.timestamp == pytest.approx(1.08)
+        assert tracker.frontend_visual_inertial.last_prior_source == "backend_keyframe"
+    assert tracker._trial_index == 0
+    assert tracker.prev_in_contact_flag
+
+
 @pytest.mark.parametrize("initialize_from_imu", [False, True])
 def test_frontend_no_contact_preserves_trial_state_after_reference_reset(initialize_from_imu):
     tracker = make_coasting_tracker()

@@ -46,12 +46,14 @@ def stationary_samples(end=2.0, acceleration=(0, 0, 9.81), gyro=(0, 0, 0), start
             for t in np.arange(start, end + 0.0025, 0.005)]
 
 
-def averaged_approach_reference(omega, sensor_offset, world_force):
+def midpoint_approach_reference(omega, sensor_offset, world_force):
     """Closed-form reference for the rotating sample fixtures below.
 
     At 2.000 the sensor is stationary; at 2.005 its gyro is omega and
     its measured attitude is identity. Pair averaging adds a half gyro step
-    before the remaining 0.495 s. Averaging two rotated force vectors
+    before the remaining 0.495 s. The first interval rotates its mean force by
+    a quarter step; subsequent midpoints retain the half-step attitude offset.
+    Averaging two rotated force vectors
     scales the component perpendicular to omega by cos(|omega|*dt/2).
     The IMU-origin state integrates the measured centripetal force directly.
     No correction to the GelSight origin is applied to the measurements.
@@ -63,9 +65,10 @@ def averaged_approach_reference(omega, sensor_offset, world_force):
     averaged_force = parallel + np.cos(np.linalg.norm(omega) * dt / 2) * (force - parallel)
     gravity = np.array([0., 0., -9.81])
     centripetal = np.cross(omega, np.cross(omega, sensor_offset))
-    velocity = dt * (.5 * (force + gravity) + .5 * centripetal)
-    velocity += .495 * (averaged_force + gravity)
-    velocity += dt * sum(so3_exp(omega * (.0025 + k * dt)) @ centripetal
+    first_force = .5 * (-gravity + force + centripetal)
+    velocity = dt * (so3_exp(omega * (dt / 4)) @ first_force + gravity)
+    velocity += .495 * (so3_exp(omega * (dt / 2)) @ averaged_force + gravity)
+    velocity += dt * sum(so3_exp(omega * (dt + k * dt)) @ centripetal
                          for k in range(99))
     return so3_exp(omega * .4975), velocity
 
@@ -293,7 +296,7 @@ def test_rotating_offset_sensor_rebases_imu_velocity_and_gravity():
         samples.append(ImuSample(round(float(time), 9), acceleration, omega))
     feed(detector, buffer, samples)
     seed = predict(detector, buffer, extrinsic, 2.5)
-    rotation, velocity = averaged_approach_reference(
+    rotation, velocity = midpoint_approach_reference(
         omega, extrinsic[:3, 3], [0.2, 0, 9.81]
     )
     assert np.allclose(seed.state.velocity, rotation.T @ velocity, atol=1e-8)
@@ -317,7 +320,7 @@ def test_tilt_during_approach_with_rotated_sensor_mount():
                                  sensor_rotation.T @ omega))
     feed(detector, buffer, samples)
     seed = predict(detector, buffer, extrinsic, 2.5)
-    rotation, velocity = averaged_approach_reference(
+    rotation, velocity = midpoint_approach_reference(
         omega, extrinsic[:3, 3], [0, 0.2, 9.81]
     )
     contact_rotation = rotation_aligning_gravity_to_negative_z(rotation.T @ [0, 0, -9.81])

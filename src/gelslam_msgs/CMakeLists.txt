@@ -16,6 +16,8 @@ find_package(rosidl_default_generators REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/KeyFrameMsg.msg"
   "msg/FrameMsg.msg"
+  "msg/BackendFeedbackMsg.msg"
+  "msg/FramePoseMsg.msg"
   "msg/VisibleCoverageNodeMsg.msg"
   "msg/VisibleCoverageGraphMsg.msg"
   DEPENDENCIES std_msgs sensor_msgs

@@ -34,3 +34,13 @@ bool tactile_valid true
 # Previous emitted keyframe to this keyframe, including both time endpoints.
 # Rows: [timestamp_s, ax, ay, az, wx, wy, wz], in calibrated IMU units/axes.
 float64[] imu_measurements
+
+# Process-independent stream identity and seed basis. These add no factors.
+string session_id
+int32 trial_id -1
+int32 anchor_kid -1
+uint64 solution_revision
+# Optional full-precision IMU pose, in the original tracking trial (16 entries).
+float64[] navigation_pose
+# Optional 26-double anchor row: timestamp, IMU pose, velocity, ba, bg.
+float64[] anchor_state

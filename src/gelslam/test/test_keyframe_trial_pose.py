@@ -49,7 +49,7 @@ def test_keyframe_db_keeps_trial_poses_and_reanchors_after_a_drop(monkeypatch):
     monkeypatch.setattr(
         keyframe_module,
         "KeyFrame",
-        lambda _h, _c, _n, _l, kid, fid, group, new, pose, _ppmm, _stamp:
+        lambda _h, _c, _n, _l, kid, fid, group, new, pose, _ppmm, _stamp, **_options:
         SimpleNamespace(
             kid=kid, fid=fid, trial_group=group, new_trial_flag=new,
             trial_T_curr=pose,
@@ -78,7 +78,7 @@ def test_keyframe_group_recovery_keeps_gravity_axes(monkeypatch):
     from scipy.spatial.transform import Rotation
 
     monkeypatch.setattr(keyframe_module, "KeyFrame",
-        lambda _h, _c, _n, _l, kid, fid, group, new, pose, _ppmm, _stamp:
+        lambda _h, _c, _n, _l, kid, fid, group, new, pose, _ppmm, _stamp, **_options:
         SimpleNamespace(kid=kid, trial_group=group, trial_T_curr=pose))
     db = KeyFrameDB(1., SimpleNamespace(info=lambda *_: None, warning=lambda *_: None))
     db.bridge = SimpleNamespace(imgmsg_to_cv2=lambda _: np.zeros((2, 2)))

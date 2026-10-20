@@ -84,6 +84,7 @@ GTSAM은 다음 단계에서 별도로 설치합니다.
 
 버전 번호만 확인하지 말고 필요한 API도 확인해야 합니다.
 아래 소스 리비전은 현재 작업 공간에 설치된 GTSAM 리비전입니다.
+아래 명령은 GelSLAM 저장소 루트에서 실행합니다. 중간 자세 IMU 적분을 위해 제공된 GTSAM 패치를 적용합니다.
 빌드 절차는 [GTSAM Python 설치 문서](https://github.com/borglab/gtsam/blob/71a25ca36c084cbad1f872e812d6d97fbadfdb05/python/README.md)를 기준으로 합니다.
 
 ```bash
@@ -91,6 +92,7 @@ conda activate gel-slam
 mkdir -p ~/libraries
 git clone https://github.com/borglab/gtsam.git ~/libraries/gtsam-4.3.0
 git -C ~/libraries/gtsam-4.3.0 checkout 71a25ca36c084cbad1f872e812d6d97fbadfdb05
+git -C ~/libraries/gtsam-4.3.0 apply "$PWD/patches/gtsam-midpoint-integration.patch"
 python -m pip install -r ~/libraries/gtsam-4.3.0/python/dev_requirements.txt
 cmake -S ~/libraries/gtsam-4.3.0 -B ~/libraries/gtsam-4.3.0/build-conda \
   -DCMAKE_BUILD_TYPE=Release \
@@ -106,6 +108,7 @@ python - <<'PYTHON'
 import gtsam
 p = gtsam.PreintegrationParams([0.0, 0.0, -9.80665])
 p.setImuFactorErrorMode(gtsam.ImuFactorErrorMode.ComponentWise)
+p.setUseMidpointIntegration(True)
 print('GTSAM API OK:', gtsam.__file__)
 PYTHON
 ```
@@ -230,6 +233,10 @@ bag 재생이 끝나면 터미널 A에서 `Ctrl+C`를 누르고 결과 저장이
 | `use_sim_time` | `true` | bag 재생기의 `/clock` 사용 |
 
 화면 없이 실행하려면 `rendering:=false rviz:=false publish_coverage:=false`를 지정합니다.
+RViz의 원본 영상은 `/gelslam/rviz/image`를 사용합니다. 표시용 노드가
+`device_config.image_topic`의 영상을 이 토픽으로 전달합니다.
+`debug_visualization_enabled: false`이면 normal map, 대응점, 현재 접촉면은
+발행하지 않습니다. 백엔드의 전역 표면을 보려면 `publish_coverage:=true`가 필요합니다.
 백엔드 사용 시 재구성 결과는 `<data_dir>/gelslam_online/reconstructed_mesh.ply`입니다.
 궤적 평가를 켜면 `<data_dir>/gelslam_online/trajectory_evaluation/<sequence_name>/`에
 평가 결과를 저장합니다. `backend:=false` 실행은 백엔드 재구성 메시를 만들지 않습니다.
@@ -283,7 +290,22 @@ Please calibrate your sensor and prepare a configuration file before running Gel
 
 ### 🚀 Running GelSLAM
 
-The tracker publishes a normal correspondence image on
+The standard launches run `tracker_node` and `pose_graph_node` as separate ROS
+processes. Keyframes travel on `keyframe`; optimized 15D states return on
+`backend_feedback` and are applied at an image boundary. The backend uses the
+latest combined GelSight (normal + mean height), IMU and bias factors, with projection reuse and a residual-only
+error path. See [ROS process architecture](docs/slam_thread_architecture.md).
+
+
+Set `gelslam_config.track_config.debug_visualization_enabled: false` to skip
+normal RGB images, current-contact point clouds and correspondence images,
+including their construction. This applies to both `gelslam_node` and
+`tracker_node`. The default is `true`, including when the key is omitted.
+Set the value before starting the node. Pose estimation and frame/keyframe
+publication continue when it is `false`. This switch is independent of the
+Open3D `rendering` launch option.
+
+When debug visualization is enabled, the tracker publishes a normal correspondence image on
 `/gelslam/rviz/normal_correspondences` for each processed surface image.
 The reference normal map is on the left. The current normal map is on the
 right. Solid green lines connect the normal-flow reference pixels to their
@@ -342,17 +364,60 @@ ros2 launch gelslam live_demo_launch.py data_dir:="/absolute/path/to/path_to_sav
 
 ### Backend navigation optimization
 
+The standard launches run `tracker_node` and `pose_graph_node` in separate processes. Keyframes and versioned 15D corrections travel over ROS topics. Tracking applies corrections at an image boundary and rebuilds the prior after target acceptance. See [ROS process ownership and feedback](docs/slam_thread_architecture.md).
+
 The backend optimizes a 15D state per keyframe: IMU pose, world velocity,
-accelerometer bias and gyroscope bias. It uses direct tactile normal/height
-observations, IMU preintegration and bias random walk. Tracker poses are initial
-values; relative-pose measurement factors are removed. The default local window
-contains 10 keyframes with a marginalized navigation prior. Loop constraints
-also use direct tactile observations.
+accelerometer bias and gyroscope bias. Each observed keyframe pair uses one
+GelSight factor containing independently weighted normal and mean-height rows,
+alongside IMU preintegration and bias random walk. Tracker poses are initial
+values in this local VI graph. The default local window contains 10 keyframes;
+`marginalization_enabled` selects its boundary treatment.
+
+Loop correction uses a separate 4DoF pose graph with world yaw and XYZ updates,
+following ORB-SLAM3's inertial essential graph. Yaw rotates about the recorded
+gravity axis, preserving each local VI pose's gravity attitude. Each remaining
+component anchor is fixed. Relative-pose residuals retain all six measured rows.
+Its edges are local-VI relative odometry and fixed registered loop poses.
+The PGO never evaluates tactile maps and never enters the local marginal prior.
+Per-keyframe map corrections affect output and frontend feedback; new frontend
+seeds are converted back to the independent local VI coordinates.
+The relative-pose sigmas are 0.01 rad and 0.0001 m, matching origin's 0.1 mm.
+
+To use only global PGO in the backend, set the following in the YAML supplied
+through `config_path` and keep backend optimization enabled (`backend:=true`
+for the bag launch):
+
+```yaml
+gelslam_config:
+  pose_graph_config:
+    local_vi_enabled: false
+```
+
+The default is `true`. With `false`, the backend builds no local tactile, IMU,
+bias or initialization factors and runs no local VI solve or marginalization.
+Frontend keyframe seeds supply the temporal relative poses for the separate
+4DoF PGO. Accepted loop measurements trigger PGO; batches without a new loop
+publish the seed poses with the last map corrections. Frontend VI, no-contact
+IMU propagation and backend feedback keep their existing settings. Synchronized
+navigation seeds, gravity, calibrated mounting and IMU intervals are still required.
+`local_window_optimization: false` only selects a full local VI graph when
+local VI is enabled; it does not disable local VI.
+
+Add `backend_feedback:=false` to any standard launch to disable backend feedback
+publication and frontend correction reception while keeping local VI, loop PGO,
+map output and final backend evaluation active. The default is enabled (the bag
+launch follows `backend` by default). Example:
+
+```bash
+ros2 launch gelslam bag_replay_launch.py backend:=true backend_feedback:=false
+```
 
 Rebuild `gelslam_msgs` and `gelslam` together after this interface change.
 The backend requires synchronized keyframe navigation seeds and IMU intervals;
 video-only input cannot supply them. Use the ROS 2 bag procedure above.
 Historical pose-only snapshots require replay with IMU data before backend optimization.
+Legacy v2 snapshots with direct tactile loops also require replay, because they
+do not retain the registered loop measurements. New v3 snapshots retain both graphs.
 
 ### Final trajectory error colour maps
 

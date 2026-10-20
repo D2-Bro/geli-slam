@@ -1,5 +1,8 @@
 import os
 import signal
+import json
+from collections import deque
+from traceback import format_exc
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -13,6 +16,9 @@ import rclpy
 import yaml
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
+from cv_bridge import CvBridge
+from std_msgs.msg import String
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 
@@ -20,21 +26,20 @@ from gelslam.core.coverage_graph import CoverageGraph, create_visible_coverage_g
 from gelslam.core.keyframe import KeyFrameDB, compute_adjusted_pointcloud
 from gelslam.core.parent_groups_info import ParentGroupsInfo
 from gelslam.core.gtsam_pose_graph import PoseGraph, PoseGraphSolutions
+from gelslam.core.topic_backend import TopicBackend
+from gelslam.core.backend_feedback import feedback_message
+from gelslam.core.slam_packets import keyframe_from_ros
 from gelslam.core.trajectory_evaluation import (
     save_aligned_trajectory,
     trajectory_output_dir,
 )
 from gelslam.utils import Logger, pointcloud2mesh
-from gelslam_msgs.msg import FrameMsg, KeyFrameMsg, VisibleCoverageGraphMsg
+from gelslam_msgs.msg import FrameMsg, KeyFrameMsg, VisibleCoverageGraphMsg, BackendFeedbackMsg, FramePoseMsg
 
 """
-Two threads:
-1. K thread (Keyframe callback):
-    - Adds keyframe to the KeyFrameDB.
-2. L thread (Loop closure):
-    - Detects loops.
-    - Performs Loop Closure: updates parent groups, solves poses, updates coverage graph.
-    - Publishes the visible coverage graph message.
+ROS callbacks enqueue keyframes and record lightweight frame poses.
+A backend worker owns decoding, feature search, graph mutation, optimization,
+coverage updates and publication. Tracking executes in another ROS process.
 """
 
 
@@ -67,6 +72,10 @@ class PoseGraphNode(Node):
         self.backend_optimization_enabled = bool(
             self.get_parameter("backend_optimization").get_parameter_value().bool_value
         )
+        self.declare_parameter("backend_feedback", True)
+        self.backend_feedback_enabled = bool(
+            self.get_parameter("backend_feedback").value and self.backend_optimization_enabled)
+        self.feedback_messages_published = 0
         # Get the rendering flag
         self.declare_parameter("rendering", True)
         self.rendering = (
@@ -83,36 +92,35 @@ class PoseGraphNode(Node):
 
         # The logger
         self.logger = Logger(ros_logger=self.get_logger())
+        os.makedirs(self.save_dir, exist_ok=True)
+        with open(os.path.join(self.save_dir, 'backend_process_config_supplied.yaml'), 'w') as handle:
+            yaml.safe_dump(dict(config=self.config, backend_optimization=self.backend_optimization_enabled,
+                                backend_feedback=self.backend_feedback_enabled,
+                                rendering=self.rendering, pid=os.getpid()), handle, sort_keys=False)
 
-        # KeyframeDB (keyframe database) is never modified except appending.
-        # K thread writes (appending), L thread reads
+        self._backend = TopicBackend(self.config, self.logger, self.backend_optimization_enabled)
+        self._bind_backend()
         self.add_keyframe_lock = threading.Lock()
-        self.keyframedb = KeyFrameDB(
-            ppmm=self.config["device_config"]["ppmm"], logger=self.logger,
-            gelsight_T_imu=self.config.get("imu_config", {}).get("gelsight_T_imu"),
-            imu_max_sample_gap_s=self.config["gelslam_config"]["pose_graph_config"].get("imu_max_sample_gap_s", 0.05),
-        )
-
-        # Parent groups, pose graph, pose graph solutions, and coverage graph are updated in L thread.
-        self.parent_groups_info = ParentGroupsInfo()
-        self.pose_graph = PoseGraph(self.config)
-        if self.backend_optimization_enabled:
-            if not self.pose_graph.mounting_calibrated:
-                raise ValueError("15D backend requires calibrated imu_config.gelsight_T_imu; use the calibrated real/simulation configuration")
-            self.logger.info("Backend: 15D keyframe states; direct normal/height, IMU and bias factors; no relative-pose factors")
-        if (
-            self.backend_optimization_enabled
-            and self.pose_graph.pose_graph_config.get("loop_closure_only_optimization", False)
-        ):
-            self.logger.info("Backend optimization will run only after a loop edge is added")
-        self.pose_graph_solutions = PoseGraphSolutions()
+        self._work = threading.Condition()
+        self._pending = deque()
+        self._failure = None
+        self._closed = False
+        self._last_received = {}
+        self._stream_ends = {}
+        self._bridge = CvBridge()
         self.processed_keyframe_count = 0
-        self.coverage_graph = CoverageGraph(self.config)
-        # This is independent of mesh rendering.  RViz can therefore show
-        # backend keyframe poses when Open3D rendering is disabled.
-        self.gelsight_trajectory_pub = self.create_publisher(
-            Path, "/gelslam/rviz/gelsight_trajectory", 1
-        )
+        self.gelsight_trajectory_pub = self.create_publisher(Path, "/gelslam/rviz/gelsight_trajectory", 1)
+        self.feedback_pub = self.create_publisher(BackendFeedbackMsg, "backend_feedback", 1)
+        self.create_subscription(String, "backend_stream_end", self.stream_end_callback, 10)
+        if self.backend_optimization_enabled:
+            if self.pose_graph.local_vi_enabled:
+                self.logger.info("ROS process: backend; local 15D GelSight/IMU/bias graph; separate 4DoF yaw/XYZ loop PGO")
+            else:
+                self.logger.info("ROS process: backend; local VI disabled; 4DoF yaw/XYZ loop PGO with frontend seed odometry")
+        else:
+            self.logger.info("ROS process: backend raw storage; optimization and feedback disabled")
+        self.logger.info("Backend feedback publication %s" % (
+            "enabled" if self.backend_feedback_enabled else "disabled"))
         self.trajectory_evaluation_config = self.config.get("trajectory_evaluation", {})
         self.trajectory_evaluation_enabled = bool(
             self.trajectory_evaluation_config.get("enabled", False)
@@ -130,10 +138,10 @@ class PoseGraphNode(Node):
             KeyFrameMsg,
             "keyframe",
             self.keyframe_callback,
-            10,
+            1000,
         )
         if self.trajectory_evaluation_enabled:
-            self.create_subscription(FrameMsg, "frame", self.trajectory_frame_callback, 1000)
+            self.create_subscription(FramePoseMsg, "frame_pose", self.trajectory_frame_callback, 1000)
             self.create_subscription(
                 PoseStamped,
                 self.trajectory_evaluation_config.get(
@@ -145,20 +153,48 @@ class PoseGraphNode(Node):
             self.logger.info("Recording frame and ground-truth poses for final SE(3) evaluation")
 
         # Start the L thread: loop detection and pose graph optimization thread
-        self.loop_closure_thread = threading.Thread(target=self.loop_closure)
+        self.loop_closure_thread = threading.Thread(target=self.loop_closure,
+                                                    name='gelslam-backend', daemon=False)
         self.loop_closure_thread.start()
 
-    def keyframe_callback(self, keyframe_msg):
-        """
-        Adds received keyframe to KeyFrameDB (K thread).
+    def _bind_backend(self):
+        mapper = self._backend.mapper
+        self.keyframedb, self.pose_graph = mapper.db, mapper.graph
+        self.parent_groups_info, self.coverage_graph = mapper.groups, mapper.coverage
+        self.pose_graph_solutions = mapper.solutions
 
-        :param keyframe_msg: KeyFrameMsg; The received keyframe message.
-        """
-        if self.backend_optimization_enabled and not keyframe_msg.navigation_valid:
-            self.logger.error("Rejecting keyframe %d: 15D backend needs a navigation seed at its image time" % keyframe_msg.kid)
+    def keyframe_callback(self, keyframe_msg):
+        # Decode and derived-feature work belong to the backend worker.
+        with self._work:
+            if not self.running:
+                return
+            self._last_received[keyframe_msg.session_id] = keyframe_msg.kid
+            self._pending.append(keyframe_msg)
+            self._work.notify_all()
+
+    def stream_end_callback(self, message):
+        try:
+            record = json.loads(message.data)
+            session, last = str(record['session_id']), int(record['last_kid'])
+        except (ValueError, KeyError, TypeError):
+            self.logger.warning('Ignoring invalid tracking end marker')
             return
-        with self.add_keyframe_lock:
-            self.keyframedb.insert(keyframe_msg, log_prefix="Keyframe Insert Thread")
+        with self._work:
+            self._stream_ends[session] = last
+
+    def input_complete(self):
+        with self._work:
+            session = self._backend.session_id
+            if session is None:
+                return any(last < 0 for last in self._stream_ends.values())
+            return (session in self._stream_ends and
+                    self._last_received.get(session, -1) >= self._stream_ends[session])
+
+    def raise_if_failed(self):
+        with self._work:
+            failure = self._failure
+        if failure is not None:
+            raise RuntimeError('Backend worker failed:\n' + failure[1]) from failure[0]
 
     def publish_gelsight_keyframe_trajectory(self):
         """Publish the solved poses of the largest backend keyframe group."""
@@ -285,128 +321,38 @@ class PoseGraphNode(Node):
             )
 
     def loop_closure(self):
-        """
-        Loop closure thread (L thread).
-        Detects loops, merges parent groups, solves poses, and updates coverage graph.
-
-        Steps:
-        1. Detect loops, add loop closing factors to the pose graph. (Expensive)
-        2. Perform loop closure updates. (Faster)
-        """
-        while self.running:
-            # Get the targeted number of keyframes
-            with self.add_keyframe_lock:
-                targeted_size = self.keyframedb.size()
-            # Skip if no new keyframes since last loop closure
-            updated_size = self.processed_keyframe_count
-            if targeted_size == 0 or targeted_size == updated_size:
-                time.sleep(0.01)
-                continue
-
-            self.logger.info(
-                "Loop Closure Thread -- Begin: current keyframe database size: %d"
-                % targeted_size
-            )
-            # Tracker estimates initialize states; observation factors use maps/IMU.
-            self.pose_graph.add_keyframes(
-                self.keyframedb, updated_size, targeted_size,
-                build_factors=self.backend_optimization_enabled,
-            )
-            for reference, target, reason in self.pose_graph.tactile_skipped:
-                self.logger.warning("No tactile factor for keyframes %d -> %d: %s" % (reference, target, reason))
-            self.pose_graph.tactile_skipped.clear()
-
-            # Always preserve the keyframe graph and its tracker odometry
-            # chain. With optimization disabled, do not create loop factors or
-            # solve the graph; expose the raw chain for trajectory evaluation.
-            if not self.backend_optimization_enabled:
-                self.parent_groups_info.update_wrt_new_keyframes(
-                    self.keyframedb, updated_size, targeted_size
-                )
-                self.pose_graph_solutions = self.pose_graph.raw_solutions()
-                self.processed_keyframe_count = targeted_size
-                self.logger.info(
-                    "Loop Closure Thread -- Added keyframes without backend optimization: %d"
-                    % targeted_size
-                )
-                continue
-
-            # Detect loops
-            tar_kidx = targeted_size - 1
-            matched_kidxs = self.pose_graph.detect_and_add_loops(
-                self.keyframedb, tar_kidx, self.coverage_graph
-            )
-            self.logger.info(
-                "Loop Closure Thread -- Loop detected: keyframe index %d matched with keyframe indices %s"
-                % (tar_kidx, str(matched_kidxs))
-            )
-
-            # Update parent groups due to newly introduced keyframes since last loop closure
-            self.parent_groups_info.update_wrt_new_keyframes(
-                self.keyframedb, updated_size, targeted_size
-            )
-            # Update parent groups due to newly detected loops
-            (
-                original_member_kidxs,
-                new_member_kidxs,
-                other_kidxs,
-                removed_trial_groups,
-            ) = self.parent_groups_info.update_wrt_loop_closure(
-                self.keyframedb,
-                tar_kidx,
-                matched_kidxs,
-                updated_size,
-            )
-            # Remove prior factors from pose graph due to trial fusion
-            self.pose_graph.remove_prior_factors(removed_trial_groups)
-            # A new loop constrains old and new states, so it needs a full
-            # solve. Without a loop, the graph either keeps tracker odometry
-            # or runs a local solve, according to the configuration.
-            self.pose_graph_solutions = self.pose_graph.solve(
-                global_optimization=bool(matched_kidxs)
-            )
-            self.processed_keyframe_count = targeted_size
-            self.publish_gelsight_keyframe_trajectory()
-
-            # Add new coverage node to coverage graph that represents new keyframes
-            self.coverage_graph.add_new_coverage_nodes(updated_size, targeted_size)
-            # Update the coverage graph based on the new keyframes from other trials
-            self.coverage_graph.update_wrt_new_keyframes(
-                other_kidxs,
-                self.keyframedb,
-                self.pose_graph_solutions,
-                self.parent_groups_info,
-            )
-            # Update the coverage graph based on keyframes in the merged trials
-            self.coverage_graph.update_wrt_loop_closure(
-                original_member_kidxs,
-                new_member_kidxs,
-                self.keyframedb,
-                self.pose_graph_solutions,
-            )
-            # Publish the visible coverage graph message for rendering
-            if self.rendering:
-                self.visible_coverage_graph_pub.publish(
-                    create_visible_coverage_graph_msg(
-                        tar_kidx,
-                        self.keyframedb,
-                        self.pose_graph_solutions,
-                        self.parent_groups_info,
-                        self.coverage_graph,
-                    )
-                )
-
-            # Log the connectability information
-            n_disjoint_trials = np.unique(self.parent_groups_info.parent_groups).size
-
-            self.logger.info(
-                "Loop Closure Thread -- End: disjoint trials: %d, largest trial keyframe portions: %d/%d"
-                % (
-                    np.unique(self.parent_groups_info.parent_groups).size,
-                    np.max(self.parent_groups_info.parent_group_sizes),
-                    np.sum(self.parent_groups_info.parent_group_sizes),
-                )
-            )
+        """Drain ordered keyframes; search, optimize and publish in one owner."""
+        try:
+            while True:
+                with self._work:
+                    self._work.wait_for(lambda: self._pending or not self.running)
+                    if not self._pending and not self.running:
+                        return
+                    pending, self._pending = self._pending, deque()
+                packets = [keyframe_from_ros(message, self._bridge) for message in pending]
+                if self.backend_optimization_enabled and any(not p.navigation_valid for p in packets):
+                    raise ValueError('15D backend requires synchronized navigation keyframe seeds')
+                changed = self._backend.process(packets)
+                self._bind_backend()
+                self.processed_keyframe_count = self.keyframedb.size()
+                if not changed:
+                    continue
+                if self.backend_feedback_enabled:
+                    feedback = feedback_message(self._backend.store.snapshot_for_tracking(),
+                                                self._backend.session_id)
+                    feedback.header.stamp = self.get_clock().now().to_msg()
+                    self.feedback_pub.publish(feedback)
+                    self.feedback_messages_published += 1
+                self.publish_gelsight_keyframe_trajectory()
+                if self.rendering and self.backend_optimization_enabled and self.keyframedb.size():
+                    self.visible_coverage_graph_pub.publish(create_visible_coverage_graph_msg(
+                        self.keyframedb.size() - 1, self.keyframedb, self.pose_graph_solutions,
+                        self.parent_groups_info, self.coverage_graph))
+        except BaseException as error:
+            with self._work:
+                self._failure = (error, format_exc())
+                self.running = False
+                self._work.notify_all()
 
     def merge_and_save_mesh(self):
         """
@@ -414,6 +360,9 @@ class PoseGraphNode(Node):
         Merging the meshes and save the reconstructed mesh.
         """
         updated_size = self.pose_graph_solutions.size()
+        if not updated_size:
+            self.logger.info('No backend mesh to export: no keyframes')
+            return
         active_parent_group = self.parent_groups_info.get_largest_parent_group()
         active_kidxs = []
         for kidx in range(updated_size):
@@ -461,9 +410,30 @@ class PoseGraphNode(Node):
         Merge the meshes for reconstruction.
         Save pose graph states.
         """
-        self.running = False
-        super().destroy_node()
+        if self._closed:
+            return
+        self._closed = True
+        with self._work:
+            self.running = False
+            self._work.notify_all()
         self.loop_closure_thread.join()
+        self.raise_if_failed()
+        with open(os.path.join(self.save_dir, 'backend_process_summary.json'), 'w') as handle:
+            json.dump(dict(pid=os.getpid(), session_id=self._backend.session_id,
+                keyframes=self.keyframedb.size(), last_received=self._last_received,
+                stream_ends=self._stream_ends, worker_joined=not self.loop_closure_thread.is_alive(),
+                map_revision=self._backend.store.snapshot_for_tracking().revision,
+                backend_feedback=self.backend_feedback_enabled,
+                feedback_messages_published=self.feedback_messages_published,
+                local_vi_enabled=self.backend_optimization_enabled and self.pose_graph.local_vi_enabled,
+                factor_kinds={kind: self.pose_graph.factor_kinds.count(kind)
+                              for kind in set(self.pose_graph.factor_kinds)},
+                loop_pgo_factor_kinds={kind: self.pose_graph.loop_pgo.factor_kinds.count(kind)
+                                      for kind in set(self.pose_graph.loop_pgo.factor_kinds)},
+                loop_pgo_degrees_of_freedom=self.pose_graph.loop_pgo.degrees_of_freedom,
+                loop_pairs=len(self._backend.mapper.accepted_pairs),
+                loop_pgo_initial_cost=self.pose_graph.loop_pgo.last_initial_cost,
+                loop_pgo_final_cost=self.pose_graph.loop_pgo.last_final_cost), handle, indent=2)
 
         # The graph solution is final only after the loop-closure thread has
         # stopped; resolve all lightweight FrameMsg records at this point.
@@ -481,25 +451,40 @@ class PoseGraphNode(Node):
             self.keyframedb.save(self.save_dir)
             self.parent_groups_info.save(self.save_dir)
             self.pose_graph_solutions.save(self.save_dir)
+        super().destroy_node()
 
 
 def main(args=None):
-    """
-    Main function to initialize and run the node.
-    """
-    rclpy.init(args=args)
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = PoseGraphNode()
     executor = MultiThreadedExecutor(num_threads=3)
     executor.add_node(node)
+    previous = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+    def stop(_signum, _frame):
+        raise KeyboardInterrupt
+    for signum in previous:
+        signal.signal(signum, stop)
     try:
-        executor.spin()
+        while rclpy.ok():
+            executor.spin_once(timeout_sec=.1)
+            node.raise_if_failed()
     except (KeyboardInterrupt, SystemExit):
-        # ros2 launch can send a second SIGINT while the node writes the final
-        # trajectory evaluation.  Ignore it so cleanup can complete.
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        for signum in previous:
+            signal.signal(signum, signal.SIG_IGN)
+        # Tracking finishes its current image and sends an ordered stream end.
+        # Continue ROS reception until its last keyframe has reached our queue.
+        deadline = time.monotonic() + 5.
+        while rclpy.ok() and not node.input_complete() and time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=.05)
+            node.raise_if_failed()
     finally:
-        node.destroy_node()
-        executor.shutdown()
+        try:
+            executor.shutdown()
+            node.destroy_node()
+        finally:
+            rclpy.try_shutdown()
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
 
 
 if __name__ == "__main__":

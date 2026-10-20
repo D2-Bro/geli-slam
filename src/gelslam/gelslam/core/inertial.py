@@ -173,6 +173,14 @@ class ImuBuffer:
         # lock only protects deque access and never covers integration work.
         self._lock = RLock()
 
+    def __getstate__(self):
+        with self._lock:
+            return {"_samples": self._samples.copy()}
+
+    def __setstate__(self, state):
+        self._samples = state["_samples"]
+        self._lock = RLock()
+
     def add(self, sample):
         """Append a sample, rejecting duplicate or out-of-order timestamps."""
         if not isinstance(sample, ImuSample):

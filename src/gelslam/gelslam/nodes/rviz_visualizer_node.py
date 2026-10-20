@@ -12,7 +12,7 @@ from geometry_msgs.msg import TransformStamped, Vector3Stamped
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs.msg import Image, PointCloud2, PointField
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 from gelslam.core.frame import pose_of_frame_msg
@@ -123,7 +123,10 @@ class RvizVisualizerNode(Node):
         self.use_backend_poses = bool(
             self.get_parameter("use_backend_poses").value
         )
-        self.keyframedb = KeyFrameDB(self.ppmm, Logger())
+        self.keyframedb = KeyFrameDB(
+            self.ppmm, Logger(), self.gelsight_T_imu,
+            config["gelslam_config"]["pose_graph_config"].get("imu_max_sample_gap_s", .05),
+        )
         self.visible_coverage_meshes = VisibleCoverageMeshes()
         self.pending_frame_msg = None
         self.latest_map_T_gelsight = np.eye(4, dtype=np.float64)
@@ -135,6 +138,12 @@ class RvizVisualizerNode(Node):
         self.global_cloud_pub = self.create_publisher(
             PointCloud2, "/gelslam/rviz/global_surface", 1
         )
+        # RViz uses one stable topic for simulated bags and real devices.
+        image_topic = config["device_config"].get("image_topic", "image")
+        if self.resolve_topic_name(image_topic) != self.resolve_topic_name("/gelslam/rviz/image"):
+            image_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+            self.image_pub = self.create_publisher(Image, "/gelslam/rviz/image", image_qos)
+            self.create_subscription(Image, image_topic, self.image_pub.publish, image_qos)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
         self.gravity_alignment = None

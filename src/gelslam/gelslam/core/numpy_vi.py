@@ -36,6 +36,18 @@ def adjoint(pose):
     return result
 
 
+def normal_ic_pose_jacobians(reference_rows, target_T_reference):
+    """Map cached reference IC rows into the two right-local pose charts."""
+    return reference_rows, -reference_rows @ adjoint(np.linalg.inv(target_T_reference))
+
+
+def gelsight_z_pose_jacobian(gel_from_state_increment, sigma):
+    """Freeze rotation/XY; measure only target GelSight body-local Z motion."""
+    row = np.zeros((1, 6))
+    row[0, 5] = 1.0 / sigma
+    return row @ gel_from_state_increment
+
+
 @dataclass
 class NavigationState:
     """Navigation pose, world velocity, and sensor-frame additive IMU biases.
@@ -303,8 +315,7 @@ class DenseNormalResidual:
             normal_blocks[:, :, :5] = source
         normal_relative = normal_blocks.reshape(-1, 6)
 
-        reference_jacobian = normal_relative
-        target_jacobian = -normal_relative @ adjoint(np.linalg.inv(relative))
+        reference_jacobian, target_jacobian = normal_ic_pose_jacobians(normal_relative, relative)
         if self.fixed_reference_z_m is not None:
             # The normal residual depends on reference-frame XY translation.
             # Project the target's right-tangent translation onto that plane.

@@ -22,6 +22,91 @@ def _pose(rotation, position):
     return gtsam.Pose3(gtsam.Rot3.Expmap(np.asarray(rotation)), np.asarray(position)).matrix()
 
 
+def test_fixed_pose_velocity_and_bias_are_removed_from_qr_and_remain_exact(monkeypatch):
+    from gelslam.core import split_pose
+    from gelslam.core.backend_factors import (
+        state_keys, variable_type, frozen_navigation_factor,
+    )
+    values = gtsam.Values()
+    for index in (0, 1):
+        pose, velocity, bias = state_keys(index)
+        values.insert(pose, gtsam.Pose3(_pose((.1, -.2, .3), (.02, -.01, .03))))
+        values.insert(velocity, np.array([.1, -.2, .3]))
+        values.insert(bias, gtsam.imuBias.ConstantBias(np.ones(3) * .01, np.ones(3) * .001))
+    fixed = set(state_keys(0))
+    rhs = np.arange(15) * .001
+    graph = gtsam.NonlinearFactorGraph()
+    graph.add(frozen_navigation_factor(list(state_keys(0) + state_keys(1)),
+                                       np.column_stack((np.eye(15), np.eye(15))), rhs, values))
+    # A conflicting fixed-only observation must never move the fixed state.
+    graph.add(frozen_navigation_factor(list(state_keys(0)), np.eye(15) * 1e8,
+                                       np.ones(15), values))
+    original_qr = split_pose.solve_gaussian_qr
+    calls = []
+
+    def check_qr(gaussian):
+        assert not fixed.intersection(gaussian.keys())
+        calls.append(True)
+        return original_qr(gaussian)
+
+    monkeypatch.setattr(split_pose, 'solve_gaussian_qr', check_qr)
+    result = optimize_split_pose_graph(
+        graph, values, fixed_keys=fixed,
+        variable_types={key: variable_type(key) for key in values.keys()})
+    assert calls
+    for index in (0,):
+        pose, velocity, bias = state_keys(index)
+        np.testing.assert_array_equal(result.atPose3(pose).matrix(), values.atPose3(pose).matrix())
+        np.testing.assert_array_equal(result.atVector(velocity), values.atVector(velocity))
+        np.testing.assert_array_equal(result.atConstantBias(bias).vector(), values.atConstantBias(bias).vector())
+    pose, velocity, bias = state_keys(1)
+    actual = np.r_[split_pose_coordinates(values.atPose3(pose).matrix(), result.atPose3(pose).matrix()),
+                   result.atVector(velocity) - values.atVector(velocity),
+                   result.atConstantBias(bias).vector() - values.atConstantBias(bias).vector()]
+    np.testing.assert_allclose(actual, rhs, atol=1e-7, rtol=1e-5)
+
+
+def test_conditioning_supports_factors_with_more_than_three_free_keys():
+    values = gtsam.Values()
+    values.insert(0, np.array([.1, -.2, .3]))
+    for key in range(1, 5):
+        values.insert(key, np.zeros(3))
+    target = np.arange(12) * .01
+
+    def error(_factor, current, jacobians):
+        if jacobians is not None:
+            jacobians[0] = -np.tile(np.eye(3), (4, 1))
+            for slot in range(1, 5):
+                jacobians[slot] = np.eye(12)[:, (slot - 1) * 3:slot * 3]
+        return (np.concatenate([current.atVector(key) for key in range(1, 5)])
+                - np.tile(current.atVector(0), 4) - target)
+
+    graph = gtsam.NonlinearFactorGraph()
+    graph.add(gtsam.CustomFactor(gtsam.noiseModel.Unit.Create(12), list(range(5)), error))
+    result = optimize_split_pose_graph(graph, values, fixed_keys={0},
+                                       variable_types={key: 'vector' for key in range(5)})
+    np.testing.assert_array_equal(result.atVector(0), values.atVector(0))
+    np.testing.assert_allclose(np.concatenate([result.atVector(key) for key in range(1, 5)]),
+                               np.tile(values.atVector(0), 4) + target, atol=1e-8)
+
+
+def test_all_fixed_problem_skips_qr_and_rejects_unknown_fixed_key(monkeypatch):
+    from gelslam.core import split_pose
+    values = gtsam.Values()
+    values.insert(0, np.ones(3))
+    graph = gtsam.NonlinearFactorGraph()
+    graph.add(gtsam.PriorFactorVector(0, np.zeros(3), gtsam.noiseModel.Unit.Create(3)))
+
+    def unexpected(_graph):
+        raise AssertionError('all-fixed problem must not run QR')
+
+    monkeypatch.setattr(split_pose, 'solve_gaussian_qr', unexpected)
+    result = optimize_split_pose_graph(graph, values, fixed_keys={0}, variable_types={0: 'vector'})
+    np.testing.assert_array_equal(result.atVector(0), values.atVector(0))
+    with pytest.raises(ValueError, match='fixed keys must exist'):
+        optimize_split_pose_graph(graph, values, fixed_keys={1}, variable_types={0: 'vector'})
+
+
 def test_finite_rotation_does_not_redirect_the_position_increment():
     pose = _pose((0.2, -0.1, 0.3), (0.04, -0.02, 0.01))
     rotation = np.array((0., 0., np.pi / 2))

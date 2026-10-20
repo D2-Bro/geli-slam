@@ -123,26 +123,75 @@ def solve_gaussian_qr(graph):
     return graph.eliminateSequential(ordering, gtsam.EliminateQR).optimize()
 
 
-def optimize_split_pose_graph(graph, initial, max_iterations=100, variable_types=None):
+def _condition_fixed_keys(linear, current, widths, fixed_keys):
+    """Condition each Gaussian row on delta_fixed=0 without a finite prior."""
+    conditioned = gtsam.GaussianFactorGraph()
+    for index in range(linear.size()):
+        factor = linear.at(index)
+        if factor is None:
+            continue
+        keys = list(factor.keys())
+        if not fixed_keys.intersection(keys):
+            conditioned.add(factor)
+            continue
+        if all(key in fixed_keys for key in keys):
+            continue
+        A, rhs = gtsam.JacobianFactor(factor).jacobian()
+        blocks, column = {}, 0
+        for key in keys:
+            width = widths[key]
+            if key not in fixed_keys:
+                blocks[key] = A[:, column:column + width]
+            column += width
+        noise = gtsam.noiseModel.Unit.Create(len(rhs))
+        if len(blocks) <= 3:
+            args = [item for key, block in blocks.items() for item in (key, block)]
+            conditioned.add(gtsam.JacobianFactor(*args, rhs, noise))
+        else:
+            # The Python JacobianFactor constructors expose at most three
+            # keys. CustomFactor can construct arbitrary Gaussian row blocks.
+            def rows(_factor, _values, jacobians):
+                if jacobians is not None:
+                    for slot, block in enumerate(blocks.values()):
+                        jacobians[slot] = block
+                return -rhs
+
+            conditioned.add(gtsam.CustomFactor(noise, list(blocks), rows).linearize(current))
+    return conditioned
+
+
+def optimize_split_pose_graph(graph, initial, max_iterations=100, variable_types=None,
+                              fixed_keys=()):
     """Sparse GTSAM QR steps with LM damping and explicit split retraction.
 
     Native Pose3 optimizers use Values.retract(), whose installed chart uses
     the SE(3) exponential. Apply accepted increments ourselves instead.
     Damping follows each variable's information diagonal, so translation
     and rotation with different units do not share an absolute scale.
+    Fixed keys retain their supplied values exactly. Their increment columns
+    are removed before QR, while their observations still constrain free keys.
     """
     current = gtsam.Values(initial)
-    keys = list(current.keys())
-    types = {key: "pose" for key in keys} if variable_types is None else variable_types
-    widths = {key: (3 if types[key] == "vector" else 6) for key in keys}
+    all_keys = list(current.keys())
+    fixed_keys = set(fixed_keys)
+    if not fixed_keys.issubset(all_keys):
+        raise ValueError("fixed keys must exist in the initial values")
+    keys = [key for key in all_keys if key not in fixed_keys]
+    types = {key: "pose" for key in all_keys} if variable_types is None else variable_types
+    widths = {key: (len(current.atVector(key)) if types[key] == "vector" else 6)
+              for key in all_keys}
     cost = float(graph.error(current))
     if not np.isfinite(cost):
         raise ValueError("non-finite split pose graph cost")
+    if not keys:
+        return current
     damping = 1e-5
     for _iteration in range(max_iterations):
         if cost <= 1e-16:
             break
         linear = graph.linearize(current)
+        if fixed_keys:
+            linear = _condition_fixed_keys(linear, current, widths, fixed_keys)
         diagonals = {key: np.zeros(widths[key]) for key in keys}
         for index in range(linear.size()):
             factor = linear.at(index)

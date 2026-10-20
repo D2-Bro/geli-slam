@@ -173,6 +173,7 @@ def test_tracker_publishes_normal_map_when_contact_tracking_is_rejected():
     observation = SimpleNamespace(N=np.array([[[0.0, 0.0, 1.0]]]))
     node = SimpleNamespace(
         recorded_source_clock=None,
+        debug_visualization_enabled=True,
         bridge=SimpleNamespace(
             imgmsg_to_cv2=lambda *_args, **_kwargs: np.zeros((1, 1, 3)),
             cv2_to_imgmsg=lambda rgb, encoding: SimpleNamespace(
@@ -473,3 +474,85 @@ def test_backend_keyframe_trajectory_uses_only_active_solved_states():
     assert np.allclose(
         [pose.pose.position.x for pose in path.poses], (0.0, 0.1)
     )
+
+
+@pytest.mark.parametrize('image_topic', ['/image', '/gelsight/image_raw'])
+def test_rviz_navigation_pose_uses_mounting_and_forwards_configured_image(tmp_path, image_topic):
+    """A new double-precision IMU pose must still display the GelSight pose."""
+    import time
+    import rclpy
+    import yaml
+    from cv_bridge import CvBridge
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from sensor_msgs.msg import Image
+    from std_msgs.msg import Header
+    from backend_test_support import frame
+    from gelslam.core.frame import create_keyframe_msg
+
+    mounting = np.diag([1., -1., -1., 1.])
+    mounting[2, 3] = -.04
+    config = dict(device_config=dict(ppmm=1., image_topic=image_topic),
+        imu_config=dict(gelsight_T_imu=mounting.tolist()),
+        gelslam_config=dict(pose_graph_config={}))
+    config_path = tmp_path/'config.yaml'
+    config_path.write_text(yaml.safe_dump(config))
+    rclpy.init(args=['--ros-args', '-p', 'config_path:='+str(config_path)])
+    node = peer = executor = None
+    try:
+        node = RvizVisualizerNode()
+        observation = frame(new=True)
+        observation.L = observation.L.astype(np.float32)
+        observation.navigation_state.pose = mounting.copy()  # map_T_G is identity.
+        header = Header(stamp=Time(sec=1))
+        message = create_keyframe_msg(CvBridge(), observation, 0, 0, True, np.eye(4),
+            header, observation.navigation_state, observation.gravity, observation.imu_samples)
+        node.keyframe_callback(message)
+        node.frame_callback(SimpleNamespace(ref_kid=0, ref_t_curr=np.eye(4).ravel(), header=header))
+        np.testing.assert_allclose(node.latest_map_T_gelsight, np.eye(4), atol=1e-12)
+        np.testing.assert_allclose(node.keyframedb[0].navigation_state.pose, mounting, atol=1e-12)
+
+        peer = Node('rviz_image_test')
+        publisher = peer.create_publisher(Image, image_topic, 1)
+        received = []
+        peer.create_subscription(Image, '/gelslam/rviz/image', received.append,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+        executor = SingleThreadedExecutor()
+        executor.add_node(node); executor.add_node(peer)
+        image = CvBridge().cv2_to_imgmsg(np.full((2, 3, 3), 17, np.uint8), encoding='bgr8')
+        image.header = header
+        deadline = time.monotonic()+4
+        while not received and time.monotonic()<deadline:
+            publisher.publish(image)
+            executor.spin_once(timeout_sec=.02)
+        assert received, 'No raw image on the configured RViz topic'
+        assert received[-1].header == image.header
+        assert received[-1].encoding == image.encoding
+        assert bytes(received[-1].data) == bytes(image.data)
+    finally:
+        if executor is not None: executor.shutdown()
+        if peer is not None: peer.destroy_node()
+        if node is not None: node.destroy_node()
+        rclpy.shutdown()
+
+
+@pytest.mark.parametrize('use_sim_time', ['true', 'false'])
+def test_bag_launch_supplies_same_clock_to_rviz(use_sim_time):
+    import importlib.util
+    from pathlib import Path
+    from launch import LaunchContext
+    from launch.utilities import normalize_to_list_of_substitutions, perform_substitutions
+    from launch_ros.actions import Node
+    from launch_ros.utilities import evaluate_parameters
+
+    path = Path(__file__).resolve().parents[1]/'launch'/'bag_replay_launch.py'
+    spec = importlib.util.spec_from_file_location('rviz_clock_launch', path)
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    context = LaunchContext()
+    context.launch_configurations['use_sim_time'] = use_sim_time
+    nodes = [n for n in module.generate_launch_description().entities if isinstance(n, Node)]
+    rviz = next(n for n in nodes if perform_substitutions(context,
+        normalize_to_list_of_substitutions(n.node_executable)) == 'rviz2')
+    params = evaluate_parameters(context, rviz._Node__parameters)
+    assert list(params) == [{'use_sim_time': use_sim_time == 'true'}]

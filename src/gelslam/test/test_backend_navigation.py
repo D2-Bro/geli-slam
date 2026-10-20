@@ -29,7 +29,7 @@ def test_15d_graph_has_direct_tactile_motion_bias_and_no_relative_pose_factors()
     graph.add_keyframes(frames, 0, 2)
     assert graph.graph_init.size() == 6  # two (Pose3, velocity, ConstantBias) triples
     assert graph.factor_kinds == ['pose_anchor', 'velocity_prior', 'bias_prior',
-                                  'imu', 'bias', 'normal', 'height']
+                                  'imu', 'bias', 'gelsight']
     assert all(measurement is None for _, _, measurement, _ in graph.edges)
     factors = [graph.graph.at(i) for i in range(graph.graph.size())]
     assert factors[3].dim() == 9 and factors[4].dim() == 6
@@ -58,23 +58,26 @@ def test_tactile_height_updates_both_poses_and_includes_imu_mounting_offset():
     extrinsic[:3, 3] = [.02, -.01, .03]
     first, second = frame(), frame(1, height_m=.001)
     pair = TactilePair(first, second, np.eye(4), np.eye(4), extrinsic, {})
-    factors = pair.factors(0, 1)
+    factors = (pair.factor(0, 1),)
     values = gtsam.Values()
     for key in (0, 1):
         values.insert(key, gtsam.Pose3(imu_pose(np.eye(4), extrinsic)))
-    factor = factors[1]
+    factor = factors[0]
     A, _ = factor.linearize(values).jacobian()
+    A = A[-1:]
+    # Differentiate the intended conditional model: only displacement of the
+    # GelSight origin along its frozen local Z, not the full warped height.
+    from gelslam.core.imu_navigation import gelsight_pose
     epsilon = 1e-6
-    numeric = np.zeros_like(A)
-    for slot, key in enumerate((0, 1)):
-        for axis in range(6):
-            step = np.eye(6)[axis] * epsilon
-            plus, minus = gtsam.Values(values), gtsam.Values(values)
-            pose = values.atPose3(key).matrix()
-            plus.update(key, gtsam.Pose3(split_pose_plus(pose, step)))
-            minus.update(key, gtsam.Pose3(split_pose_plus(pose, -step)))
-            numeric[:, slot * 6 + axis] = (factor.whitenedError(plus) - factor.whitenedError(minus)) / (2 * epsilon)
-    assert np.allclose(A, numeric, atol=1e-4, rtol=1e-4)
+    target_numeric = np.zeros(6)
+    pose = values.atPose3(1).matrix()
+    for axis in range(6):
+        step = np.eye(6)[axis] * epsilon
+        plus = gelsight_pose(split_pose_plus(pose, step), extrinsic)
+        minus = gelsight_pose(split_pose_plus(pose, -step), extrinsic)
+        target_numeric[axis] = (plus[2, 3] - minus[2, 3]) / (2 * epsilon) / pair.height_sigma
+    numeric = np.r_[-target_numeric, target_numeric][None, :]
+    np.testing.assert_allclose(A, numeric, atol=1e-5, rtol=1e-5)
     assert np.linalg.norm(A[:, :6]) > 0 and np.linalg.norm(A[:, 6:]) > 0
 
 
@@ -83,8 +86,30 @@ def test_imu_only_recovery_has_no_tactile_factor():
     frames = [frame(0, new=True), frame(1, tactile=False), frame(2)]
     graph.add_keyframes(frames, 0, 3)
     assert graph.factor_kinds.count('imu') == 2
-    assert 'normal' not in graph.factor_kinds and 'height' not in graph.factor_kinds
+    assert 'gelsight' not in graph.factor_kinds
     assert len(graph.tactile_skipped) == 2
+
+
+def test_backend_imu_factor_stores_midpoint_preintegration():
+    graph = PoseGraph(config())
+    frames = [frame(0, new=True), frame(1, tactile=False)]
+    acceleration = np.array([.3, -.2, 9.81])
+    omega = np.array([.4, -.3, .5])
+    samples = tuple(ImuSample(float(t), acceleration, omega)
+                    for t in np.linspace(1., 1.1, 11))
+    frames[1].imu_samples = samples
+    graph.add_keyframes(frames, 0, 2)
+    factor_index = graph.factor_kinds.index('imu')
+    pim = graph.graph.at(factor_index).preintegratedMeasurements()
+    midpoint_velocity = np.zeros(3)
+    start_velocity = np.zeros(3)
+    for first, second in zip(samples, samples[1:]):
+        dt = second.timestamp - first.timestamp
+        elapsed = first.timestamp - samples[0].timestamp
+        midpoint_velocity += gtsam.Rot3.Expmap(omega*(elapsed+dt/2)).rotate(acceleration)*dt
+        start_velocity += gtsam.Rot3.Expmap(omega*elapsed).rotate(acceleration)*dt
+    np.testing.assert_allclose(pim.deltaVij(), midpoint_velocity, atol=1e-13, rtol=0.)
+    assert np.linalg.norm(pim.deltaVij()-start_velocity) > 1e-4
 
 
 @pytest.mark.parametrize('damage', ['missing', 'start', 'end', 'gap'])
@@ -118,7 +143,164 @@ def test_window_prior_retains_velocity_bias_cross_terms_without_double_counting(
     graph.solve()
     assert graph.window_start == 4
     graph.solve(global_optimization=True)
+    assert graph.marginal_prior.size() == 1  # A PGO request does not reset local VI information.
+
+
+def test_fixed_local_window_keeps_predecessor_factors_and_allows_first_state_to_move():
+    graph = PoseGraph(config(marginalization_enabled=False))
+    frames = [frame(i, new=i == 0, z=.002 if i >= 3 else 0.) for i in range(6)]
+    graph.add_keyframes(frames, 0, 6)
+    window, values, fixed = graph._window_graph(3)
+    assert fixed == set(state_keys(2))
+    assert set(values.keys()) == {key for i in range(2, 6) for key in state_keys(i)}
+    # Three real boundary/interior edge sets, without an artificial prior.
+    assert window.size() == 9
+    keys = [list(window.at(i).keys()) for i in range(window.size())]
+    assert [2, velocity_key(2), 3, velocity_key(3), bias_key(2)] in keys
+    assert [bias_key(2), bias_key(3)] in keys and [2, 3] in keys
+    before = graph.states[2].copy()
+    graph.solve()
+    for field in ('pose', 'velocity', 'accel_bias', 'gyro_bias'):
+        np.testing.assert_array_equal(getattr(graph.states[2], field), getattr(before, field))
+    assert abs(graph.states[3].pose[2, 3]) < 1e-6
     assert graph.marginal_prior.size() == 0
+
+
+def test_fixed_local_window_excludes_outside_loop_endpoint():
+    graph = PoseGraph(config(marginalization_enabled=False))
+    graph.add_keyframes([frame(i, new=i == 0) for i in range(6)], 0, 6)
+    assert graph._add_loop_pair(0, 5, np.eye(4))
+    window, values, fixed = graph._window_graph(3)
+    assert fixed == set(state_keys(2))
+    assert all(values.exists(key) for key in fixed)
+    keys = [list(window.at(i).keys()) for i in range(window.size())]
+    assert [0, 5] not in keys
+    assert not set(state_keys(0)).intersection(values.keys())
+    assert [0] not in keys
+    snapshots = {i: graph.states[i].copy() for i in (0, 2)}
+    graph.solve()
+    for index, before in snapshots.items():
+        np.testing.assert_array_equal(graph.states[index].pose, before.pose)
+
+
+@pytest.mark.parametrize('count', [1, 3])
+def test_fixed_local_window_fixes_only_first_pose_without_predecessor(count):
+    graph = PoseGraph(config(marginalization_enabled=False))
+    graph.add_keyframes([frame(i, new=i == 0, z=.002 if i else 0.) for i in range(count)], 0, count)
+    window, _, fixed = graph._window_graph(0)
+    assert fixed == {0}
+    keys = [list(window.at(i).keys()) for i in range(window.size())]
+    assert [velocity_key(0)] in keys and [bias_key(0)] in keys
+    assert [0] not in keys  # The pose prior has no free increment.
+    before = graph.states[0].copy()
+    graph.solve()
+    np.testing.assert_array_equal(graph.states[0].pose, before.pose)
+    if count > 1:
+        assert abs(graph.states[1].pose[2, 3]) < 1e-6
+
+
+def test_new_trial_without_temporal_predecessor_has_only_pose_fixed_inside_window():
+    graph = PoseGraph(config(marginalization_enabled=False, local_window_size=4))
+    frames = [frame(i, new=i in (0, 3), group=int(i >= 3)) for i in range(6)]
+    graph.add_keyframes(frames, 0, 6)
+    window, values, fixed = graph._window_graph(2)
+    assert fixed == set(state_keys(1)) | {3}
+    assert all(values.exists(key) for key in state_keys(2) + state_keys(4) + state_keys(5))
+    assert not set(state_keys(0)).intersection(values.keys())
+    keys = [list(window.at(i).keys()) for i in range(window.size())]
+    assert [velocity_key(3)] in keys and [bias_key(3)] in keys
+
+
+def test_inside_fixed_pose_retains_priors_and_commits_velocity_and_both_biases():
+    graph = PoseGraph(config(marginalization_enabled=False))
+    graph.add_keyframes([frame(0, new=True)], 0, 1)
+    state = graph.states[0]
+    state.pose[0, 3] = .002  # Conflict with the old pose prior must not move it.
+    state.velocity[:] = [.1, -.2, .3]
+    state.accel_bias[:] = [.01, -.02, .03]
+    state.gyro_bias[:] = [.001, -.002, .003]
+    graph.poses[0] = state.pose.copy()
+    graph._put_state(0, state)
+    pose, observation_pose = state.pose.copy(), graph.poses[0].copy()
+    window, values, fixed = graph._window_graph(0)
+    assert fixed == {0} and window.size() == 2
+    assert window.error(values) > 0.
+    graph.solve()
+    np.testing.assert_array_equal(state.pose, pose)
+    np.testing.assert_array_equal(graph.poses[0], observation_pose)
+    np.testing.assert_allclose(state.velocity, 0., atol=1e-8)
+    np.testing.assert_allclose(state.accel_bias, 0., atol=1e-8)
+    np.testing.assert_allclose(state.gyro_bias, 0., atol=1e-8)
+    np.testing.assert_array_equal(graph.graph_init.atVector(velocity_key(0)), state.velocity)
+    np.testing.assert_array_equal(graph.graph_init.atConstantBias(bias_key(0)).vector(),
+                                  np.r_[state.accel_bias, state.gyro_bias])
+
+
+def test_inside_anchor_velocity_biases_update_with_pose_fixed_outside_predecessor():
+    graph = PoseGraph(config(marginalization_enabled=False, local_window_size=4))
+    graph.add_keyframes([frame(i, new=i in (0, 3), group=int(i >= 3)) for i in range(6)], 0, 6)
+    state = graph.states[3]
+    state.velocity[:] = [.1, -.2, .3]
+    state.accel_bias[:] = [.01, -.02, .03]
+    state.gyro_bias[:] = [.001, -.002, .003]
+    graph._put_state(3, state)
+    pose = state.pose.copy()
+    outside = graph.states[1].copy()
+    graph.solve()
+    np.testing.assert_array_equal(state.pose, pose)
+    assert np.linalg.norm(state.velocity) < 1e-5
+    assert np.linalg.norm(state.accel_bias) < 1e-5
+    assert np.linalg.norm(state.gyro_bias) < 1e-5
+    for field in ('pose', 'velocity', 'accel_bias', 'gyro_bias'):
+        np.testing.assert_array_equal(getattr(graph.states[1], field), getattr(outside, field))
+
+
+@pytest.mark.parametrize('loop_reference', [0, 1])
+def test_outside_predecessor_keeps_all_15d_fixed_with_separate_loop(loop_reference):
+    graph = PoseGraph(config(marginalization_enabled=False))
+    frames = [frame(i, new=i in (0, 2), group=int(i >= 2)) for i in range(6)]
+    graph.add_keyframes(frames, 0, 6)
+    assert graph._add_loop_pair(loop_reference, 5, np.eye(4))
+    fixed_index = 2
+    state = graph.states[fixed_index]
+    state.pose[0, 3] = .002
+    state.velocity[:] = [.1, -.2, .3]
+    state.accel_bias[:] = [.01, -.02, .03]
+    state.gyro_bias[:] = [.001, -.002, .003]
+    graph.poses[fixed_index] = state.pose.copy()
+    graph._put_state(fixed_index, state)
+    pose, observation_pose = state.pose.copy(), graph.poses[fixed_index].copy()
+    frozen = state.copy()
+    excluded = graph.states[1].copy()
+    window, values, fixed = graph._window_graph(3)
+    assert fixed == set(state_keys(2))
+    assert not set(state_keys(1)).intersection(values.keys())
+    keys = [list(window.at(i).keys()) for i in range(window.size())]
+    assert [velocity_key(fixed_index)] not in keys and [bias_key(fixed_index)] not in keys
+    assert [fixed_index] not in keys
+    assert window.error(values) > 0.
+    graph.solve()
+    np.testing.assert_array_equal(state.pose, pose)
+    np.testing.assert_array_equal(graph.poses[fixed_index], observation_pose)
+    for field in ('velocity', 'accel_bias', 'gyro_bias'):
+        np.testing.assert_array_equal(getattr(state, field), getattr(frozen, field))
+    np.testing.assert_array_equal(graph.graph_init.atVector(velocity_key(fixed_index)), state.velocity)
+    np.testing.assert_array_equal(graph.graph_init.atConstantBias(bias_key(fixed_index)).vector(),
+                                  np.r_[state.accel_bias, state.gyro_bias])
+    for field in ('pose', 'velocity', 'accel_bias', 'gyro_bias'):
+        np.testing.assert_array_equal(getattr(graph.states[1], field), getattr(excluded, field))
+
+
+def test_loop_pgo_request_keeps_the_local_window_boundary_fixed():
+    graph = PoseGraph(config(marginalization_enabled=False))
+    graph.add_keyframes([frame(i, new=i == 0) for i in range(5)], 0, 5)
+    graph.states[1].pose[2, 3] = .004
+    graph.poses[1][2, 3] = .004
+    graph._put_state(1, graph.states[1])
+    graph.solve()
+    assert graph.states[1].pose[2, 3] == .004
+    graph.solve(global_optimization=True)
+    assert graph.states[1].pose[2, 3] == pytest.approx(.004)
 
 
 def test_graph_round_trip_restores_navigation_and_direct_observations(tmp_path):
@@ -196,44 +378,44 @@ def test_tracker_packet_uses_keyframe_imu_times_and_separate_buffer(monkeypatch)
     assert len(db[1].imu_samples) == len(rows)
 
 
-def test_both_tactile_factor_jacobians_match_their_bilinear_residuals():
-    first, second = frame(), frame(1)
-    yy, xx = np.mgrid[:40, :40]
-    second.N = np.dstack((.005 * xx, .003 * yy, np.ones_like(xx))).astype(np.float64)
-    second.H = (.02 * xx + .01 * yy).astype(np.float64)
-    mount = gtsam.Pose3(gtsam.Rot3.Expmap(np.array([.2, -.1, .3])), np.array([.02, -.01, .03])).matrix()
-    target = gtsam.Pose3(gtsam.Rot3.Expmap(np.array([.01, -.02, .03])), np.array([.00031, .00027, .001])).matrix()
-    pair = TactilePair(first, second, np.eye(4), target, mount,
-                       {'tactile_normal_sigma': .02, 'tactile_normal_huber_delta': .4})
-    values = gtsam.Values()
-    values.insert(0, gtsam.Pose3(imu_pose(np.eye(4), mount)))
-    values.insert(1, gtsam.Pose3(imu_pose(target, mount)))
-    for factor in pair.factors(0, 1):
-        A, _ = factor.linearize(values).jacobian()
-        numeric = np.zeros_like(A)
-        epsilon = 1e-7
-        for slot, key in enumerate((0, 1)):
-            for axis in range(6):
-                step = np.eye(6)[axis] * epsilon
-                plus, minus = gtsam.Values(values), gtsam.Values(values)
-                pose = values.atPose3(key).matrix()
-                plus.update(key, gtsam.Pose3(split_pose_plus(pose, step)))
-                minus.update(key, gtsam.Pose3(split_pose_plus(pose, -step)))
-                numeric[:, slot * 6 + axis] = (factor.whitenedError(plus) - factor.whitenedError(minus)) / (2 * epsilon)
-        assert np.allclose(A, numeric, atol=1e-4, rtol=1e-4)
-
-
 def test_lost_overlap_has_nonzero_cost_and_cannot_win_an_lm_step():
     pair = TactilePair(frame(), frame(1), np.eye(4), np.eye(4), np.eye(4), {})
     values = gtsam.Values()
     values.insert(0, gtsam.Pose3())
     values.insert(1, gtsam.Pose3())
-    factors = pair.factors(0, 1)
+    factors = (pair.factor(0, 1),)
     before = sum(f.error(values) for f in factors)
     pose = np.eye(4)
     pose[0, 3] = 1.
     values.update(1, gtsam.Pose3(pose))
     assert sum(f.error(values) for f in factors) > before + 1e6
+
+
+def test_opencv_tactile_factor_corrects_known_pose_error_on_textured_maps():
+    first, second = frame(), frame(1)
+    yy, xx = np.mgrid[:40, :40]
+    nx, ny = .2 * np.sin(xx / 5), .2 * np.cos(yy / 7)
+    normal = np.dstack((nx, ny, np.sqrt(1 - nx * nx - ny * ny))).astype(np.float32)
+    height = (.1 * np.sin(xx / 7) + .2 * np.cos(yy / 6)).astype(np.float32)
+    for observation in (first, second):
+        observation.N, observation.H = normal.copy(), height.copy()
+    target = np.eye(4)
+    target[:3, 3] = [.0003, -.0002, .0001]
+    pair = TactilePair(first, second, np.eye(4), target, np.eye(4),
+                       {'tactile_normal_sigma': .02})
+    values = gtsam.Values()
+    values.insert(0, gtsam.Pose3())
+    values.insert(1, gtsam.Pose3(target))
+    graph = gtsam.NonlinearFactorGraph()
+    graph.add(pair.factor(0, 1))
+    graph.add(frozen_navigation_factor([0], np.eye(6) * 1e6, np.zeros(6), values))
+    before = graph.error(values)
+    result = optimize_split_pose_graph(graph, values, max_iterations=30)
+    assert graph.error(result) < before * 1e-4
+    # The quantized sampler has a subpixel plateau; do not demand an exact
+    # zero XY translation. Its known identity solution is recovered within
+    # one table step (1 mm pixel pitch / 32).
+    assert np.linalg.norm(result.atPose3(1).translation()) < .001 / 32
 
 
 def test_raw_backend_save_and_load(tmp_path):

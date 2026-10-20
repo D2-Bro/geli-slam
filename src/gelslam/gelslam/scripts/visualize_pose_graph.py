@@ -109,7 +109,7 @@ def main():
         C = keyframe.C
         H = keyframe.H
         # Graph variables are IMU poses; patch centers use GelSight poses.
-        start_T_curr = np.asarray(pose_graph.poses[kidx], dtype=np.float32)
+        start_T_curr = np.asarray(pose_graph_solutions[kidx], dtype=np.float32)
         cy, cx = np.mean(np.column_stack(np.where(C)), axis=0)
         cz = H[int(cy), int(cx)] - 8
         center = (

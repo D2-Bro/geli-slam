@@ -1,5 +1,7 @@
 import os
 import signal
+import json
+import uuid
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -16,11 +18,14 @@ from rclpy.signals import SignalHandlerOptions
 from cv_bridge import CvBridge
 from rclpy.node import Node
 from sensor_msgs.msg import Image, Imu, PointCloud2, PointField
+from std_msgs.msg import String
 from normalflow.utils import height2pointcloud
 
 from gelslam.core.inertial import ImuSample, gyro_to_rad_per_sec
 from gelslam.core.recorded_source_clock import RecordedSourceClock
 from gelslam.core.tracker import Tracker, TrackingMode
+from gelslam.core.backend_feedback import FeedbackReceiver
+from gelslam.core.slam_packets import ArrayBridge, FramePacket, KeyFramePacket, to_ros
 from gelslam.core.gt_state_diagnostic import gt_state_test_needs_gt, resolve_gt_state_test
 from gelslam.core.state_velocity_evaluation import StateVelocityEvaluation, capture_state_velocity
 from gelslam.core.trajectory_evaluation import trajectory_output_dir
@@ -30,7 +35,7 @@ from gelslam.visualization.normal_correspondences import (
     normal_map_to_rgb8,
     render_normal_correspondences,
 )
-from gelslam_msgs.msg import FrameMsg, KeyFrameMsg
+from gelslam_msgs.msg import FrameMsg, KeyFrameMsg, BackendFeedbackMsg, FramePoseMsg
 
 
 """
@@ -45,8 +50,8 @@ class TrackerNode(Node):
     ROS2 node for real-time tracking.
     """
 
-    def __init__(self):
-        super().__init__("tracker_node")
+    def __init__(self, node_name="tracker_node"):
+        super().__init__(node_name)
         self.bridge = CvBridge()
         # Load configuration path
         self.declare_parameter("config_path", "")
@@ -56,6 +61,12 @@ class TrackerNode(Node):
         config_path = os.path.abspath(os.path.expanduser(config_path))
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
+        self.config = config
+        self.debug_visualization_enabled = config["gelslam_config"]["track_config"].get(
+            "debug_visualization_enabled", True
+        )
+        if not isinstance(self.debug_visualization_enabled, bool):
+            raise ValueError("gelslam_config.track_config.debug_visualization_enabled must be a boolean")
         # Get the calibration model path
         calib_model_path = config["device_config"]["calibration_model_path"]
         if not os.path.isabs(calib_model_path):
@@ -80,11 +91,34 @@ class TrackerNode(Node):
 
         # The logger
         self.logger = Logger(ros_logger=self.get_logger())
+        self.logger.info("Frontend debug visualization: %s" % (
+            "enabled" if self.debug_visualization_enabled else "disabled"
+        ))
 
         # Initialize tracker
         self.tracker = Tracker(
             calib_model_path, config, self.skip_background_check, logger=self.logger
         )
+        self.session_id = uuid.uuid4().hex
+        self.tracker._ros_session_id = self.session_id
+        self.tracker.bridge = ArrayBridge()
+        self._last_published_kid = -1
+        self.declare_parameter("backend_feedback", True)
+        self.backend_feedback_enabled = bool(self.get_parameter("backend_feedback").value
+            and self.tracker.frontend_visual_inertial is not None)
+        self.feedback_receiver = None
+        if self.backend_feedback_enabled:
+            self.feedback_receiver = FeedbackReceiver(self.session_id, self.tracker.gelsight_T_imu)
+            self.tracker._map_snapshot_provider = self.feedback_receiver.snapshot
+            self.create_subscription(BackendFeedbackMsg, "backend_feedback",
+                                     self.backend_feedback_callback, 1)
+        self.stream_end_pub = self.create_publisher(String, "backend_stream_end", 10)
+        self.logger.info("ROS process: tracking; backend feedback %s; session %s" % (
+            "enabled" if self.backend_feedback_enabled else "disabled", self.session_id))
+        os.makedirs(self.save_dir, exist_ok=True)
+        with open(os.path.join(self.save_dir, 'tracker_process_config_supplied.yaml'), 'w') as handle:
+            yaml.safe_dump(dict(config=config, backend_feedback=self.backend_feedback_enabled,
+                                pid=os.getpid(), session_id=self.session_id), handle, sort_keys=False)
         self.declare_parameter("sequence_name", "")
         self.state_velocity_evaluation = None
         velocity_settings = dict(config.get("trajectory_evaluation", {}).get("state_velocity", {}))
@@ -250,8 +284,9 @@ class TrackerNode(Node):
                     )
 
         # Initialize publishers
-        self.keyframe_pub = self.create_publisher(KeyFrameMsg, "keyframe", 10)
+        self.keyframe_pub = self.create_publisher(KeyFrameMsg, "keyframe", 1000)
         self.frame_pub = self.create_publisher(FrameMsg, "frame", 10)
+        self.frame_pose_pub = self.create_publisher(FramePoseMsg, "frame_pose", 1000)
         self.contact_surface_pub = self.create_publisher(
             PointCloud2, "/gelslam/current_contact_local", 1
         )
@@ -307,16 +342,14 @@ class TrackerNode(Node):
         self._publish_frontend_gravity(msg.header)
         if ret:
             frame_msg, keyframe_msgs = track_result
-            for keyframe_msg in keyframe_msgs:
-                self.keyframe_pub.publish(keyframe_msg)
+            self._publish_tracking_result(frame_msg, keyframe_msgs)
             if frame_msg is not None:
-                self.frame_pub.publish(frame_msg)
                 evaluation = getattr(self, "state_velocity_evaluation", None)
                 if evaluation is not None:
                     evaluation.add_state(capture_state_velocity(self.tracker, frame_msg))
                 self._log_tracking_pose(frame_msg)
         observation = self.tracker.latest_observation_frame
-        if observation is not None:
+        if self.debug_visualization_enabled and observation is not None:
             normal_image = self.bridge.cv2_to_imgmsg(
                 normal_map_to_rgb8(observation.N), encoding="rgb8"
             )
@@ -326,6 +359,37 @@ class TrackerNode(Node):
                 self._contact_surface_cloud(observation, msg.header.stamp)
             )
             self._publish_normal_correspondences(observation, msg.header)
+
+    def _publish_tracking_result(self, frame_msg, keyframe_msgs):
+        for keyframe_msg in keyframe_msgs:
+            message = to_ros(keyframe_msg, self.bridge) if isinstance(keyframe_msg, KeyFramePacket) else keyframe_msg
+            self.keyframe_pub.publish(message)
+            self._last_published_kid = message.kid
+        if frame_msg is not None:
+            pose_message = FramePoseMsg()
+            pose_message.header = frame_msg.header
+            pose_message.fid, pose_message.ref_kid = frame_msg.fid, frame_msg.ref_kid
+            pose_message.ref_t_curr = np.asarray(frame_msg.ref_t_curr).ravel().tolist()
+            self.frame_pose_pub.publish(pose_message)
+            message = to_ros(frame_msg, self.bridge) if isinstance(frame_msg, FramePacket) else frame_msg
+            self.frame_pub.publish(message)
+
+    def backend_feedback_callback(self, message):
+        try:
+            self.feedback_receiver.receive(message)
+        except ValueError as error:
+            self.get_logger().warning("Ignoring invalid backend feedback: %s" % error)
+
+    def _publish_stream_end(self):
+        if getattr(self, 'stream_end_pub', None) is None:
+            return
+        message = String()
+        message.data = json.dumps(dict(session_id=self.session_id, last_kid=self._last_published_kid))
+        from rclpy.duration import Duration
+        self.keyframe_pub.wait_for_all_acked(Duration(seconds=2.))
+        self.frame_pose_pub.wait_for_all_acked(Duration(seconds=2.))
+        self.stream_end_pub.publish(message)
+        self.stream_end_pub.wait_for_all_acked(Duration(seconds=1.))
 
     def _state_velocity_gt_callback(self, message):
         from scipy.spatial.transform import Rotation
@@ -561,7 +625,14 @@ class TrackerNode(Node):
         """
         Clean up node and save tracker state.
         """
+        self._publish_stream_end()
         self.tracker.log_frontend_tracking_summary()
+        if getattr(self, 'session_id', None) is not None:
+            with open(os.path.join(self.save_dir, 'tracker_process_summary.json'), 'w') as handle:
+                json.dump(dict(pid=os.getpid(), session_id=self.session_id,
+                    last_published_kid=self._last_published_kid,
+                    backend_feedback_enabled=self.backend_feedback_enabled,
+                    tracking_counts=dict(self.tracker._frontend_tracking_counts)), handle, indent=2)
         if self.state_velocity_evaluation is not None:
             try:
                 metrics = self.state_velocity_evaluation.save()

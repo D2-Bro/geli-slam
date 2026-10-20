@@ -27,6 +27,22 @@ def create_keyframe_msg(bridge, frame, kid, fid, is_new_trial, trial_T_curr,
     :param header: std_msgs.msg.Header; Source image header, if available.
     :return: KeyFrameMsg; The keyframe message.
     """
+    if getattr(bridge, "internal_packets", False):
+        from copy import deepcopy
+        from gelslam.core.slam_packets import KeyFramePacket, readonly
+        state = navigation_state
+        navigation = {} if state is None else dict(
+            navigation_valid=True, navigation_timestamp=state.timestamp,
+            navigation_pose=readonly(state.pose).reshape(-1),
+            velocity=readonly(state.velocity), accel_bias=readonly(state.accel_bias),
+            gyro_bias=readonly(state.gyro_bias), gravity=readonly(gravity),
+            imu_measurements=readonly([[s.timestamp, *s.acceleration, *s.angular_velocity]
+                                       for s in imu_samples]).reshape(-1),
+        )
+        return KeyFramePacket(
+            deepcopy(header), readonly(frame.H), readonly(frame.C.astype(np.uint8)),
+            readonly(frame.N), readonly(frame.L), kid, fid, is_new_trial,
+            readonly(trial_T_curr).reshape(-1), tactile_valid=tactile_valid, **navigation)
     keyframe_msg = KeyFrameMsg()
     _copy_header(keyframe_msg, header)
     keyframe_msg.height_map = bridge.cv2_to_imgmsg(frame.H, encoding="32FC1")
@@ -45,6 +61,7 @@ def create_keyframe_msg(bridge, frame, kid, fid, is_new_trial, trial_T_curr,
     if navigation_state is not None:
         keyframe_msg.navigation_valid = True
         keyframe_msg.navigation_timestamp = float(navigation_state.timestamp)
+        keyframe_msg.navigation_pose = np.asarray(navigation_state.pose).ravel().tolist()
         keyframe_msg.velocity = np.asarray(navigation_state.velocity).tolist()
         keyframe_msg.accel_bias = np.asarray(navigation_state.accel_bias).tolist()
         keyframe_msg.gyro_bias = np.asarray(navigation_state.gyro_bias).tolist()
@@ -68,6 +85,12 @@ def create_frame_msg(bridge, frame, fid, ref_kid, ref_T_curr, header=None):
     :param header: std_msgs.msg.Header; Source image header, if available.
     :return: FrameMsg; The frame message.
     """
+    if getattr(bridge, "internal_packets", False):
+        from copy import deepcopy
+        from gelslam.core.slam_packets import FramePacket, readonly
+        return FramePacket(
+            deepcopy(header), readonly(frame.H), readonly(frame.C.astype(np.uint8)),
+            readonly(frame.N), readonly(frame.L), fid, ref_kid, readonly(ref_T_curr).reshape(-1))
     frame_msg = FrameMsg()
     _copy_header(frame_msg, header)
     frame_msg.height_map = bridge.cv2_to_imgmsg(frame.H, encoding="32FC1")

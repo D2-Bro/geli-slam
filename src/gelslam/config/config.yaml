@@ -140,6 +140,9 @@ contact_mask_config:
 gelslam_config:
   # Configuration of how GelSLAM tracks
   track_config:
+    # Write/publish normal RGB, contact cloud and correspondence debug images.
+    # false skips their construction; tracking and frame/keyframe output continue.
+    debug_visualization_enabled: true
     # Promote a valid contact frame after this image-time gap. 0 disables it.
     keyframe_max_interval_s: 0.5
     # Sample at most 30 normal-flow pairs in the RViz Image panel.
@@ -154,15 +157,24 @@ gelslam_config:
   # Configuration of how GelSLAM builds pose graph and loop closure
   pose_graph_config:
     # 15D states: IMU pose, world velocity, accelerometer and gyroscope biases.
-    # Tracker poses are initial values only; no relative-pose measurement factors.
+    # Local VI uses tactile/IMU observations; tracker poses only initialize it.
+    # Separate 4DoF loop PGO: gravity-axis yaw + world XYZ; local VI tilt fixed.
+    # Odometry/registered-loop residuals remain 6D, with the sigmas below.
+    # Same relative-pose sigmas as gelslam-origin, converted from mm to metres.
+    loop_pgo_rotation_sigma_rad: 0.01
+    loop_pgo_translation_sigma_m: 0.0001
+    # false: skip backend local VI factors/solve; PGO uses frontend seed odometry.
+    # Frontend VI and no-contact IMU propagation keep their imu_config settings.
+    local_vi_enabled: true
     loop_closure_only_optimization: false
     local_window_optimization: true
     local_window_size: 10
+    # false: fix the temporal predecessor's 15D state; inside anchors pose-only.
+    # Crossing IMU: information x0.01 + Huber(sqrt(16.92)); bias RW unchanged.
     marginalization_enabled: true
     # Direct normal-map and mean-height observations between contact keyframes.
     tactile_max_samples: 500
     tactile_normal_sigma: 1.0
-    tactile_normal_huber_delta: 0.4
     tactile_height_sigma_m: 0.0001
     # IMU/bias noise densities use imu_config; reject uncovered/gapped intervals.
     imu_max_sample_gap_s: 0.05

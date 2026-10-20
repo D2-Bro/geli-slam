@@ -60,6 +60,9 @@ def generate_launch_description():
         parameters=[
             {
                 "config_path": LaunchConfiguration("config_path"),
+                "backend_feedback": LaunchConfiguration("backend_feedback"),
+                "sequence_name": LaunchConfiguration("sequence_name"),
+                "save_gelslam_state": LaunchConfiguration("save_gelslam_states"),
                 "data_dir": LaunchConfiguration("data_dir"),
                 "rendering": LaunchConfiguration("rendering"),
                 "save_gelslam_states": LaunchConfiguration("save_gelslam_states"),
@@ -68,6 +71,8 @@ def generate_launch_description():
         ],
     )
     pose_graph_node = Node(
+        sigterm_timeout="120",
+        sigkill_timeout="30",
         package="gelslam",
         executable="pose_graph_node",
         name="pose_graph_node",
@@ -75,6 +80,7 @@ def generate_launch_description():
         parameters=[
             {
                 "config_path": LaunchConfiguration("config_path"),
+                "backend_feedback": LaunchConfiguration("backend_feedback"),
                 "data_dir": LaunchConfiguration("data_dir"),
                 "rendering": LaunchConfiguration("rendering"),
                 "save_gelslam_states": LaunchConfiguration("save_gelslam_states"),
@@ -114,6 +120,8 @@ def generate_launch_description():
             data_dir_arg,
             sequence_name_arg,
             config_path_arg,
+            DeclareLaunchArgument("backend_feedback", default_value="true",
+                description="Send backend corrections to tracking; false keeps backend optimization active"),
             rendering_arg,
             streamer_arg,
             skip_background_check_arg,
@@ -122,6 +130,12 @@ def generate_launch_description():
             pose_graph_node,
             visualizer_node,
             gelsight_streamer_node,
+            RegisterEventHandler(
+                event_handler=OnProcessExit(
+                    target_action=pose_graph_node,
+                    on_exit=[EmitEvent(event=Shutdown(reason="Backend process stopped"))],
+                )
+            ),
             RegisterEventHandler(
                 event_handler=OnProcessExit(
                     target_action=tracker_node,

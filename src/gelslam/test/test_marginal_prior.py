@@ -222,7 +222,7 @@ def test_backend_marginal_prior_keeps_full_navigation_covariance():
     instance = PoseGraph(backend_config())
     frames = [backend_frame(i, new=i == 0) for i in range(6)]
     instance.add_keyframes(frames, 0, len(frames))
-    window, values = instance._window_graph(3)
+    window, values, _ = instance._window_graph(3)
     full, local = gtsam.Marginals(instance.graph, instance.graph_init), gtsam.Marginals(window, values)
     for key in state_keys(3):
         assert np.allclose(local.marginalCovariance(key), full.marginalCovariance(key), rtol=1e-4, atol=1e-9)
@@ -232,14 +232,15 @@ def test_backend_marginal_prior_keeps_full_navigation_covariance():
     assert np.allclose(A.T @ A, again.T @ again)
 
 
-def test_backend_global_loop_resets_prior_then_local_solve_rebuilds_it(tmp_path):
+def test_separate_loop_pgo_preserves_local_prior_and_reload(tmp_path):
     instance = PoseGraph(backend_config())
     frames = [backend_frame(i, new=i == 0) for i in range(6)]
     instance.add_keyframes(frames, 0, len(frames))
     instance.solve()
     assert instance._add_loop_pair(0, 5, np.eye(4))
     instance.solve(global_optimization=True)
-    assert instance.marginal_prior.size() == 0 and instance.window_start == 0
+    assert instance.marginal_prior.size() > 0 and instance.window_start == 3
+    assert instance.loop_pgo.factor_kinds.count('loop') == 1
     instance.solve()
     assert instance.marginal_prior.size() > 0
     instance.save(tmp_path)
@@ -248,7 +249,7 @@ def test_backend_global_loop_resets_prior_then_local_solve_rebuilds_it(tmp_path)
     assert np.all(np.isfinite(restored.solve()[5]))
 
 
-def test_backend_trial_merge_removes_absorbed_pose_anchor_only():
+def test_backend_trial_merge_removes_pgo_anchor_but_retains_local_priors():
     instance = PoseGraph(backend_config())
     frames = [backend_frame(0, new=True), backend_frame(1),
               backend_frame(2, new=True, group=1), backend_frame(3, group=1), backend_frame(4, group=1)]
@@ -256,32 +257,36 @@ def test_backend_trial_merge_removes_absorbed_pose_anchor_only():
     instance.solve()
     assert instance._add_loop_pair(1, 3, np.eye(4))
     instance.remove_prior_factors([1])
-    assert instance.prior_keys == [0, -1]
+    assert instance.prior_keys == [0, 2]
+    assert instance.loop_pgo.removed_groups == {1}
     assert all(instance.graph.at(index) is not None for index in instance.navigation_prior_idxs[2])
     instance.solve(global_optimization=True)
     assert np.allclose(instance.poses, np.tile(np.eye(4), (5, 1, 1)), atol=1e-7)
 
 
-def test_disabled_marginalization_conditions_on_full_window_boundary_state():
+def test_disabled_marginalization_fixes_predecessor_and_optimizes_first_window_state():
     instance = PoseGraph(backend_config(marginalization_enabled=False))
     frames = [backend_frame(i, new=i == 0) for i in range(5)]
     instance.add_keyframes(frames, 0, 5)
     pose = instance.states[2].pose.copy()
     pose[2, 3] = .004
     instance.graph_init.update(2, gtsam.Pose3(pose))
+    predecessor = instance.states[1].pose.copy()
     instance.solve()
-    assert instance.poses[2][2, 3] == pytest.approx(.004, abs=1e-7)
+    np.testing.assert_array_equal(instance.states[1].pose, predecessor)
+    assert abs(instance.poses[2][2, 3]) < 1e-7
     assert instance.marginal_prior.size() == 0
 
 
-def test_backend_prior_keeps_multiple_separator_poses_and_loop_correlations():
+def test_backend_local_prior_does_not_absorb_loop_pose_constraints():
     instance = PoseGraph(backend_config())
     frames = [backend_frame(i, new=i == 0) for i in range(6)]
     instance.add_keyframes(frames, 0, 6)
     assert instance._add_loop_pair(0, 5, np.eye(4))
-    window, values = instance._window_graph(3)
+    window, values, _ = instance._window_graph(3)
     prior_keys = {key for i in range(instance.marginal_prior.size()) for key in instance.marginal_prior.at(i).keys()}
-    assert set(state_keys(3)) | {5} == prior_keys
+    assert set(state_keys(3)) == prior_keys
+    assert instance.loop_pgo.loops[0][:2] == (0, 5)
     ordering = gtsam.Ordering()
     for key in sorted(prior_keys):
         ordering.push_back(key)
@@ -294,7 +299,7 @@ def test_backend_discards_expired_component_without_separator():
     instance = PoseGraph(backend_config())
     frames = [backend_frame(0, new=True), backend_frame(1, new=True, group=1)]
     instance.add_keyframes(frames, 0, 2)
-    window, values = instance._window_graph(1)
+    window, values, _ = instance._window_graph(1)
     assert instance.marginal_prior.size() == 0
     assert instance._marginalized_factor_idxs == {0, 1, 2}
     assert window.size() == 3 and instance.graph.size() == 6

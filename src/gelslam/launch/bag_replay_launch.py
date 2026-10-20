@@ -47,6 +47,10 @@ def generate_launch_description():
     rviz_arg = DeclareLaunchArgument(
         "rviz", default_value="true", description="Start RViz mesh and TF visualization"
     )
+    backend_feedback_arg = DeclareLaunchArgument(
+        "backend_feedback", default_value=LaunchConfiguration("backend"),
+        description="Send backend corrections to tracking; false keeps backend optimization active",
+    )
     publish_coverage_arg = DeclareLaunchArgument(
         "publish_coverage",
         default_value="true",
@@ -80,12 +84,15 @@ def generate_launch_description():
             common_parameters,
             {
                 "skip_background_check": LaunchConfiguration("skip_background_check"),
+                "backend_feedback": LaunchConfiguration("backend_feedback"),
                 "save_gelslam_state": LaunchConfiguration("save_states"),
                 "sequence_name": LaunchConfiguration("sequence_name"),
             },
         ],
     )
     pose_graph_node = Node(
+        sigterm_timeout="120",
+        sigkill_timeout="30",
         package="gelslam",
         executable="pose_graph_node",
         name="pose_graph_node",
@@ -97,6 +104,7 @@ def generate_launch_description():
                 "save_gelslam_states": LaunchConfiguration("save_states"),
                 "sequence_name": LaunchConfiguration("sequence_name"),
                 "backend_optimization": LaunchConfiguration("backend"),
+                "backend_feedback": LaunchConfiguration("backend_feedback"),
             },
         ],
     )
@@ -127,6 +135,7 @@ def generate_launch_description():
         executable="rviz2",
         name="rviz2",
         output="screen",
+        parameters=[{"use_sim_time": LaunchConfiguration("use_sim_time")}],
         arguments=[
             "-d",
             os.path.join(
@@ -143,6 +152,7 @@ def generate_launch_description():
             config_path_arg,
             rendering_arg,
             backend_arg,
+            backend_feedback_arg,
             rviz_arg,
             publish_coverage_arg,
             skip_background_check_arg,
@@ -153,6 +163,12 @@ def generate_launch_description():
             visualizer_node,
             rviz_bridge_node,
             rviz_node,
+            RegisterEventHandler(
+                event_handler=OnProcessExit(
+                    target_action=pose_graph_node,
+                    on_exit=[EmitEvent(event=Shutdown(reason="Backend process stopped"))],
+                )
+            ),
             RegisterEventHandler(
                 event_handler=OnProcessExit(
                     target_action=tracker_node,

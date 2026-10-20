@@ -38,6 +38,7 @@ setup(
         "console_scripts": [
             "saved_video_streamer_node = gelslam.nodes.saved_video_streamer_node:main",
             "gelsight_streamer_node = gelslam.nodes.gelsight_streamer_node:main",
+            "gelslam_node = gelslam.nodes.gelslam_node:main",
             "tracker_node = gelslam.nodes.tracker_node:main",
             "pose_graph_node = gelslam.nodes.pose_graph_node:main",
             "visualizer_node = gelslam.nodes.visualizer_node:main",

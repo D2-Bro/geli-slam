@@ -1,9 +1,14 @@
 """Direct tactile observations and frozen mixed-state priors for local VI BA."""
 
+import cv2
 import gtsam
 import numpy as np
+from dataclasses import dataclass
+from normalflow.utils import wide_remap
 
-from gelslam.core.numpy_vi import DenseNormalResidual, adjoint
+from gelslam.core.numpy_vi import (
+    DenseNormalResidual, adjoint, normal_ic_pose_jacobians, gelsight_z_pose_jacobian,
+)
 from gelslam.core.imu_navigation import gelsight_pose, gelsight_pose_jacobian
 from gelslam.core.split_pose import split_pose_coordinates, split_pose_coordinate_jacobian
 
@@ -63,36 +68,43 @@ def frozen_navigation_factor(keys, A, rhs, values):
     return gtsam.CustomFactor(gtsam.noiseModel.Unit.Create(len(rhs)), keys, error)
 
 
-def _skew_batch(points):
-    return np.cross(points[:, None, :], np.eye(3)).transpose(0, 2, 1)
+@dataclass
+class _RemapCoordinates:
+    x: np.ndarray
+    y: np.ndarray
 
 
-def _huber_normals(residual, jacobians, delta):
-    """Transform each 3-vector so squared error equals its Huber cost."""
-    if delta <= 0:
-        return residual, jacobians
-    r = residual.reshape(-1, 3)
-    norms = np.linalg.norm(r, axis=1)
-    outlier = norms > delta
-    scale = np.ones(len(r))
-    scale[outlier] = np.sqrt(2 * delta * norms[outlier] - delta**2) / norms[outlier]
-    D = scale[:, None, None] * np.broadcast_to(np.eye(3), (len(r), 3, 3)).copy()
-    # d(scale*r)/dr, including the radial derivative of the robust transform.
-    derivative = np.zeros(len(r))
-    derivative[outlier] = (delta / (scale[outlier] * norms[outlier]**3)
-                           - scale[outlier] / norms[outlier]**2)
-    D += derivative[:, None, None] * r[:, :, None] * r[:, None, :]
-    return (r * scale[:, None]).reshape(-1), [
-        (D @ J.reshape(-1, 3, 6)).reshape(-1, 6) for J in jacobians
-    ]
+@dataclass
+class _RemapSamples:
+    field: np.ndarray
+    coordinates: _RemapCoordinates
+
+    def value(self):
+        return wide_remap(self.field, self.coordinates.x, self.coordinates.y)[:, 0]
+
+
+@dataclass
+class _TactileProjection:
+    relative: np.ndarray
+    points: np.ndarray
+    normals: np.ndarray
+    height: np.ndarray
+    shared: np.ndarray
+    normal_samples: _RemapSamples
+    height_samples: _RemapSamples
+    normal_jacobians: tuple = None
+    height_jacobians: tuple = None
 
 
 class TactilePair:
-    """Two-pose normal-map and mean-height factors; no estimated pose measurement.
+    """A two-pose GelSight factor with normal-map and mean-height residual blocks.
 
     Reference surface points/maps are immutable observations. Both endpoint
-    poses are variables. Invalid overlap rejects an LM candidate with a finite
-    penalty, instead of allowing an empty correspondence set to have zero cost.
+    poses are variables. Normal rows use the frontend's reference-map IC
+    approximation. The conditional height row uses target-local GelSight Z,
+    transported to both endpoint charts. These are approximate linear models,
+    not exact derivatives of the complete resampled residual function.
+    Invalid overlap receives a finite penalty instead of zero cost.
     """
 
     def __init__(self, reference, target, initial_reference, initial_target,
@@ -101,11 +113,9 @@ class TactilePair:
         self.gel_jacobian = gelsight_pose_jacobian(self.extrinsic)
         self.normal_sigma = float(config.get('tactile_normal_sigma', 1.0))
         self.height_sigma = float(config.get('tactile_height_sigma_m', 1e-4))
-        self.huber_delta = float(config.get('tactile_normal_huber_delta', 0.4))
         if (not np.isfinite(self.normal_sigma) or self.normal_sigma <= 0
-                or not np.isfinite(self.height_sigma) or self.height_sigma <= 0
-                or not np.isfinite(self.huber_delta) or self.huber_delta < 0):
-            raise ValueError('backend tactile sigmas must be positive; Huber delta must be nonnegative')
+                or not np.isfinite(self.height_sigma) or self.height_sigma <= 0):
+            raise ValueError('backend tactile sigmas must be positive')
         self.visual = DenseNormalResidual(
             reference, target, reference.ppmm, initial_reference, initial_target,
             max_samples=int(config.get('tactile_max_samples', 500)),
@@ -119,96 +129,145 @@ class TactilePair:
         self.visual.candidate_normals = self.visual.candidate_normals[selected].copy()
         self.visual.candidate_normal_jacobian = self.visual.candidate_normal_jacobian[:, :, selected].copy()
         self.count = len(self.visual.candidate_points)
+        # The same 5D reference normal-map IC basis used by the frontend,
+        # embedded in 6D with a zero reference-Z column. It is immutable for
+        # this observation pair; only active rows and pose mapping change.
+        self._normal_reference_blocks = np.zeros((self.count, 3, 6))
+        self._normal_reference_blocks[:, :, :5] = np.transpose(
+            self.visual.candidate_normal_jacobian, (2, 0, 1))
+        self._height_target_row = gelsight_z_pose_jacobian(np.eye(6), 1.)
+        # ROS maps are already float32. Other input types are converted once
+        # per immutable observation pair, never to full-image float64.
+        self._normal_map = np.asarray(target.N, dtype=np.float32)
+        self._height_map = np.asarray(target.H, dtype=np.float32)
+        self._contact_map = np.asarray(target.C, dtype=np.float32)
+        self._projection_cache = None
+        self._observation_pose_cache = None
 
     @staticmethod
-    def _sample(field, x, y):
-        """Bilinear values and derivatives of the same smooth image sampler."""
-        h, w = field.shape[:2]
-        x, y = np.clip(x, 0., w - 1.), np.clip(y, 0., h - 1.)
-        x0, y0 = np.floor(x).astype(int), np.floor(y).astype(int)
-        x1, y1 = np.minimum(x0 + 1, w - 1), np.minimum(y0 + 1, h - 1)
-        a, b = field[y0, x0], field[y0, x1]
-        c, d = field[y1, x0], field[y1, x1]
-        dx, dy = x - x0, y - y0
-        if field.ndim == 3:
-            dx, dy = dx[:, None], dy[:, None]
-        value = (1 - dy) * ((1 - dx) * a + dx * b) + dy * ((1 - dx) * c + dx * d)
-        gx, gy = (1 - dy) * (b - a) + dy * (d - c), (1 - dx) * (c - a) + dx * (d - b)
-        return value, gx, gy
+    def _sample_coordinates(shape, x, y):
+        """Share origin-compatible float32 maps; defer gradient preparation."""
+        return _RemapCoordinates(np.asarray(x, dtype=np.float32),
+                                 np.asarray(y, dtype=np.float32))
 
-    def _projection(self, ref, tar):
+    @staticmethod
+    def _samples(field, coordinates):
+        return _RemapSamples(field, coordinates)
+
+    def _projection(self, ref, tar, need_jacobians=True):
+        """Reuse the normal/height projection across cost and Jacobian requests.
+
+        The local BA worker evaluates this pair sequentially. Compare both
+        endpoint matrices exactly: even a small optimization step must refresh
+        the result. Keep copies because callers can update matrices in place.
+        Only one result is retained, independent of the number of LM trials.
+        """
+        cached = self._projection_cache
+        if (cached is not None and np.array_equal(ref, cached[0])
+                and np.array_equal(tar, cached[1])):
+            projection = cached[2]
+        else:
+            projection = self._compute_projection(ref, tar, need_jacobians=False)
+            self._projection_cache = (ref.copy(), tar.copy(), projection)
+        if need_jacobians:
+            self._normal_pose_jacobians(projection)
+            self._height_pose_jacobians(projection)
+        return projection
+
+    def _projection_from_values(self, values, reference, target):
+        """Share observation-pose conversion without caching mutable Values."""
+        ref_imu = values.atPose3(reference).matrix()
+        tar_imu = values.atPose3(target).matrix()
+        cached = self._observation_pose_cache
+        if (cached is None or not np.array_equal(ref_imu, cached[0])
+                or not np.array_equal(tar_imu, cached[1])):
+            cached = (ref_imu.copy(), tar_imu.copy(),
+                      gelsight_pose(ref_imu, self.extrinsic),
+                      gelsight_pose(tar_imu, self.extrinsic))
+            self._observation_pose_cache = cached
+        return self._projection(cached[2], cached[3], need_jacobians=False)
+
+    def _normal_pose_jacobians(self, projection):
+        if projection.normal_jacobians is None:
+            reference_rows = self._normal_reference_blocks[projection.shared].reshape(-1, 6)
+            projection.normal_jacobians = normal_ic_pose_jacobians(reference_rows, projection.relative)
+        return projection.normal_jacobians
+
+    def _height_pose_jacobians(self, projection):
+        if projection.height_jacobians is None:
+            # Exactly the frontend's target-local Z row. Transport its
+            # counterpart to the reference chart so a common rigid motion
+            # of both endpoints has zero linearized relative-height effect.
+            target = self._height_target_row
+            reference = -target @ adjoint(projection.relative)
+            projection.height_jacobians = (reference, target)
+        return projection.height_jacobians
+
+    def _compute_projection(self, ref, tar, need_jacobians=True):
         relative = np.linalg.inv(tar) @ ref
         R = relative[:3, :3]
         q = self.visual.candidate_points @ R.T + relative[:3, 3]
         pitch = self.visual.ppmm / 1000.
-        h, w = self.visual.tar.C.shape
-        x, y = q[:, 0] / pitch + w / 2 - .5, q[:, 1] / pitch + h / 2 - .5
-        valid = (x >= 0) & (x < w - 1) & (y >= 0) & (y < h - 1)
-        contact_x = np.clip(np.floor(x + .5).astype(int), 0, w - 1)
-        contact_y = np.clip(np.floor(y + .5).astype(int), 0, h - 1)
-        valid &= self.visual.tar.C[contact_y, contact_x]
-        normal, nx, ny = self._sample(np.asarray(self.visual.tar.N, dtype=float), x, y)
-        height, hx, hy = self._sample(np.asarray(self.visual.tar.H, dtype=float), x, y)
+        x, y = self.visual._pixel_coordinates(q)
+        valid = self.visual._in_image(x, y)
+        valid &= wide_remap(self._contact_map, x, y, mode=cv2.INTER_NEAREST)[:, 0] > .5
+        coordinates = self._sample_coordinates(self.visual.tar.C.shape, x, y)
+        normal_samples = self._samples(self._normal_map, coordinates)
+        height_samples = self._samples(self._height_map, coordinates)
+        normal, height = normal_samples.value(), height_samples.value()
         valid &= np.isfinite(normal).all(axis=1) & np.isfinite(height)
-        gradient = np.zeros((len(q), 3, 3))
-        gradient[:, :, 0], gradient[:, :, 1] = nx / pitch, ny / pitch
         # Pixel-height units times pixel pitch give height in metres.
-        height_gradient = np.column_stack((hx, hy, -np.ones(len(q))))
-        return relative, q, normal, gradient, height * pitch, height_gradient, valid
+        projection = _TactileProjection(relative, q, normal, height.astype(np.float64) * pitch, valid,
+                                         normal_samples, height_samples)
+        if need_jacobians:
+            self._normal_pose_jacobians(projection)
+            self._height_pose_jacobians(projection)
+        return projection
 
-    def factors(self, reference, target):
-        def normal_error(_factor, values, jacobians):
-            ref = gelsight_pose(values.atPose3(reference).matrix(), self.extrinsic)
-            tar = gelsight_pose(values.atPose3(target).matrix(), self.extrinsic)
-            relative, q, normals, gradient, _, _, shared = self._projection(ref, tar)
-            residual = np.zeros(3 * self.count)
-            Js = [np.zeros((len(residual), 6)), np.zeros((len(residual), 6))]
-            if np.count_nonzero(shared) < 10:
+    def factor(self, reference, target):
+        """Stack independently weighted normal/height rows in one callback.
+
+        Normal rows use ordinary least squares with shared-point normalization.
+        The final height row retains its own sigma. Neither residual block uses
+        a robust loss, and there is no robust model around the full vector.
+        """
+        normal_rows = 3 * self.count
+
+        def gelsight_error(_factor, values, jacobians):
+            projection = self._projection_from_values(values, reference, target)
+            relative, q = projection.relative, projection.points
+            normals, shared = projection.normals, projection.shared
+            residual = np.zeros(normal_rows + 1)
+            Js = None if jacobians is None else [
+                np.zeros((len(residual), 6)), np.zeros((len(residual), 6))]
+            shared_count = np.count_nonzero(shared)
+            if shared_count < 10:
                 residual[:] = 1e6
             else:
                 R = relative[:3, :3]
-                normals, gradient, points = normals[shared], gradient[shared], q[shared]
+                normals = normals[shared]
+                points_tar = q[shared]
                 r = (normals @ R - self.visual.candidate_normals[shared]).reshape(-1)
-                blocks = np.concatenate((R.T @ (gradient @ _skew_batch(points) - _skew_batch(normals)),
-                                         -R.T @ gradient), axis=2)
-                Jt = blocks.reshape(-1, 6)
-                Jr = -Jt @ adjoint(relative)
-                r, blocks = _huber_normals(
-                    r / self.normal_sigma,
-                    [Jr / self.normal_sigma, Jt / self.normal_sigma], self.huber_delta,
-                )
+                blocks = None
+                if jacobians is not None:
+                    blocks = [J / self.normal_sigma for J in self._normal_pose_jacobians(projection)]
+                r = r / self.normal_sigma
                 rows = np.repeat(shared, 3)
-                scale = 1 / np.sqrt(np.count_nonzero(shared))
-                residual[rows] = r * scale
-                for J, block in zip(Js, blocks):
-                    J[rows] = block @ self.gel_jacobian * scale
+                scale = 1 / np.sqrt(shared_count)
+                normal_residual = residual[:normal_rows]
+                normal_residual[rows] = r * scale
+                if jacobians is not None:
+                    for J, block in zip(Js, blocks):
+                        normal_J = J[:normal_rows]
+                        normal_J[rows] = block @ self.gel_jacobian * scale
+
+                residual[-1] = np.mean(projection.height[shared] - points_tar[:, 2]) / self.height_sigma
+                if jacobians is not None:
+                    for J, row in zip(Js, self._height_pose_jacobians(projection)):
+                        J[-1:] = (row / self.height_sigma) @ self.gel_jacobian
             if jacobians is not None:
                 jacobians[0], jacobians[1] = Js
             return residual
 
-        def height_error(_factor, values, jacobians):
-            ref = gelsight_pose(values.atPose3(reference).matrix(), self.extrinsic)
-            tar = gelsight_pose(values.atPose3(target).matrix(), self.extrinsic)
-            relative, q, _, _, height, gradients, shared = self._projection(ref, tar)
-            Js = [np.zeros((1, 6)), np.zeros((1, 6))]
-            residual = np.array([1e6])
-            if np.count_nonzero(shared) >= 10:
-                points, q = self.visual.candidate_points[shared], q[shared]
-                d = gradients[shared, None, :]
-                ref_motion = np.concatenate((-_skew_batch(points),
-                                             np.broadcast_to(np.eye(3), (len(q), 3, 3))), axis=2)
-                tar_motion = np.concatenate((_skew_batch(q),
-                                             -np.broadcast_to(np.eye(3), (len(q), 3, 3))), axis=2)
-                Js[0] = np.mean(d @ relative[:3, :3] @ ref_motion, axis=0) @ self.gel_jacobian / self.height_sigma
-                Js[1] = np.mean(d @ tar_motion, axis=0) @ self.gel_jacobian / self.height_sigma
-                residual = np.array([np.mean(height[shared] - q[:, 2]) / self.height_sigma])
-            if jacobians is not None:
-                jacobians[0], jacobians[1] = Js
-            return residual
-
-        return (
-            gtsam.CustomFactor(gtsam.noiseModel.Unit.Create(3 * self.count),
-                               [reference, target], normal_error),
-            gtsam.CustomFactor(gtsam.noiseModel.Unit.Create(1),
-                               [reference, target], height_error),
-        )
+        return gtsam.CustomFactor(gtsam.noiseModel.Unit.Create(normal_rows + 1),
+                                  [reference, target], gelsight_error)

@@ -16,7 +16,7 @@ from gelslam.utils import (
 
 
 def keyframe_msg2keyframe(bridge, keyframe_msg, trial_group, new_trial_flag, ppmm,
-                          tracker_trial_T_group=None, gelsight_T_imu=None):
+                          tracker_trial_T_group=None, gelsight_T_imu=None, compute_features=True):
     """
     Converts a KeyFrameMsg to a KeyFrame object.
 
@@ -37,6 +37,13 @@ def keyframe_msg2keyframe(bridge, keyframe_msg, trial_group, new_trial_flag, ppm
     tracker_trial_T_curr = np.asarray(
         keyframe_msg.trial_t_curr, dtype=np.float64
     ).reshape(4, 4)
+    navigation_pose = np.asarray(getattr(keyframe_msg, 'navigation_pose', ()), dtype=float)
+    if getattr(keyframe_msg, 'navigation_valid', False) and navigation_pose.size:
+        from gelslam.core.imu_navigation import gelsight_pose
+        if navigation_pose.size != 16 or not np.isfinite(navigation_pose).all():
+            raise ValueError('keyframe navigation pose must contain 16 finite values')
+        tracker_trial_T_curr = gelsight_pose(navigation_pose.reshape(4, 4),
+            np.eye(4) if gelsight_T_imu is None else gelsight_T_imu)
     if tracker_trial_T_group is None or np.array_equal(
         tracker_trial_T_group, np.eye(4)
     ):
@@ -55,8 +62,9 @@ def keyframe_msg2keyframe(bridge, keyframe_msg, trial_group, new_trial_flag, ppm
         new_trial_flag,
         trial_T_curr,
         ppmm,
-        _header_timestamp(keyframe_msg.header),
+        _header_timestamp(keyframe_msg.header), compute_features=compute_features,
     )
+    keyframe.tracker_trial_T_group = np.array(tracker_trial_T_group if tracker_trial_T_group is not None else np.eye(4))
     keyframe.navigation_state = None
     keyframe.gravity = None
     keyframe.imu_samples = ()
@@ -66,9 +74,14 @@ def keyframe_msg2keyframe(bridge, keyframe_msg, trial_group, new_trial_flag, ppm
         from gelslam.core.inertial import ImuSample
         from gelslam.core.imu_navigation import imu_pose
         # Group recovery changes only the world origin, not velocity or gravity.
+        state_pose = imu_pose(trial_T_curr, np.eye(4) if gelsight_T_imu is None else gelsight_T_imu)
+        if navigation_pose.size:
+            state_pose = navigation_pose.reshape(4, 4).copy()
+            if tracker_trial_T_group is not None:
+                state_pose = np.linalg.inv(tracker_trial_T_group) @ state_pose
         keyframe.navigation_state = NavigationState(
             float(keyframe_msg.navigation_timestamp),
-            imu_pose(trial_T_curr, np.eye(4) if gelsight_T_imu is None else gelsight_T_imu),
+            state_pose,
             np.asarray(keyframe_msg.velocity, dtype=np.float64),
             np.asarray(keyframe_msg.accel_bias, dtype=np.float64),
             np.asarray(keyframe_msg.gyro_bias, dtype=np.float64),
@@ -211,6 +224,7 @@ class KeyFrame:
         trial_T_curr,
         ppmm,
         timestamp=None,
+        compute_features=True,
     ):
         # Set the frame information
         self.H = H
@@ -261,9 +275,9 @@ class KeyFrame:
         ]
 
         # Get the SIFT features
-        self.kp, self.des = get_sift_features(
-            self.L, self.C, cv2.SIFT_create(contrastThreshold=0.02, nOctaveLayers=3)
-        )
+        self.kp, self.des = (), None
+        if compute_features:
+            self.compute_sift_features()
 
     def compute_sift_features(self):
         self.kp, self.des = get_sift_features(
@@ -431,7 +445,7 @@ class KeyFrameDB:
                     break
         return tar_kidx
 
-    def insert(self, keyframe_msg, log_prefix="Keyframe Insert Thread"):
+    def insert(self, keyframe_msg, log_prefix="Keyframe Insert Thread", compute_features=True):
         """
         Turn the keyframe message to keyframe and insert to the database.
 
@@ -481,7 +495,7 @@ class KeyFrameDB:
             new_trial_flag=new_trial_flag,
             ppmm=self.ppmm,
             tracker_trial_T_group=self.tracker_trial_T_group,
-            gelsight_T_imu=self.gelsight_T_imu,
+            gelsight_T_imu=self.gelsight_T_imu, compute_features=compute_features,
         )
         self.logger.info(
             "%s -- keyframe ID = %d, trial group = %d"

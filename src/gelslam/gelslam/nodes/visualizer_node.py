@@ -75,7 +75,10 @@ class VisualizerNode(Node):
         # KeyFrameDB (keyframe database) is never modified except appending.
         # K thread writes (appending), V thread reads
         self.add_keyframe_lock = threading.Lock()
-        self.keyframedb = KeyFrameDB(self.ppmm, Logger())
+        self.keyframedb = KeyFrameDB(
+            self.ppmm, Logger(), config.get("imu_config", {}).get("gelsight_T_imu"),
+            config["gelslam_config"]["pose_graph_config"].get("imu_max_sample_gap_s", .05),
+        )
 
         # Backend mode updates these from pose-graph messages.  Tracker-only
         # mode updates them from each new keyframe's tracked pose.

@@ -78,6 +78,16 @@ optimization (`frontend_fix_previous_state: false` and
 `gtsam_vi_marginalization: true`). The bag simulation preset enables this mode; other
 presets leave it disabled.
 
+IMU preintegration averages the two observations bounding each sample interval.
+The patched GTSAM Tangent backend subtracts the anchor biases, computes the
+half-step attitude with `Exp(omega * dt / 2)`, and uses that attitude to rotate
+the averaged specific force. It advances rotation with `Exp(omega * dt)`.
+The bias Jacobians and covariance include the resulting gyro-to-acceleration
+coupling. This shared path covers static startup propagation, frontend
+prediction/recovery, calibrated VI no-contact propagation, and backend IMU
+factors. It requires the native `setUseMidpointIntegration` API; rebuild the
+local GTSAM dependency before running the updated package.
+
 Set `imu_config.frontend_fix_previous_state: true` to hold the previous
 pose, world velocity, accelerometer bias, and gyro bias constant throughout
 each frontend optimization. Only the target state is optimized. This flag

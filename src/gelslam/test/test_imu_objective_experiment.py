@@ -51,11 +51,14 @@ def test_motion_jacobians_match_actual_retraction_at_nonzero_residual():
     assert max(c['relative_frobenius'] for c in checks) < 1e-7
 
 
-def test_rotating_acceleration_discretization_error_decreases_with_sample_period():
+def test_midpoint_rotating_acceleration_error_converges_quadratically():
     errors = []
     for dt in (.001, .0001):
         previous, target, samples, gravity = experiment.synthetic_case('general_rotation_acceleration', dt)
         pim = gv.preintegrate_imu(samples, previous, {}, np.eye(4), gravity)
         residual = gv._split_imu_factor(pim).unwhitenedError(gv._imu_values(previous, target))
         errors.append(np.linalg.norm(residual[3:]))
-    assert 9. < errors[0]/errors[1] < 11.
+    # The active preintegrator uses midpoint integration. Reducing dt by
+    # ten gives a hundredfold reduction in its second-order global error.
+    assert errors[0] < 1e-7
+    assert 90. < errors[0]/errors[1] < 110.
