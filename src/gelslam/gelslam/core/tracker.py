@@ -265,9 +265,10 @@ class Tracker:
         if not np.isfinite(timestamp) or timestamp <= 0.0:
             raise ValueError("rest event timestamp must be positive and finite")
         events = getattr(self, "_recorded_rest_events", None)
-        if events is None or name == "recorded_rest_started":
-            events = self._recorded_rest_events = {}
+        events = {} if events is None or name == "recorded_rest_started" else dict(events)
         events[name] = float(timestamp)
+        # One reference assignment; the image thread never sees a partial update.
+        self._recorded_rest_events = events
 
     def _prepare_static_trial(self, header):
         """Hold node registration until a bounded first-contact state exists."""

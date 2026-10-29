@@ -260,11 +260,13 @@ class TrackerNode(Node):
             )
             static_settings = getattr(self.tracker, "_static_imu_settings", None)
             if static_settings is not None and static_settings["mode"] == "recorded_rest_event":
-                # The image group serializes event updates with initialization reads.
+                # Own group: a busy image group must not delay rest events past the
+                # IMU buffer span. add_rest_event replaces the event dict atomically.
+                self.rest_event_callback_group = MutuallyExclusiveCallbackGroup()
                 self.rest_event_sub = self.create_subscription(
                     String, static_settings["events_topic"], self.rest_event_callback,
                     QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE),
-                    callback_group=self.image_callback_group,
+                    callback_group=self.rest_event_callback_group,
                 )
                 self.get_logger().info(
                     "Subscribing to recorded rest events from %s" % static_settings["events_topic"])
@@ -851,7 +853,7 @@ def main(args=None):
     # Keep ROS logging available until the final summary has been written.
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = TrackerNode()
-    executor = TrackerExecutor(num_threads=2)
+    executor = TrackerExecutor(num_threads=3)
     executor.add_node(node)
     previous_handlers = {
         signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
@@ -871,7 +873,7 @@ def main(args=None):
                 # before deleting the subscription, then rebuild its wait set.
                 executor.shutdown()
                 node._release_initialization_imu_gt()
-                executor = TrackerExecutor(num_threads=2)
+                executor = TrackerExecutor(num_threads=3)
                 executor.add_node(node)
     except (KeyboardInterrupt, SystemExit):
         # ros2 launch can send a second SIGINT while the node is saving state.
