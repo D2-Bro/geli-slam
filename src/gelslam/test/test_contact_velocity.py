@@ -324,3 +324,41 @@ def test_imu_recovery_keeps_coast_state_and_prior_through_next_optimization(
     np.testing.assert_allclose(tracker._frontend_vi_state.pose, expected.pose, atol=1e-10)
     np.testing.assert_allclose(tracker._frontend_vi_state.velocity, expected.velocity, atol=1e-10)
     assert solver.marginal_prior.matches(tracker._frontend_vi_state)
+
+
+def test_contact_kinematic_velocity_uses_gyro_lever_arm_not_attitude_differences():
+    from gelslam.core.inertial import ImuSample
+    lever = np.array([0., 0., .14])   # gelsight_T_imu translation; GelSight origin at -lever in IMU axes
+    transform = np.eye(4)
+    transform[:3, 3] = lever
+    h = ContactVelocityHistory.from_config(dict(gelsight_T_imu=transform.tolist(), coast_velocity_fit=dict(
+        enabled=True, model='contact_kinematic', window_s=.3, min_samples=5, min_span_s=.2,
+        max_fit_rmse_m=.002, max_velocity_change_mps=1.)))
+    omega_world, slide = np.array([.3, -.2, .1]), np.array([.003, -.002, 0.])
+    gel_in_imu = -lever
+    bias = np.array([.01, -.02, .005])
+    previous = None
+    for t in np.arange(.70, 1.0001, .05):
+        rotation = Rotation.from_rotvec(omega_world * t).as_matrix()
+        pose = np.eye(4)
+        pose[:3, :3] = rotation
+        pose[:3, 3] = slide * t - rotation @ gel_in_imu
+        current = NavigationState(float(t), pose, np.zeros(3), np.zeros(3), bias)
+        samples = () if previous is None else [
+            ImuSample(float(s), (0., 0., 9.81), Rotation.from_rotvec(omega_world * s).as_matrix().T @ omega_world + bias)
+            for s in np.linspace(previous, t, 11)]
+        h.observe(current, 0, samples)
+        previous = t
+    seed = h.seed(current)
+    assert seed is not None and h.last_status == 'accepted'
+    expected = slide - np.cross(omega_world, current.pose[:3, :3] @ gel_in_imu)
+    np.testing.assert_allclose(seed.velocity_delta, expected, atol=2e-4)
+    # A velocity change above the configured bound keeps the VI velocity.
+    h.settings['max_velocity_change_mps'] = 1e-3
+    assert h.seed(current) is None and h.last_status == 'velocity_change_too_large'
+
+
+def test_contact_kinematic_requires_imu_interval():
+    h = history(model='contact_kinematic', window_s=.3, min_samples=5, min_span_s=.2, max_fit_rmse_m=.002)
+    anchor, _ = trajectory(h)
+    assert h.seed(anchor) is None and h.last_status == 'missing_contact_imu_interval'

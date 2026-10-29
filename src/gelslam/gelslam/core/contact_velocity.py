@@ -5,6 +5,12 @@ at the accepted anchor position; its endpoint derivative supplies the coast
 velocity. Its acceleration is never extrapolated into the contact gap. This
 does not change the accepted contact state or prior during a gap. At IMU
 recovery, the correction transfers to both the target state and its prior.
+
+The contact_kinematic model uses the rigid-body relation instead: the GelSight
+origin velocity comes from a line fit of its contact positions, and the IMU
+lever arm adds omega x (R r) with the bias-corrected gyro at the anchor. The
+lever arm (about 0.14 m on the real rig) is not differentiated from noisy
+tactile attitudes.
 """
 
 from collections import deque
@@ -78,8 +84,8 @@ class ContactVelocityHistory:
         if unknown:
             raise ValueError('unknown coast_velocity_fit settings: ' + ', '.join(sorted(unknown)))
         settings = dict(DEFAULTS, **supplied)
-        if settings['model'] not in {'quadratic', 'inertial_quadratic'}:
-            raise ValueError('coast_velocity_fit.model must be quadratic or inertial_quadratic')
+        if settings['model'] not in {'quadratic', 'inertial_quadratic', 'contact_kinematic'}:
+            raise ValueError('coast_velocity_fit.model must be quadratic, inertial_quadratic or contact_kinematic')
         count = settings['min_samples']
         if isinstance(count, bool) or not isinstance(count, int) or count < 5:
             raise ValueError('coast_velocity_fit.min_samples must be an integer >= 5')
@@ -99,6 +105,9 @@ class ContactVelocityHistory:
         self.imu_samples = deque(maxlen=4096)
         self.trial_id = None
         self.last_status = 'no_contact_history'
+        transform = np.asarray(self.imu_config.get('gelsight_T_imu', np.eye(4)), float)
+        # GelSight origin in IMU coordinates.
+        self.gel_in_imu = -transform[:3, :3].T @ transform[:3, 3]
 
     def clear(self):
         self.samples.clear()
@@ -120,7 +129,7 @@ class ContactVelocityHistory:
                 self.samples.pop()
             elif gap < 0. or gap > self.settings['max_sample_gap_s'] + 1e-9:
                 self.clear()
-        self.samples.append((t, p))
+        self.samples.append((t, p, np.asarray(state.pose, float)[:3, :3].copy()))
         for sample in imu_samples:
             if not self.imu_samples or sample.timestamp > self.imu_samples[-1].timestamp:
                 self.imu_samples.append(sample)
@@ -143,6 +152,8 @@ class ContactVelocityHistory:
         span = times[-1] - times[0]
         if span < self.settings['min_span_s'] - 1e-9:
             return None
+        if self.settings['model'] == 'contact_kinematic':
+            return self._kinematic_seed(anchor, times, span)
         x = (times - anchor.timestamp) / span
         X = np.column_stack((x, 0.5*x*x))
         displacement = positions - positions[-1]
@@ -200,3 +211,34 @@ class ContactVelocityHistory:
                 return None
             displacements.append(.5*np.asarray(gravity)*(timestamp-times[0])**2 + rotation@pim.deltaPij())
         return np.array(displacements), final_dv
+
+    def _kinematic_seed(self, anchor, times, span):
+        """IMU-origin velocity from the GelSight contact velocity and the gyro."""
+        gel = np.array([rotation @ self.gel_in_imu + position
+                        for _, position, rotation in self.samples])
+        x = times - anchor.timestamp
+        X = np.column_stack((x, np.ones_like(x)))
+        coefficients, _, rank, _ = np.linalg.lstsq(X, gel, rcond=1e-10)
+        if rank < 2 or not np.isfinite(coefficients).all():
+            self.last_status = 'degenerate_contact_history'
+            return None
+        residual = gel - X @ coefficients
+        rmse = float(np.sqrt(np.mean(np.sum(residual*residual, axis=1))))
+        if rmse > self.settings['max_fit_rmse_m']:
+            self.last_status = 'contact_curve_residual_too_large'
+            return None
+        # Mean gyro over the last image interval, ending at the anchor.
+        recent = [s.angular_velocity for s in self.imu_samples
+                  if times[-1] - (times[-1] - times[-2]) - 1e-9 <= s.timestamp <= anchor.timestamp + 1e-9]
+        if not recent:
+            self.last_status = 'missing_contact_imu_interval'
+            return None
+        rotation = np.asarray(anchor.pose, float)[:3, :3]
+        omega = rotation @ (np.mean(recent, axis=0) - anchor.gyro_bias)
+        velocity = coefficients[0] - np.cross(omega, rotation @ self.gel_in_imu)
+        delta = velocity - anchor.velocity
+        if not np.isfinite(delta).all() or np.linalg.norm(delta) > self.settings['max_velocity_change_mps']:
+            self.last_status = 'velocity_change_too_large'
+            return None
+        self.last_status = 'accepted'
+        return CoastVelocitySeed(float(anchor.timestamp), delta.copy(), rmse, len(times), float(span))

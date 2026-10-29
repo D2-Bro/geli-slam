@@ -728,7 +728,7 @@ class Tracker:
         if (history is not None and self._frontend_vi_state is not None
                 and not getattr(self.frontend_visual_inertial, "imu_prediction_only", False)):
             samples = ()
-            if (history.settings['model'] == 'inertial_quadratic' and history.samples
+            if (history.settings['model'] in {'inertial_quadratic', 'contact_kinematic'} and history.samples
                     and self.imu_buffer is not None
                     and self._frontend_vi_state.timestamp > history.samples[-1][0]):
                 samples = self.imu_buffer.samples_covering(
