@@ -162,10 +162,12 @@ real 설정은 `src/gelslam/config/real_objects_config.yaml`(새 파일)이고, 
 ## 4. 남은 문제
 
 - 접촉 중 drift: 위치 약 1 mm/s, 회전은 trial당 수 °입니다. 비접촉 구간의 IMU coast 오차가 남은 위치 오차의 대부분입니다.
-- 백엔드 (`backend:=true`, feedback 꺼짐, 수정 전 설정에서 3개 trial):
-  - trial_001 2.95 mm, trial_012 16.0 mm로 프론트엔드보다 좋습니다.
-  - trial_005는 128 mm로 프론트엔드보다 나쁩니다. 잘못된 loop로 보이며, 확인하지 않았습니다.
-  - 수정 전 설정에서는 키프레임이 350개를 넘어서, 백엔드가 종료 제한(SIGINT 후 120 s + SIGTERM 후 150 s) 안에 끝나지 못했습니다.
+- 백엔드 (`backend:=true`, feedback 꺼짐, 최종 설정, 실시간 12개 trial, `FINAL_backend`):
+  - 파이프라인 자체 평가(GelSight pose 위치 RMSE)에서 raw odometry와 비교한 결과입니다.
+  - 좋아진 trial: 001 5.9 → 4.2, 002 7.9 → 5.3, 003 19.4 → 2.8, 004 10.8 → 8.3, 009 4.4 → 2.3, 010 13.0 → 3.9 mm
+  - 나빠진 trial: 005 19.2 → 53.9, 006 15.2 → 33.0, 011 3.9 → 8.4, 012 7.6 → 16.1 mm
+  - 12개 trial 모두 종료 제한 안에 끝났습니다. 수정 전에는 키프레임이 350개를 넘어서 끝나지 못한 경우가 있었습니다.
+  - trial_005에서는 Global PGO가 4번 실행되었습니다. 마지막(키프레임 164개)의 비용은 74 550 → 1866이었습니다. 로그에 loop 수용 정보가 없어서, 잘못된 loop인지는 확인하지 못했습니다.
 - sim:
   - plane_yaw와 periodic_return_gap은 접촉을 검출하지 않습니다. 이전 분석과 같은 원인입니다 (평면에서 SDK 접촉 마스크가 0 pixel).
   - sim에서 integration sigma를 줄이면 긴 sequence에서 촉각 거부가 늘어납니다. 원인은 확인하지 않았습니다.
