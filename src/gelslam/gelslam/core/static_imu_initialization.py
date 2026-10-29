@@ -89,9 +89,8 @@ def resolve_static_imu_config(config, gelsight_T_imu):
         raise ValueError("static_initialization.motion_check requires mode: recorded_rest_event")
     if not isinstance(settings["events_topic"], str) or not settings["events_topic"]:
         raise ValueError("static_initialization.events_topic must be a non-empty string")
-    if mode == "recorded_rest_event" and config.get("timestamp_source", "header") != "header":
-        # Event times are host receipt wall times; only header IMU stamps share that clock.
-        raise ValueError("static_initialization mode recorded_rest_event requires timestamp_source: header")
+    # Event times are host wall times. Header stamps and recorded_source times (source
+    # clocks fitted to host receipt) share that axis within a few milliseconds.
     if mode == "fixed_time":
         for name in ("start_time_s", "end_time_s"):
             value = settings[name]

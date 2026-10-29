@@ -718,7 +718,6 @@ def segment(start, end, acceleration=(0, 0, 9.81), gyro=(0, 0, 0)):
     (event_config(motion_check=1), "motion_check must be a boolean"),
     (event_config(motion_check=True, motion_pre_peak_margin_s=0), "motion_pre_peak_margin_s"),
     (event_config(events_topic=""), "events_topic"),
-    (dict(event_config(), timestamp_source="recorded_source"), "timestamp_source: header"),
 ])
 def test_recorded_rest_event_config_guards(cfg, match):
     with pytest.raises(ValueError, match=match):
@@ -833,7 +832,7 @@ def test_tracker_forwards_rest_events_and_restart_clears_sequence(monkeypatch):
         tracker.add_rest_event("trial_ready", np.nan)
 
 
-def test_real_objects_preset_uses_rest_events_and_previous_state_start():
+def test_real_objects_preset_uses_rest_events_source_time_and_previous_state_start():
     from gelslam.core.contact_velocity import ContactVelocityHistory
     cfg = yaml.safe_load((Path(__file__).parents[1] / "config" / "real_objects_config.yaml").read_text())
     imu = cfg["imu_config"]
@@ -841,8 +840,10 @@ def test_real_objects_preset_uses_rest_events_and_previous_state_start():
     assert settings["mode"] == "recorded_rest_event" and settings["max_propagation_s"] == 15.
     assert imu["frontend_initialize_from_imu_preintegration"] is False
     assert imu["image_to_imu_time_offset_s"] == pytest.approx(-0.0615)
-    history = ContactVelocityHistory.from_config(effective)
-    assert history.settings["model"] == "contact_kinematic" and history.settings["kinematic_fit_order"] == 2
+    assert settings["contact_velocity_sigma_mps"] == pytest.approx(.3)
+    assert imu["timestamp_source"] == "recorded_source"
+    assert imu["gtsam_integration_sigma_m"] == pytest.approx(1e-3)
+    assert ContactVelocityHistory.from_config(effective) is None
 
 
 def test_contact_velocity_sigma_adds_variance_and_keeps_mean():

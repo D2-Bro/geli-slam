@@ -43,6 +43,9 @@ imu_config:
     # the previous State keeps the velocity error out of the tactile solve.
     max_propagation_s: 15.0
     velocity_sigma_mps: 0.0001
+    # The 3-7 s hand-held approach leaves 0.13-0.29 m/s seed velocity error; let the
+    # first contact frames re-estimate it (first 0.25 s position error 9-22 -> <11 mm).
+    contact_velocity_sigma_mps: 0.3
   enabled: true
   frontend_optimization: true
   # Use reference_marginalization / pairwise for a variable reference + current 21D prior.
@@ -91,7 +94,9 @@ imu_config:
   gtsam_vi_prior_gyro_bias_sigma_rps: 0.02
   # Subscribe to the paired timing topics; a bag path is optional.
   # Start the tracker before the sensor publishers or bag player.
-  # timestamp_source: recorded_source
+  # Source clocks from /gelsight/timing (PTS) and /imu/device_time_ms, offsets fixed
+  # after warmup; removes receipt jitter and the 2-5 % duplicate IMU header stamps.
+  timestamp_source: recorded_source
   # camera_timing_topic: "/gelsight/timing"
   # imu_device_time_topic: "/imu/device_time_ms"
   # At each trial start, use one nearby GT GelSight attitude to set frontend
@@ -108,15 +113,15 @@ imu_config:
   # sensor_msgs/Imu.header.frame_id in pilot-real-20261007-v1/trial_003/bag.
   frame_id: "ebimu_sensor"
   # T_SI is declared from the gel chart (gel_frame), not the optical frame.
-  # Image headers are host receipt times, 52-84 ms (median 62.5 ms) after source_pts;
-  # IMU headers are receipt times about 1.6 ms after the device clock.
-  # Use 0.0 with bags whose headers were rewritten to source time.
+  # Camera receipt is 52-84 ms (median 62.5 ms) after source_pts and IMU receipt about
+  # 1.6 ms after the device clock; source clocks keep that mean receipt latency.
+  # Use 0.0 with timestamp_source: header on bags rewritten to source time.
   image_to_imu_time_offset_s: -0.0615
   max_coast_duration_s: 3.0
-  # Coast entry velocity from GelSight contact velocity + omega x lever arm.
-  # On these bags it cut the error added per no-contact gap by about 60-70 %.
+  # contact_kinematic helped only while gtsam_integration_sigma_m was 0.01 (VI velocity
+  # error 24 mm/s median). With 0.001 the VI velocity (6 mm/s) is better; keep it off.
   coast_velocity_fit:
-    enabled: true
+    enabled: false
     model: "contact_kinematic"
     kinematic_fit_order: 2
     window_s: 0.3
@@ -145,7 +150,9 @@ imu_config:
   accelerometer_noise_density: 0.002
   gyroscope_noise_density: 0.00016
   accelerometer_bias_random_walk: 0.00086
-  gyroscope_bias_random_walk: 0.000022
+  # 2.2e-5 let the gyro z bias wander 2 mrad/s in 70 s (yaw RMSE 2.3 deg); rest
+  # means show a stable bias. 2.2e-6: yaw/rotation RMSE 2.27 -> 1.10 deg.
+  gyroscope_bias_random_walk: 0.0000022
   buffer_max_samples: 6000
   # T_GI derived from this bag's /tf_static: IMU coordinates into gel_frame.
   gelsight_T_imu:
@@ -177,7 +184,9 @@ imu_config:
   # Set target_relinearized to compare with current-target normal derivatives.
   gtsam_vi_normal_linearization: "inverse_compositional"
   # Full undamped GN steps; IMU/bias/prior terms are relinearized each iteration.
-  gtsam_integration_sigma_m: 0.01
+  # 0.01 left velocity unobserved (median error 24 mm/s, p90 78); 0.001 -> 6 mm/s.
+  # Not for bag_simulation_config: there 0.001 adds tactile rejections on long runs.
+  gtsam_integration_sigma_m: 0.001
   # Original NormalFlow thresholds in reference GelSight IC coordinates.
   # Z, velocity, bias and previous-state updates do not control convergence.
   gtsam_vi_rotation_stop_rad: 0.001

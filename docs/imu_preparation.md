@@ -368,9 +368,9 @@ imu_config:
 bias. Zero velocity is set at `trial_ready` (GO), and the tracker predicts from
 GO to the first contact. The interval comes from each bag's event times, not
 from the bag start. The tracker uses the `host_wall_ns` field of each event as
-the IMU header time. This mode requires `timestamp_source: header`. In the
-GeLISLAM exports, the IMU header time differs from the event receipt time by a
-few milliseconds.
+the IMU time. Header stamps and `timestamp_source: recorded_source` times are
+both on the host receipt axis; they differ from the event time by a few
+milliseconds.
 
 With `motion_check: true`, the tracker searches the IMU from GO to the first
 contact. It finds the first sample whose acceleration differs from the rest
