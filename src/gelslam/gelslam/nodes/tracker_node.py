@@ -123,9 +123,11 @@ class TrackerNode(Node):
             if self.tracker.frontend_visual_inertial is None:
                 self.get_logger().warning("State.velocity evaluation requires the VI frontend; inactive")
             else:
-                path = os.path.expanduser(velocity_settings["truth_path"])
-                if not os.path.isabs(path):
-                    path = os.path.join(os.path.dirname(config_path), path)
+                path = velocity_settings.get("truth_path")
+                if path is not None:
+                    path = os.path.expanduser(path)
+                    if not os.path.isabs(path):
+                        path = os.path.join(os.path.dirname(config_path), path)
                 velocity_settings["truth_path"] = path
                 output_dir = trajectory_output_dir(
                     self.save_dir, self.get_parameter("sequence_name").value, data_dir

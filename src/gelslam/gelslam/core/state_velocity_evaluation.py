@@ -106,7 +106,9 @@ class StateVelocityEvaluation:
     def __init__(self, settings, output_dir):
         self.settings = dict(settings)
         self.output_dir = output_dir
-        self.truth = NativeImuVelocityTruth(settings['truth_path'], settings.get('time_offset_s', 1.0))
+        # Without a native truth file (real data), save states and GT poses only.
+        self.truth = (None if settings.get('truth_path') is None else
+                      NativeImuVelocityTruth(settings['truth_path'], settings.get('time_offset_s', 1.0)))
         self.states, self.gt_poses = [], []
         self.lock = threading.Lock()
 
@@ -139,7 +141,7 @@ class StateVelocityEvaluation:
             if os.path.isfile(name):
                 os.remove(name)
         result = dict(velocity_source='frontend State.velocity (IMU origin, raw state values retained)',
-                      ground_truth_source=self.truth.path,
+                      ground_truth_source=None if self.truth is None else self.truth.path,
                       ground_truth_pose_topic=self.settings.get('ground_truth_pose_topic', '/ground_truth/imu_pose'),
                       ground_truth_method='velocity_WS_m_s + cross(R_WI @ ideal_gyro_rad_s, p_WI - p_WS)',
                       method_reference='first10_contact_state_errors_20261018 and last_run_state_errors_20261016',
@@ -154,6 +156,8 @@ class StateVelocityEvaluation:
                 json.dump(result, handle, indent=2, allow_nan=False)
             return result
 
+        if self.truth is None:
+            return finish('states_only_no_truth_file')
         # Reject an unrelated sidecar rather than evaluating against arbitrary motion.
         mismatches = 0
         for timestamp, pose in gt_poses:
