@@ -21,6 +21,7 @@ setup(
                 "config/figure8_imu_refined_experiment.yaml",
                 "config/real_config.yaml",
                 "config/real_far_config.yaml",
+                "config/real_objects_config.yaml",
                 "config/gelslam_rviz.rviz",
             ],
         ),

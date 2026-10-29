@@ -831,3 +831,15 @@ def test_tracker_forwards_rest_events_and_restart_clears_sequence(monkeypatch):
     assert tracker._static_trial_seed.stationary_timestamp == 2.2
     with pytest.raises(ValueError):
         tracker.add_rest_event("trial_ready", np.nan)
+
+
+def test_real_objects_preset_uses_rest_events_and_previous_state_start():
+    from gelslam.core.contact_velocity import ContactVelocityHistory
+    cfg = yaml.safe_load((Path(__file__).parents[1] / "config" / "real_objects_config.yaml").read_text())
+    imu = cfg["imu_config"]
+    effective, settings, _ = resolve_static_imu_config(imu, np.array(imu["gelsight_T_imu"]))
+    assert settings["mode"] == "recorded_rest_event" and settings["max_propagation_s"] == 15.
+    assert imu["frontend_initialize_from_imu_preintegration"] is False
+    assert imu["image_to_imu_time_offset_s"] == pytest.approx(-0.0615)
+    history = ContactVelocityHistory.from_config(effective)
+    assert history.settings["model"] == "contact_kinematic" and history.settings["kinematic_fit_order"] == 2

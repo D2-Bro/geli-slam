@@ -21,7 +21,8 @@ import numpy as np
 
 DEFAULTS = dict(enabled=False, model='quadratic', window_s=0.4, min_samples=5,
                 min_span_s=0.3, max_sample_gap_s=0.15,
-                max_fit_rmse_m=0.00005, max_velocity_change_mps=0.02)
+                max_fit_rmse_m=0.00005, max_velocity_change_mps=0.02,
+                kinematic_fit_order=1)
 
 
 @dataclass(frozen=True)
@@ -89,7 +90,9 @@ class ContactVelocityHistory:
         count = settings['min_samples']
         if isinstance(count, bool) or not isinstance(count, int) or count < 5:
             raise ValueError('coast_velocity_fit.min_samples must be an integer >= 5')
-        for name in DEFAULTS.keys() - {'enabled', 'min_samples', 'model'}:
+        if settings['kinematic_fit_order'] not in (1, 2) or isinstance(settings['kinematic_fit_order'], bool):
+            raise ValueError('coast_velocity_fit.kinematic_fit_order must be 1 or 2')
+        for name in DEFAULTS.keys() - {'enabled', 'min_samples', 'model', 'kinematic_fit_order'}:
             value = settings[name]
             if isinstance(value, bool) or not np.isfinite(float(value)) or float(value) <= 0.:
                 raise ValueError('coast_velocity_fit.' + name + ' must be positive and finite')
@@ -217,9 +220,11 @@ class ContactVelocityHistory:
         gel = np.array([rotation @ self.gel_in_imu + position
                         for _, position, rotation in self.samples])
         x = times - anchor.timestamp
-        X = np.column_stack((x, np.ones_like(x)))
+        # Order 2 differentiates the endpoint of a quadratic: no half-window lag.
+        columns = (x, np.ones_like(x)) if self.settings['kinematic_fit_order'] == 1 else (x, .5*x*x, np.ones_like(x))
+        X = np.column_stack(columns)
         coefficients, _, rank, _ = np.linalg.lstsq(X, gel, rcond=1e-10)
-        if rank < 2 or not np.isfinite(coefficients).all():
+        if rank < len(columns) or not np.isfinite(coefficients).all():
             self.last_status = 'degenerate_contact_history'
             return None
         residual = gel - X @ coefficients
