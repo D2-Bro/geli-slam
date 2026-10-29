@@ -73,7 +73,8 @@ def create_keyframe_msg(bridge, frame, kid, fid, is_new_trial, trial_T_curr,
     return keyframe_msg
 
 
-def create_frame_msg(bridge, frame, fid, ref_kid, ref_T_curr, header=None):
+def create_frame_msg(bridge, frame, fid, ref_kid, ref_T_curr, header=None, *,
+                     tracking_status="contact_tracking", pose_valid=True, pose_timestamp=None):
     """
     Creates a FrameMsg from a Frame object.
 
@@ -85,13 +86,20 @@ def create_frame_msg(bridge, frame, fid, ref_kid, ref_T_curr, header=None):
     :param header: std_msgs.msg.Header; Source image header, if available.
     :return: FrameMsg; The frame message.
     """
+    if pose_timestamp is None:
+        pose_timestamp = (float(header.stamp.sec) + header.stamp.nanosec * 1e-9
+                          if header is not None else 0.0)
     if getattr(bridge, "internal_packets", False):
         from copy import deepcopy
         from gelslam.core.slam_packets import FramePacket, readonly
         return FramePacket(
             deepcopy(header), readonly(frame.H), readonly(frame.C.astype(np.uint8)),
-            readonly(frame.N), readonly(frame.L), fid, ref_kid, readonly(ref_T_curr).reshape(-1))
+            readonly(frame.N), readonly(frame.L), fid, ref_kid, readonly(ref_T_curr).reshape(-1),
+            tracking_status, bool(pose_valid), float(pose_timestamp))
     frame_msg = FrameMsg()
+    frame_msg.tracking_status = tracking_status
+    frame_msg.pose_valid = bool(pose_valid)
+    frame_msg.pose_timestamp = float(pose_timestamp)
     _copy_header(frame_msg, header)
     frame_msg.height_map = bridge.cv2_to_imgmsg(frame.H, encoding="32FC1")
     frame_msg.contact_mask = bridge.cv2_to_imgmsg(

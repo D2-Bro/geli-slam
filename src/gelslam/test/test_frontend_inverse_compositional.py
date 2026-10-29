@@ -154,8 +154,7 @@ def test_navigation_update_matches_origin_inverse_composition_to_first_order():
 
 
 @pytest.mark.parametrize('fixed_previous', [False, True])
-@pytest.mark.parametrize('fixed_bias', [False, True])
-def test_ic_reuses_reference_j_but_updates_pose_and_prior(monkeypatch, fixed_previous, fixed_bias):
+def test_ic_reuses_reference_j_but_updates_pose_and_prior(monkeypatch, fixed_previous):
     image = frame()
     initial = np.eye(4)
     initial[0, 3] = .001
@@ -188,7 +187,7 @@ def test_ic_reuses_reference_j_but_updates_pose_and_prior(monkeypatch, fixed_pre
         'gtsam_vi_max_iterations': 3, 'dense_normalflow_residual_weight': 1e8,
         'imu_residual_weight': 1e-8, 'gtsam_vi_normal_huber_delta': 0.,
         'gtsam_vi_rotation_stop_rad': 1e-10, 'gtsam_vi_translation_stop_m': 1e-10,
-        'frontend_fix_previous_state': fixed_previous, 'frontend_fix_bias': fixed_bias,
+        'frontend_fix_previous_state': fixed_previous,
     })
     result = solver.refine_current(visual, np.eye(4), previous, current, samples, np.eye(4))
     assert result is not None
@@ -205,9 +204,6 @@ def test_ic_reuses_reference_j_but_updates_pose_and_prior(monkeypatch, fixed_pre
         assert solver.pending_marginal_prior.matches(result)
     else:
         assert solver.pending_marginal_prior is None
-    if fixed_bias:
-        assert np.array_equal(result.accel_bias, previous.accel_bias)
-        assert np.array_equal(result.gyro_bias, previous.gyro_bias)
 
 
 def test_ic_reselects_contact_and_maps_fixed_reference_j_at_each_pose():

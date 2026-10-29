@@ -114,10 +114,10 @@ def test_tactile_only_fallback_implementation_is_removed():
     assert not hasattr(tm, 'normalflow')
 
 
-def test_vi_quality_rejection_is_not_a_fallback(monkeypatch):
+def test_ccs_quality_rejection_is_not_a_fallback(monkeypatch):
     tracker = make_tracker(monkeypatch)
     tracker.frontend_visual_inertial.refine_current = lambda *_args, **_kwargs: state(1.1)
-    monkeypatch.setattr(tm, "normalflow_quality", lambda *_args: (0.1, 1.0))
+    monkeypatch.setattr(tm, "normalflow_quality", lambda *_args: (0.1, 0.1))
     with pytest.raises(QualityGateError):
         refine(tracker)
     counts = tracker.frontend_tracking_statistics()
@@ -167,7 +167,8 @@ def test_counts_survive_solver_replacement_and_summary_includes_zeros(monkeypatc
 @pytest.mark.parametrize("spin_error", [False, True])
 def test_shutdown_waits_for_callbacks_before_node_destruction(monkeypatch, spin_error):
     events = []
-    node = SimpleNamespace(destroy_node=lambda: events.append("destroy"))
+    node = SimpleNamespace(destroy_node=lambda: events.append("destroy"),
+                           _initialization_imu_gt_release_ready=lambda: False)
     def spin_once(timeout_sec):
         assert timeout_sec == 0.1
         if spin_error:
@@ -179,7 +180,7 @@ def test_shutdown_waits_for_callbacks_before_node_destruction(monkeypatch, spin_
     monkeypatch.setattr(node_module.rclpy, "init", lambda **_kwargs: None)
     monkeypatch.setattr(node_module.rclpy, "try_shutdown", lambda: events.append("ros_shutdown"))
     monkeypatch.setattr(node_module, "TrackerNode", lambda: node)
-    monkeypatch.setattr(node_module, "MultiThreadedExecutor", lambda **_kwargs: executor)
+    monkeypatch.setattr(node_module, "TrackerExecutor", lambda **_kwargs: executor)
     if spin_error:
         with pytest.raises(RuntimeError, match="callback failed"):
             node_module.main()

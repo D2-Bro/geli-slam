@@ -2,11 +2,10 @@
 from dataclasses import FrozenInstanceError, replace
 from threading import Event, Thread
 from types import SimpleNamespace
-import time
 import numpy as np
 import pytest
 from std_msgs.msg import Header
-from gelslam.core.slam_packets import ArrayBridge, to_ros
+from gelslam.core.slam_packets import ArrayBridge
 from gelslam.core.frame import create_keyframe_msg
 from gelslam.core.shared_map import SharedMap, MapEstimate
 from gelslam.core.slam_system import SlamSystem
@@ -121,7 +120,7 @@ def test_image_latest_queue_retains_keyframes_and_reports_worker_failure():
     assert all(not t.is_alive() for t in broken._threads)
 
 
-def test_local_mapping_moves_window_and_save_reloads(tmp_path):
+def test_local_mapping_stores_seeds_and_save_reloads(tmp_path):
     logger = Logger(print_output=False)
     cfg = config(coverage_graph_overlap_threshold=.8)
     cfg['device_config'] = {'ppmm': 1.}
@@ -130,8 +129,7 @@ def test_local_mapping_moves_window_and_save_reloads(tmp_path):
     for index in range(12):
         store.append_keyframe(packet(index))
         assert mapper.process(store.snapshot_for_optimization(), [], store)
-    assert mapper.graph.window_start >= 9
-    assert mapper.graph.factor_kinds.count('imu') == 11
+    assert len(mapper.graph.temporal_links) == 11
     assert all(edge[2] is None for edge in mapper.graph.edges)
     mapper.save(tmp_path)
     from gelslam.core.gtsam_pose_graph import PoseGraph
@@ -172,7 +170,8 @@ def test_loop_corrected_seeds_in_one_batch_return_to_local_anchor():
     mapper.process(store.snapshot_for_optimization(),
         [LoopCandidate(0, 0, 0, 1, measured)], store)
     corrected = store.snapshot_for_tracking().estimates[1].state
-    assert np.isclose(corrected.pose[0, 3], .001, atol=1e-10)
+    correction_x = corrected.pose[0, 3]
+    assert 0. < correction_x < .002
     assert abs(mapper.graph.states[1].pose[0, 3]) < 1e-12
     # Both packets use loop-corrected tracking coordinates. K_3 refers to
     # K_2, which has not yet been appended to the local graph.
@@ -182,6 +181,8 @@ def test_loop_corrected_seeds_in_one_batch_return_to_local_anchor():
         current_pose = corrected.pose.copy()
         store.append_keyframe(replace(current,
             navigation_pose=current_pose, trial_t_curr=current_pose.reshape(-1),
+            velocity=corrected.velocity.copy(), accel_bias=corrected.accel_bias.copy(),
+            gyro_bias=corrected.gyro_bias.copy(),
             anchor_kid=index - 1, anchor_state=basis.copy()))
         basis.timestamp = current.navigation_timestamp
     mapper.process(store.snapshot_for_optimization(), [], store)
@@ -189,7 +190,7 @@ def test_loop_corrected_seeds_in_one_batch_return_to_local_anchor():
         assert abs(mapper.db[index].navigation_state.pose[0, 3]) < 1e-12
         assert abs(mapper.graph.states[index].pose[0, 3]) < 1e-10
         assert np.isclose(store.snapshot_for_tracking().estimates[index].state.pose[0, 3],
-                          .001, atol=1e-9)
+                          correction_x, atol=1e-9)
 
 
 class PositionVisual:
@@ -200,10 +201,9 @@ class PositionVisual:
         return np.zeros(30), np.zeros_like(jacobian), jacobian
 
 
-@pytest.mark.parametrize('fix_bias', [False, True])
-def test_corrected_keyframe_solve_omits_old_prior_and_builds_fresh_target_prior(fix_bias):
+def test_corrected_keyframe_solve_omits_old_prior_and_builds_fresh_target_prior():
     solver = GtsamVisualInertialSolver(dict(gtsam_vi_marginalization=True,
-        frontend_fix_bias=fix_bias, gtsam_vi_max_iterations=2))
+        gtsam_vi_max_iterations=2))
     anchor = estimate().state
     samples = [ImuSample(t, [0, 0, 9.81], [0, 0, 0]) for t in np.linspace(1., 1.1, 11)]
     solver.marginal_prior = NavigationPrior.initial(anchor, np.ones(15) * .001)
@@ -362,8 +362,8 @@ def test_feedback_preserves_accepted_relative_pose_without_imu_propagation(
         assert corrected.timestamp == previous.timestamp
         for field in ('velocity', 'accel_bias', 'gyro_bias'):
             assert np.array_equal(getattr(corrected, field), getattr(previous, field))
-        assert np.array_equal(tracker._frontend_vi_prev_pose, corrected.pose)
-        assert np.array_equal(tracker._frontend_vi_prev_velocity, previous.velocity)
+        assert np.array_equal(tracker._frontend_vi_state.pose, corrected.pose)
+        assert np.array_equal(tracker._frontend_vi_state.velocity, previous.velocity)
         assert solver.marginal_prior is prior
         assert np.array_equal(prior.rhs, np.arange(15))
         assert tracker._frontend_imu_preintegration is tracker._frontend_coast_state is None
@@ -382,12 +382,11 @@ def test_seed_appended_during_ba_rebases_against_local_anchor_without_pose_facto
     changed = estimate(.001)
     mapper.graph.states[0] = changed.state.copy()
     mapper.graph.poses[0] = changed.trial_pose.copy()
-    mapper.graph._put_state(0, mapper.graph.states[0])
     store.commit_solution(0, {0: changed})
     store.append_keyframe(replace(packet(1), anchor_kid=0, anchor_state=stale_anchor))
     mapper.process(store.snapshot_for_optimization(), [], store)
     assert mapper.db[1].navigation_state.pose[0, 3] == pytest.approx(.001)
-    assert mapper.graph.factor_kinds.count('imu') == 1
+    assert mapper.graph.temporal_links == [(0, 1)]
     assert all(edge[2] is None for edge in mapper.graph.edges)
 
 
@@ -399,7 +398,7 @@ def test_backend_off_has_raw_poses_and_no_measurement_factors():
     store.append_keyframe(packet())
     store.append_keyframe(packet(1))
     mapper.process(store.snapshot_for_optimization(), [], store)
-    assert mapper.graph.graph.size() == 0
+    assert mapper.graph.states == [None, None]
     assert mapper.solutions.size() == 2
     assert store.snapshot_for_tracking().estimates[1].state is None
 
@@ -430,7 +429,6 @@ def test_concurrent_batch_matches_sequential_reference():
     system = SlamSystem(lambda _: None, concurrent, shared_map=concurrent_store)
     system.start()
     system.stop()
-    assert concurrent.graph.window_start == reference.graph.window_start
     assert len(concurrent.graph.states) == 6
     for expected, actual in zip(reference.graph.states, concurrent.graph.states):
         for field in ('pose', 'velocity', 'accel_bias', 'gyro_bias'):

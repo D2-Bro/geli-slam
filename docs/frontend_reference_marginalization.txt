@@ -1,0 +1,274 @@
+Python NormalFlow + IMU frontend: reference marginalization
+검토 및 구현일: 2026-10-21
+추가 정책: 각 trial의 최초 접촉 F_0 pose 6D는 초기값에 정확히 고정한다.
+
+결과와 설정
+기존 pairwise 경로를 유지했다. 다음 설정으로 새 경로를 선택한다.
+
+imu_config:
+  frontend_state_mode: reference_marginalization
+  frontend_optimization: true
+  gtsam_vi_marginalization: true
+  frontend_fix_previous_state: false
+  frontend_fix_bias: false
+  frontend_imu_prediction_only: false
+  frontend_gt_previous_state_test:
+    enabled: false
+
+현재 config.yaml과 real_config.yaml은 pairwise다.
+현재 bag_simulation_config.yaml은 reference_marginalization이다.
+새 모드의 최초 접촉 pose는 항상 고정한다. 별도 큰 가중치 설정은 필요 없다.
+새 경로와 고정 state/bias, prediction-only, GT state 덮어쓰기의 조합은 오류로 거부한다.
+Gravity/velocity의 기존 초기화 선택과 static_initialization은 계속 사용할 수 있다.
+이 문서는 contact frontend 경로를 설명한다. Backend 최적화는 변경하지 않았다.
+
+변경 파일
+- core/retained_prior.py: 변수 ID, 블록 배치, manifold prior, rank-aware 제거.
+- core/reference_tracking.py: 36D solve, 21D 유지, bootstrap 및 reference 전이.
+- core/gtsam_vi.py: solver 선택 factory.
+- core/tracker.py: 설정 선택, 수락 후 commit, reference 전이, backend 경계.
+- config/*.yaml: frontend_state_mode 선택 항목.
+- test/test_reference_marginalization.py: 수치 및 lifecycle 검증.
+- scripts/validate_reference_marginalization.py: 저장 ROS 메시지 재생 검증 모듈.
+  위 scripts는 src/gelslam/gelslam/scripts 디렉터리다.
+
+기존 구현에서 확인한 convention
+NavigationState는 IMU 원점의 T_WI, world 좌표계 속도, 센서 좌표계 bias를 저장한다.
+T_WI는 IMU 좌표를 navigation world 좌표로 변환한다.
+T_GI는 IMU 좌표를 GelSight 좌표로 변환한다.
+NormalFlow 관측 pose는 T_WG = T_WI inv(T_GI)다.
+추적 내부 world는 초기 접촉 위치와 중력 정렬로 정한 trial 좌표계다.
+
+Pose 저장 형식은 4x4 행렬이다. 저장 수 16과 tangent 차원 6은 다르다.
+Quaternion 성분을 최적화하거나 단순 차분하지 않는다.
+증분 순서는 [dtheta, dp]다. 갱신은 다음과 같다.
+  p_new = p + R dp
+  R_new = R Exp(dtheta)
+두 식의 R은 갱신 전 회전이다. 우측 body-local 증분이다.
+SE(3) Exp의 회전/이동 결합항을 사용하는 갱신과 구분해야 한다.
+Pose 차이는 다음 split chart를 사용한다.
+  [Log(R_anchor.T R), R_anchor.T (p-p_anchor)]
+Log Jacobian과 R_anchor.T R을 적용해 기준점 밖의 prior를 미분한다.
+
+State tangent 순서는 기존 코드와 같이 [pose6, v3, ba3, bg3]다.
+수식의 [bg, ba] 순서와 다르지만 물리적 state 차원은 동일한 15D다.
+ba 단위는 m/s^2다. bg 단위는 rad/s다. 두 bias는 IMU 축으로 표현한다.
+Velocity는 IMU 원점의 world 속도이며 단위는 m/s다.
+Gravity는 world 벡터로 유지한다. 초기 정렬 후 일반적으로 [0,0,-g]다.
+Gravity는 최적화 변수가 아니다. IMU 예측과 native factor가 같은 중력을 사용한다.
+
+기존 pairwise 최적화는 보통 이전 state15 + 현재 state15 = 30D다.
+고정 이전 state 옵션이면 15D, bias 고정이면 state당 9D 경로도 있다.
+기존 marginal_prior.py의 NavigationPrior는 현재 state에 대한 15D prior다.
+기존 reference GelSight pose는 보통 고정이다. IMU-only reference 회복은 예외다.
+기존 final prior는 이전 state를 제거한 뒤 gradient를 0으로 재설정한다.
+새 경로는 축약한 gradient를 보존한다. Pairwise의 기존 동작은 변경하지 않았다.
+
+IMU factor는 native gtsam.ImuFactor의 9D motion residual이다.
+이전/현재 pose 및 velocity, 이전 bias를 연결한다.
+별도 BetweenFactorConstantBias가 6D [ba_j-ba_i, bg_j-bg_i] residual을 구성한다.
+Random-walk sigma는 각 noise density * sqrt(dt)다.
+CombinedImuFactor는 기존 진단용이다. 새 solve에서는 사용하지 않는다.
+따라서 bias evolution residual을 중복해서 추가하지 않는다.
+
+NormalFlow는 reference 이미지와 현재 이미지를 연결한다.
+기존 IC 경로는 reference에서 계산한 5열 모델을 6열 pose tangent에 삽입한다.
+Reference GelSight Z 이동 열은 0이다. 관측 차원을 임의로 늘리지 않는다.
+기존 target_relinearized 선택도 유지한다. IC는 정확한 forward derivative와 다르다.
+기존 robust loss, shared contact 선택, 단위, 선택적 height-Z factor를 유지한다.
+Height-Z는 사용자가 설정한 별도 측정이다. Marginalization이 생성한 정보가 아니다.
+고정-Z 진단 옵션에서는 기존 target 투영을 reference Jacobian에도 전달한다.
+그 결과 공통 world pose 변경은 NormalFlow에 새로운 관측 정보를 만들지 않는다.
+
+변수 ID와 최종 순서
+변수 ID는 (종류, IMU timestamp)다. Solver는 trial 내부에서만 ID를 사용한다.
+종류는 pose, velocity, accel_bias, gyro_bias다. 폭은 각각 6, 3, 3, 3이다.
+일반 solve 순서는 [T_ref6, s_previous15, s_current15]다. 총 36D다.
+일반 retained 순서는 [T_ref6, s_current15]다. 총 21D다.
+단, 최초 접촉 pose는 constant metadata에 저장하며 변수 열에 등록하지 않는다.
+첫 reference를 유지하는 동안 retained 변수는 현재 state15뿐이다.
+초기화 직후에는 최초 pose를 제외한 velocity/bias9만 변수다.
+같은 timestamp의 같은 pose는 하나의 블록이다. 중복 독립 pose는 만들지 않는다.
+두 factor endpoint가 같은 변수를 지정하면 해당 Jacobian 열을 더한다.
+
+프레임 처리 순서
+1. 수락한 이전 state s_(i-1)와 그 state를 포함하는 prior를 읽는다.
+2. t_(i-1) -> t_i IMU preintegration으로 현재 state의 초기값을 만든다.
+3. 기존 prior, reference/current NormalFlow, IMU motion, bias walk를 구성한다.
+4. 최초 pose를 제외한 reference pose와 두 state를 full Gauss-Newton으로 갱신한다.
+5. 최종 상태에서 모든 측정 행을 선형화한다.
+6. 유지 블록에 없는 이전 state 블록을 제거해 candidate prior를 만든다.
+7. Tracker가 SCR/CCS, finite state, IMU consistency를 확인한다.
+8. 수락하면 state, 최적화한 reference, prior를 함께 commit한다.
+   거부하면 candidate prior를 폐기하고 수락된 prior와 reference를 유지한다.
+
+기존 순서대로 IMU 예측 covariance를 품질 gate에 사용할 수 있다.
+이 예측 prior는 현재 solve에 독립 factor로 추가하지 않는다.
+No-contact publication은 별도의 예측 state를 사용한다.
+접촉 최적화가 수락될 때까지 accepted state와 accepted prior를 변경하지 않는다.
+IMU-only recovery를 수락하면 해당 IMU 구간만 prior에 흡수한다.
+그 뒤 새 reference를 현재 state pose와 공유하도록 전이한다.
+
+제거 수식과 factor 소유권
+행 convention은 E = 1/2 ||A dx-rhs||^2다.
+H = A.T A이며 사용자가 지정한 cost gradient g = -A.T rhs다.
+따라서 normal equation은 H dx = -g = A.T rhs다.
+
+제거 대상 열을 A_m, 유지 열을 A_r로 구분한다.
+SVD least-squares solve로 A_m의 열공간을 제거한 A_r와 rhs를 구한다.
+이는 H_rr-H_rm solve(H_mm,H_mr)와
+g_r-H_rm solve(H_mm,g_m)의 square-root 형태다.
+Singular H_mm에는 observable subspace의 일반화된 제거를 적용한다.
+명시적 inverse와 LM damping은 이 경로에 없다.
+단위별 열 norm으로 solve를 정규화한다. 상대 rank cutoff는 1e-12다.
+Machine roundoff 수준의 열을 단위 크기로 확대하지 않는다.
+축약 결과를 SVD 행으로 압축한다. 관측되지 않은 방향에 값을 더하지 않는다.
+Hessian은 행의 곱으로 구성한다. 대칭성과 finite 값, 수치 rank를 기록한다.
+
+새 경로는 현재 문제 전체를 prior로 압축한다.
+즉 기존 prior + 이번 NormalFlow + 이번 IMU + 이번 bias factor를 모두 흡수한다.
+최적화 이후 남는 독립 active measurement factor는 0개다.
+다음 solve에는 새 reference/current 이미지 쌍과 새 accepted/target IMU 구간만 추가한다.
+이전 prior의 timestamp와 새 IMU anchor가 다르면 history를 재설정하지 않고 거부한다.
+진단의 absorbed_intervals는 수락한 구간 수다. Reject와 품질 예측은 이를 증가시키지 않는다.
+Backend 전용 IMU buffer는 기존 별도 backend 목적함수를 위한 것이다.
+
+Prior 선형화 정책과 gauge
+Prior는 변수 ID, 순서, 폭, 각 pose/vector 기준점, A, rhs를 함께 저장한다.
+Pose/velocity/bias 및 reference/current 사이의 교차 블록을 유지한다.
+독립 대각 prior로 교체하지 않는다. Gradient도 유지한다.
+흡수한 과거 NormalFlow/IMU의 원래 Jacobian은 다시 계산하지 않는다.
+저장한 A와 rhs는 고정이다. 평가점이 움직이면 boxminus와 chart Jacobian만 계산한다.
+즉 고정 prior의 manifold 미분과 과거 측정의 재선형화는 서로 다른 작업이다.
+
+기존 초기화 pose를 F_0의 정확한 위치/회전 datum으로 사용한다. Identity로 덮어쓰지 않는다.
+Roll/pitch를 포함한 pose 6D 전체를 초기값에 고정한다. Velocity/bias는 계속 추정한다.
+이 정책은 최초 프레임만 고정하라는 추가 요청을 반영한다.
+Static initializer가 반환한 correlated NavigationPrior는 pose에 조건화해서 이관한다.
+고정 pose의 열을 제거하고, 기준점과 고정값이 다르면 그 차이를 rhs에 전달한다.
+이는 확률변수를 Schur 제거하는 연산과 다르다. 자유 변수의 모든 교차 정보와 gradient를 보존한다.
+고정 pose에 유한한 큰 정보값을 추가하지 않는다. Solver 변수에서 해당 열을 제외한다.
+Reference가 바뀌어도 F_0의 값과 ID는 constant metadata에 남는다.
+F_0를 제외한 모든 reference는 자유 변수다. 매 reference를 새로 고정하지 않는다.
+나머지 시스템의 rank 부족은 기존 rank-aware solve로 처리한다.
+
+초기화와 reference 교체
+F_0의 t_0에서는 pose가 고정되므로 retained 자유도는 velocity/bias의 9D다.
+다음 F_1의 t_1 solve는 이전 velocity/bias9 + 현재 state15 = 24D다.
+F_1 수락 후 현재 state15의 prior와 constant T_ref(t_0)를 유지한다.
+F_2의 t_2에서는 이전 state15 + 현재 state15 = 30D를 푼다.
+F_0가 reference인 동안 이 30D solve / 15D retained 구조를 유지한다.
+이는 고정 pose의 6개 열을 형식적으로 차원에 포함하지 않은 실제 자유도다.
+F_0 이후의 reference로 교체하고 서로 다른 reference/이전/현재 시점이 되면 36D로 복귀한다.
+
+기존 keyframe 조건을 유지한다. 일반 조건은 keyframe_max_interval_s다.
+낮은 SCR은 수락 가능한 target을 즉시 keyframe으로 만들 수 있다.
+IMU recovery 기준으로 촉각 추적에 성공한 것만으로는 target을 강제 승격하지 않는다.
+복구 후에도 SCR과 시간 간격 조건으로 keyframe을 선택한다.
+승격하지 않으면 최적화된 recovery 기준 pose와 reference/current prior를 유지한다.
+CCS/IMU consistency 실패는 기존 실패 대기와 IMU recovery 정책을 따른다.
+현재 F_i를 새 reference로 선택하면 기존 reference6을 prior에서 실제로 제거한다.
+남은 s_i의 pose가 새 reference와 같은 자유 변수다. 이 순간 retained 차원은 15D다.
+다음 F_(i+1) solve는 30D이며, 수락 후 다시 21D를 유지한다.
+연속 keyframe 생성에서도 이 전이를 반복한다. Variable ID를 단순 교체하지 않는다.
+새 reference가 이미 제거된 과거 pose라면 오류다. 그 pose의 정보를 재생성하지 않는다.
+새 경로는 임의의 오래된 tactile reference로 fallback하지 않는다.
+Shared contact가 부족하면 이전 state 초기값 retry와 기존 IMU recovery를 사용한다.
+
+긴 no-contact 뒤 moving segment restart에서는 예측 prior를 좌표 변환한 뒤
+이전 reference를 제거한다. 이 정보를 새 staged reference/state에 전달한다.
+게시 전의 시작 후보를 교체하면 수락된 이전 trial prior에서 새 후보를 다시 만든다.
+이미 조건화한 폐기 후보를 재사용해서 여러 pose 고정 조건을 누적하지 않는다.
+IMU 단절로 새 stationary initialization이 필요한 경우는 기존 명시적 새 trial 정책이다.
+실행 중 ref 교체를 숨기기 위해 prior를 삭제하는 경로와 구분한다.
+
+ROS 및 backend 경계
+이미지 callback은 직렬화된 경로에서 solve와 prior commit을 실행한다.
+IMU callback은 buffer에 측정을 추가한다. Solve 중인 state/prior를 직접 수정하지 않는다.
+Backend callback은 immutable snapshot을 교체한다.
+기존 pairwise 경로는 apply_map_snapshot에서 내부 state와 reference를 수정할 수 있다.
+그 경로는 유지했다.
+새 모드에서는 backend feedback을 map snapshot으로만 받는다.
+Frontend state, gravity, reference, prior에 backend pose를 덮어쓰지 않는다.
+기존 backend map 및 keyframe seed rebasing 경로는 유지한다.
+Frontend 측정을 이미 사용한 backend 결과를 독립 측정 prior로 다시 넣지 않는다.
+Public ROS topic/message 형식은 변경하지 않았다.
+RetainedPrior.reframe은 모든 retained pose, world velocity, 전체 교차 정보를 함께 옮긴다.
+센서 bias는 회전하지 않는다. 새 segment의 solver에는 같은 변환 후 중력을 전달한다.
+
+검증과 실행 한계
+최초 pose 고정 전 검증은 diagnostics/reference_marginalization_20261021에 저장했다.
+고정 정책의 새 검증은 diagnostics/first_pose_fixed_20261021에 저장한다.
+Bag 검증은 config_supplied.yaml로
+reference_marginalization을 명시적으로 공급했다.
+Static 초기화의 override 결과는 config_effective_imu.yaml에 저장했다.
+기존 실행 중인 tracker/pose_graph ROS 프로세스는 확인되지 않았다.
+build/install의 Python/config 연결을 확인했고 colcon build를 실행했다.
+
+검증 항목에는 다음이 포함된다.
+- 36D 전체 normal equation과 비영 gradient Schur 해의 일치.
+- Pose 기준점 밖의 prior Jacobian과 cost gradient finite difference.
+- Rank 부족과 측정에서 관측되지 않은 방향의 정보 보존.
+- 최초 pose 고정과 실제 9D/15D/21D/24D/30D/36D 전이.
+- 최초 프레임 이후 reference 최적화, 연속 keyframe, no-contact restart.
+- Reject 후 accepted prior 보존과 측정 구간의 단일 소유권.
+- NaN/Inf 거부, Hessian 대칭성, 수치 rank, full prior 좌표 변환.
+- Solve 중 실행된 IMU callback이 state/prior를 수정하지 않는지 확인.
+- 고정-Z 모델의 공통 world 운동 nullspace와 기존 5DOF 유지.
+
+실제 bag은 fixture-rock-long-figure8-20261001-v1-gelslam-image의 1~6초 구간이다.
+ROS 메시지를 Python tracker에 직접 넣는 CPU offline replay다.
+미리 받은 IMU/GT를 사용해 endpoint readiness를 만족시켰다.
+이미지 101개, 수락 이미지 34개, keyframe 4개, solve 33회 성공을 확인했다.
+비접촉/초기화 이미지의 비수락은 solve 실패를 뜻하지 않는다.
+Timing은 evidence.json의 solve_ms_*와 image_ms_*를 확인한다.
+이 수치는 live DDS, backend 최적화, 전체 시퀀스 정확도를 검증하지 않는다.
+최신 설치본 검증에서 solve 중앙값은 22.29 ms, 95백분위는 30.14 ms다.
+전체 이미지 처리 중앙값은 34.96 ms, 95백분위는 61.53 ms다.
+기능 테스트를 함께 실행한 CPU 측정이며 전용 성능 benchmark는 아니다.
+초기 접촉 reference는 t=4.35 s다. 이후 reference는 4.85, 5.35, 5.85 s다.
+이 값은 정지 IMU 초기화 anchor t=2.9 s와 구분해야 한다.
+최초 pose 고정 전용 검증에는 정확한 조건화, gradient, 모든 반복의 pose 불변성도 포함한다.
+새 전용 테스트 27개를 포함한 관련 테스트 167개가 통과했다.
+전체 실행은 870개 통과, 14개 실패, fixture 오류 12개, 제외 2개다.
+실패 및 fixture 오류 항목은 이전 격리 기준 실행과 동일하다.
+고정 정책의 최신 전체 결과와 source/build/install 일치는 새 검증 디렉터리에서 확인한다.
+실제 재생에서도 최초 pose와 최초 reference 행렬이 정확히 유지되는지 검사한다.
+설치본 재생의 최초 pose 검사 34회에서 최대 행렬 성분 변화는 정확히 0이다.
+검증한 source hash와 최신 설치본 결과는 first_pose_fixed_20261021/final_audit.json에 있다.
+
+전체 기능 테스트의 기존 실패는 별도로 남겼다.
+이번 변경만 제거한 /tmp의 격리 복사본에서도 같은 실패 14개와 fixture 오류 12개를 재현했다.
+재구성 절차와 실패 이름은 reconstructed_baseline.json, reconstruct_baseline.py,
+baseline_failures.log, full_tests.log에 기록했다.
+ROS 로그 경로는 writable diagnostics 디렉터리를 사용했다.
+Live DDS/RViz 통신 테스트 두 개와 기존 style 테스트 세 파일은 최종 전체 실행에서 제외했다.
+기존 Tracker.save()는 실행 종료용 snapshot이며 solver/state를 제거한다.
+이 기능에서 live tracking 재개를 위한 snapshot 형식 변경은 구현하지 않았다.
+새 실행은 초기화부터 시작해야 한다. Legacy snapshot을 새 prior로 간주하면 안 된다.
+
+실행 방법
+cd /home/dongjae/gelslam
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+
+빌드:
+/home/dongjae/miniconda3/envs/gel-slam/bin/colcon build --packages-select gelslam --symlink-install
+
+전용 테스트:
+/home/dongjae/miniconda3/envs/gel-slam/bin/python -m pytest -q src/gelslam/test/test_reference_marginalization.py
+
+재생 검증:
+/home/dongjae/miniconda3/envs/gel-slam/bin/python -m gelslam.scripts.validate_reference_marginalization \
+  --bag /home/dongjae/dataset/GeLISLAM/fixture-rock-long-figure8-20261001-v1-gelslam-image/bag \
+  --config src/gelslam/config/bag_simulation_config.yaml --start 1 --end 6 \
+  --output diagnostics/first_pose_fixed_20261021/replay
+
+ROS 실행:
+사용할 YAML의 imu_config.frontend_state_mode를 reference_marginalization으로 설정한다.
+ros2 launch gelslam bag_replay_launch.py config_path:=<YAML 절대 경로> rendering:=false rviz:=false
+별도 터미널에서 ros2 bag play <bag 경로> --clock을 실행한다.
+Static fixed_time 설정은 해당 bag의 초기 정지 구간과 일치해야 한다.

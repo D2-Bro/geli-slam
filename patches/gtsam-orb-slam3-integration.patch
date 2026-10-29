@@ -1,0 +1,257 @@
+diff --git a/gtsam/navigation/PreintegrationParams.h b/gtsam/navigation/PreintegrationParams.h
+--- a/gtsam/navigation/PreintegrationParams.h
++++ b/gtsam/navigation/PreintegrationParams.h
+@@ -53,6 +53,7 @@
+  private:
+   ImuFactorErrorMode imuFactorErrorMode_;
+   bool useMidpointIntegration_;
++  bool useOrbSlam3Integration_;
+ 
+  public:
+   /// Default constructor for serialization only; fresh params use Logmap.
+@@ -63,7 +64,8 @@
+         use2ndOrderCoriolis(false),
+         n_gravity(0, 0, -1),
+         imuFactorErrorMode_(ImuFactorErrorMode::Logmap),
+-        useMidpointIntegration_(false) {}
++        useMidpointIntegration_(false),
++        useOrbSlam3Integration_(false) {}
+ 
+   /// The Params constructor insists on getting the navigation frame gravity vector
+   /// For convenience, two commonly used conventions are provided by named constructors below
+@@ -74,7 +76,8 @@
+         use2ndOrderCoriolis(false),
+         n_gravity(n_gravity_),
+         imuFactorErrorMode_(ImuFactorErrorMode::Logmap),
+-        useMidpointIntegration_(false) {}
++        useMidpointIntegration_(false),
++        useOrbSlam3Integration_(false) {}
+ 
+   // Default Params for a Z-down navigation frame, such as NED: gravity points along positive Z-axis
+   static std::shared_ptr<PreintegrationParams> MakeSharedD(double g = 9.81) {
+@@ -119,10 +122,25 @@
+    */
+   void setUseMidpointIntegration(bool enabled) {
+     useMidpointIntegration_ = enabled;
++    if (enabled) useOrbSlam3Integration_ = false;
+   }
+ 
+   /// Return whether Tangent preintegration uses the half-step attitude.
+   bool getUseMidpointIntegration() const { return useMidpointIntegration_; }
++
++  /**
++   * Use ORB-SLAM3's start-attitude acceleration and exact rotation composition
++   * in Tangent preintegration. The caller supplies interval-averaged samples.
++   * Enabling this method disables midpoint integration, and vice versa.
++   */
++  void setUseOrbSlam3Integration(bool enabled) {
++    useOrbSlam3Integration_ = enabled;
++    if (enabled) useMidpointIntegration_ = false;
++  }
++
++  /// Return whether Tangent preintegration uses the ORB-SLAM3 update.
++  bool getUseOrbSlam3Integration() const { return useOrbSlam3Integration_; }
++
+ 
+ #ifdef GTSAM_ALLOW_DEPRECATED_SINCE_V43
+   /// @deprecated Exact rotating-Earth dynamics ignore this compatibility flag.
+@@ -159,6 +177,11 @@
+     } else if (ARCHIVE::is_loading::value) {
+       useMidpointIntegration_ = false;
+     }
++    if (version > 2) {
++      ar & BOOST_SERIALIZATION_NVP(useOrbSlam3Integration_);
++    } else if (ARCHIVE::is_loading::value) {
++      useOrbSlam3Integration_ = false;
++    }
+   }
+ #endif
+ };
+@@ -166,5 +189,5 @@
+ } // namespace gtsam
+ 
+ #if GTSAM_ENABLE_BOOST_SERIALIZATION
+-BOOST_CLASS_VERSION(gtsam::PreintegrationParams, 2)
++BOOST_CLASS_VERSION(gtsam::PreintegrationParams, 3)
+ #endif
+diff --git a/gtsam/navigation/PreintegrationParams.cpp b/gtsam/navigation/PreintegrationParams.cpp
+--- a/gtsam/navigation/PreintegrationParams.cpp
++++ b/gtsam/navigation/PreintegrationParams.cpp
+@@ -52,6 +52,7 @@
+   cout << "imuFactorErrorMode = " << errorModeName(imuFactorErrorMode_)
+        << endl;
+   cout << "useMidpointIntegration = " << useMidpointIntegration_ << endl;
++  cout << "useOrbSlam3Integration = " << useOrbSlam3Integration_ << endl;
+ }
+ 
+ //------------------------------------------------------------------------------
+@@ -65,7 +66,8 @@
+                             tol) &&
+          equal_with_abs_tol(n_gravity, e->n_gravity, tol) &&
+          imuFactorErrorMode_ == e->imuFactorErrorMode_ &&
+-         useMidpointIntegration_ == e->useMidpointIntegration_;
++         useMidpointIntegration_ == e->useMidpointIntegration_ &&
++         useOrbSlam3Integration_ == e->useOrbSlam3Integration_;
+ }
+ 
+ }  // namespace gtsam
+diff --git a/gtsam/navigation/navigation.i b/gtsam/navigation/navigation.i
+--- a/gtsam/navigation/navigation.i
++++ b/gtsam/navigation/navigation.i
+@@ -223,6 +223,8 @@
+   gtsam::ImuFactorErrorMode getImuFactorErrorMode() const;
+   void setUseMidpointIntegration(bool enabled);
+   bool getUseMidpointIntegration() const;
++  void setUseOrbSlam3Integration(bool enabled);
++  bool getUseOrbSlam3Integration() const;
+ 
+   // enabling serialization functionality
+   void serialize() const;
+diff --git a/gtsam/navigation/TangentPreintegration.h b/gtsam/navigation/TangentPreintegration.h
+--- a/gtsam/navigation/TangentPreintegration.h
++++ b/gtsam/navigation/TangentPreintegration.h
+@@ -108,6 +108,16 @@
+       const Vector9& preintegrated, OptionalJacobian<9, 9> A = {},
+       OptionalJacobian<9, 3> B = {}, OptionalJacobian<9, 3> C = {});
+ 
++  /**
++   * Integrate interval-averaged measurements with start-attitude acceleration
++   * and exact rotation composition, as in ORB-SLAM3. Return derivatives with
++   * respect to the previous vector, acceleration, and angular velocity.
++   */
++  static Vector9 UpdatePreintegratedOrbSlam3(
++      const Vector3& a_body, const Vector3& w_body, double dt,
++      const Vector9& preintegrated, OptionalJacobian<9, 9> A = {},
++      OptionalJacobian<9, 3> B = {}, OptionalJacobian<9, 3> C = {});
++
+   /// Update preintegrated measurements and get derivatives
+   /// It takes measured quantities in the j frame
+   /// Modifies preintegrated quantities in place after correcting for bias and possibly sensor pose
+diff --git a/gtsam/navigation/TangentPreintegration.cpp b/gtsam/navigation/TangentPreintegration.cpp
+--- a/gtsam/navigation/TangentPreintegration.cpp
++++ b/gtsam/navigation/TangentPreintegration.cpp
+@@ -158,6 +158,48 @@
+ }
+ 
+ //------------------------------------------------------------------------------
++Vector9 TangentPreintegration::UpdatePreintegratedOrbSlam3(
++    const Vector3& a_body, const Vector3& w_body, double dt,
++    const Vector9& preintegrated, OptionalJacobian<9, 9> A,
++    OptionalJacobian<9, 3> B, OptionalJacobian<9, 3> C) {
++  Matrix3 rotation_H_theta, increment_H_omega, log_H_rotation;
++  const Rot3 rotation = Rot3::Expmap(preintegrated.head<3>(), rotation_H_theta);
++  const Rot3 increment = Rot3::Expmap(w_body * dt, increment_H_omega);
++  const Vector3 nextTheta = Rot3::Logmap(rotation * increment, log_H_rotation);
++  const Matrix3 startRotation = rotation.matrix();
++  const Vector3 acceleration = startRotation * a_body;
++  const double halfDtSquared = 0.5 * dt * dt;
++
++  Vector9 result;
++  result << nextTheta,
++      preintegrated.segment<3>(3) + preintegrated.tail<3>() * dt +
++          acceleration * halfDtSquared,
++      preintegrated.tail<3>() + acceleration * dt;
++  if (A) {
++    const Matrix3 acceleration_H_theta =
++        -rotation.matrix() * skewSymmetric(a_body) * rotation_H_theta;
++    A->setIdentity();
++    A->block<3, 3>(0, 0) =
++        log_H_rotation * increment.matrix().transpose() * rotation_H_theta;
++    A->block<3, 3>(3, 0) = acceleration_H_theta * halfDtSquared;
++    A->block<3, 3>(3, 6) = I_3x3 * dt;
++    A->block<3, 3>(6, 0) = acceleration_H_theta * dt;
++  }
++  if (B) {
++    B->topRows<3>().setZero();
++    B->middleRows<3>(3) = startRotation * halfDtSquared;
++    B->bottomRows<3>() = startRotation * dt;
++  }
++  if (C) {
++    const Matrix3 acceleration_H_omega = Matrix3::Zero();
++    C->topRows<3>() = log_H_rotation * increment_H_omega * dt;
++    C->middleRows<3>(3) = acceleration_H_omega * halfDtSquared;
++    C->bottomRows<3>() = acceleration_H_omega * dt;
++  }
++  return result;
++}
++
++//------------------------------------------------------------------------------
+ void TangentPreintegration::update(const Vector3& measuredAcc,
+     const Vector3& measuredOmega, const double dt, Matrix9* A, Matrix93* B,
+     Matrix93* C) {
+@@ -175,9 +217,13 @@
+ 
+   // Do update
+   deltaTij_ += dt;
+-  preintegrated_ = p().getUseMidpointIntegration()
+-      ? UpdatePreintegratedMidpoint(acc, omega, dt, preintegrated_, A, B, C)
+-      : UpdatePreintegrated(acc, omega, dt, preintegrated_, A, B, C);
++  if (p().getUseOrbSlam3Integration()) {
++    preintegrated_ = UpdatePreintegratedOrbSlam3(acc, omega, dt, preintegrated_, A, B, C);
++  } else if (p().getUseMidpointIntegration()) {
++    preintegrated_ = UpdatePreintegratedMidpoint(acc, omega, dt, preintegrated_, A, B, C);
++  } else {
++    preintegrated_ = UpdatePreintegrated(acc, omega, dt, preintegrated_, A, B, C);
++  }
+ 
+   if (p().body_P_sensor) {
+     // More complicated derivatives in case of non-trivial sensor pose
+diff --git a/gtsam/navigation/tests/testTangentPreintegration.cpp b/gtsam/navigation/tests/testTangentPreintegration.cpp
+--- a/gtsam/navigation/tests/testTangentPreintegration.cpp
++++ b/gtsam/navigation/tests/testTangentPreintegration.cpp
+@@ -197,6 +197,55 @@
+ }  // namespace midpoint_integration
+ 
+ /* ************************************************************************* */
++namespace orb_slam3_integration {
++
++Vector9 step(const Vector9& state, const Vector3& acceleration,
++             const Vector3& angularVelocity) {
++  return TangentPreintegration::UpdatePreintegratedOrbSlam3(
++      acceleration, angularVelocity, kDt, state);
++}
++
++// Checks the start-attitude transition and its zero direct gyro-to-translation terms.
++TEST(TangentPreintegration, OrbSlam3UpdateJacobians) {
++  const Vector3 acceleration{0.3, -0.4, 9.7}, angularVelocity{0.7, -0.5, 0.9};
++  const Vector9 state{0.3, -0.2, 0.4, 1., 2., 3., -0.1, 0.2, -0.3};
++  Matrix9 A;
++  Matrix93 B, C;
++  const Vector9 result = TangentPreintegration::UpdatePreintegratedOrbSlam3(
++      acceleration, angularVelocity, kDt, state, A, B, C);
++  EXPECT(assert_equal(numericalDerivative31(step, state, acceleration, angularVelocity), A, 1e-8));
++  EXPECT(assert_equal(numericalDerivative32(step, state, acceleration, angularVelocity), B, 1e-8));
++  EXPECT(assert_equal(numericalDerivative33(step, state, acceleration, angularVelocity), C, 1e-8));
++  const Rot3 rotation = Rot3::Expmap(state.head<3>());
++  const Vector3 rotated = rotation.rotate(acceleration);
++  const Vector3 expectedVelocity = state.tail<3>() + rotated * kDt;
++  const Vector3 actualVelocity = result.tail<3>();
++  EXPECT(assert_equal(expectedVelocity, actualVelocity, 1e-12));
++  EXPECT(C.bottomRows<3>().norm() == 0.);
++}
++
++// Checks accumulated accelerometer and gyro bias derivatives after many steps.
++TEST(TangentPreintegration, OrbSlam3BiasJacobians) {
++  auto params = testing::Params();
++  params->setUseOrbSlam3Integration(true);
++  testing::SomeMeasurements measurements;
++  auto integrate = [&](const Vector3& accelerationBias, const Vector3& gyroBias) {
++    TangentPreintegration pim(params, Bias(accelerationBias, gyroBias));
++    testing::integrateMeasurements(measurements, &pim);
++    return pim.preintegrated();
++  };
++  TangentPreintegration pim(params);
++  testing::integrateMeasurements(measurements, &pim);
++  const Vector3 zero = Vector3::Zero();
++  EXPECT(assert_equal(numericalDerivative21<Vector9, Vector3, Vector3>(integrate, zero, zero),
++                      pim.preintegrated_H_biasAcc(), 1e-7));
++  EXPECT(assert_equal(numericalDerivative22<Vector9, Vector3, Vector3>(integrate, zero, zero),
++                      pim.preintegrated_H_biasOmega(), 1e-7));
++}
++
++}  // namespace orb_slam3_integration
++
++/* ************************************************************************* */
+ int main() {
+   TestResult tr;
+   return TestRegistry::runAllTests(tr);

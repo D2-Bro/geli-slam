@@ -174,30 +174,6 @@ def pointcloud2mesh(pointcloud, C):
     return mesh
 
 
-def matrix_in_mm(T_m):
-    """
-    Matrix in meters to matrix in millimeters.
-
-    :param T_m: np.ndarray (4, 4); Matrix in meters.
-    :return: np.ndarray (4, 4); Matrix in millimeters.
-    """
-    T_mm = T_m.copy()
-    T_mm[:3, 3] *= 1000
-    return T_mm
-
-
-def matrix_in_m(T_mm):
-    """
-    Matrix in millimeters to matrix in meters.
-
-    :param T_mm: np.ndarray (4, 4); Matrix in millimeters.
-    :return: np.ndarray (4, 4); Matrix in meters.
-    """
-    T_m = T_mm.copy()
-    T_m[:3, 3] /= 1000
-    return T_m
-
-
 def laplacian2gray(L):
     """
     Get the gray image from the laplacian map.

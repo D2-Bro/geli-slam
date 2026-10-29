@@ -638,12 +638,6 @@ def _keyframe(x, new, group):
     )
 
 
-def _graph():
-    return PoseGraph({"gelslam_config": {"pose_graph_config": {
-        "loop_closure_only_optimization": True,
-    }}})
-
-
 def test_pose_graph_keeps_aligned_anchor_during_solve_and_reload(tmp_path):
     rotation = rotation_aligning_gravity_to_negative_z([1., -3., 9.])
     keyframes = [backend_frame(0, new=True), backend_frame(1)]
@@ -659,49 +653,27 @@ def test_pose_graph_keeps_aligned_anchor_during_solve_and_reload(tmp_path):
     loaded = PoseGraph.load(tmp_path)
     loaded.solve(global_optimization=True)
     assert np.allclose(loaded.poses, graph.poses, atol=1e-8)
-    assert np.allclose(loaded.prior_poses[0], keyframes[0].trial_T_curr)
+    assert np.allclose(loaded.loop_pgo.anchor_poses[0], keyframes[0].trial_T_curr)
 
 def test_navigation_graph_separate_loop_pgo_merge_and_reload(tmp_path):
     graph = PoseGraph(backend_config())
     keyframes = [backend_frame(0, new=True), backend_frame(1),
                  backend_frame(2, new=True, group=1), backend_frame(3, group=1)]
     graph.add_keyframes(keyframes, 0, 4)
-    assert graph.factor_kinds.count('imu') == 2
-    assert graph.factor_kinds.count('gelsight') == 2
+    assert graph.temporal_links == [(0, 1), (2, 3)]
     assert all(edge[2] is None for edge in graph.edges)
     assert graph._add_loop_pair(1, 3, np.eye(4))
     graph.remove_prior_factors([1])
-    solution = graph.solve(global_optimization=True)
-    assert graph.prior_keys == [0, 2]
+    graph.solve(global_optimization=True)
     assert graph.loop_pgo.removed_groups == {1}
     graph.save(tmp_path)
     loaded = PoseGraph.load(tmp_path)
     assert np.allclose(loaded.poses, graph.poses)
-    assert loaded.prior_keys == [0, 2]
     assert loaded.loop_pgo.removed_groups == {1}
-    assert len(loaded.edges) == 3
+    assert len(loaded.edges) == 1
     keyframes.append(backend_frame(4, group=1))
     loaded.add_keyframes(keyframes, 4, 5)
     assert loaded.states[4].timestamp == pytest.approx(1.4)
-
-def test_pose_graph_loop_only_and_local_window_modes():
-    graph = PoseGraph(backend_config(loop_closure_only_optimization=True))
-    keyframes = [backend_frame(0, new=True), backend_frame(1, z=.002), backend_frame(2)]
-    graph.add_keyframes(keyframes, 0, 3)
-    assert np.isclose(graph.solve()[1][2, 3], .002)
-    graph.pose_graph_config['loop_closure_only_optimization'] = False
-    result = graph.solve()
-    assert abs(result[1][2, 3]) < 1e-6
-
-def test_tactile_noise_uses_explicit_normal_and_height_settings():
-    from gelslam.core.backend_factors import TactilePair
-    first, second = backend_frame(), backend_frame(1)
-    pair = TactilePair(first, second, np.eye(4), np.eye(4), np.eye(4),
-                       {'tactile_normal_sigma': .2, 'tactile_height_sigma_m': .0003})
-    assert pair.normal_sigma == .2 and pair.height_sigma == .0003
-    with pytest.raises(ValueError, match='tactile sigmas'):
-        TactilePair(first, second, np.eye(4), np.eye(4), np.eye(4),
-                    {'tactile_height_sigma_m': 0})
 
 def test_loop_registration_adds_relative_measurement_only_to_pgo(monkeypatch):
     import gelslam.core.gtsam_pose_graph as module
@@ -720,10 +692,10 @@ def test_loop_registration_adds_relative_measurement_only_to_pgo(monkeypatch):
     target_from_reference = np.eye(4)
     target_from_reference[0, 3] = -.002
     monkeypatch.setattr(module, 'normalflow', lambda *_a, **_k: target_from_reference)
-    graph.pose_graph_config.update(min_sift_inliers=8, scr_threshold=.3, ccs_threshold=.7)
+    graph.pose_graph_config.update(min_sift_inliers=8, scr_threshold=.3, ccs_threshold=.7,
+                                   loop_search_exclude_recent_keyframes=0)
     matched = graph.detect_and_add_loops(anchors, 1, SimpleNamespace(size=lambda: 0))
     assert matched == [0]
     assert graph.map_poses()[1][0, 3] == pytest.approx(.002)
     assert graph.poses[1][0, 3] == 0.  # The local trial frame did not move.
     assert graph.edges[-1][2][0, 3] == pytest.approx(.002)
-    assert graph.factor_kinds.count('gelsight') == 0

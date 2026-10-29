@@ -28,7 +28,7 @@ from scipy.spatial.transform import Rotation
 
 from gelslam.core import gtsam_vi as gv
 from gelslam.core import numpy_vi as nv
-from gelslam.core.inertial import ImuBuffer, ImuSample, InertialPropagator, InertialState
+from gelslam.core.inertial import ImuBuffer, ImuSample
 
 SEED = 20261013
 GRAVITY = np.array([0., 0., -9.80665])

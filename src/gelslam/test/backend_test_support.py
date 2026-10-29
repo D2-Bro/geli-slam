@@ -10,9 +10,7 @@ def config(**overrides):
         'gyroscope_noise_density': .002, 'accelerometer_bias_random_walk': .0002,
         'gyroscope_bias_random_walk': .00002,
     }, 'gelslam_config': {'pose_graph_config': {
-        'local_window_optimization': True, 'local_window_size': 3,
-        'marginalization_enabled': True, 'max_iterations': 10,
-        'tactile_max_samples': 100, **overrides,
+        'max_iterations': 10, **overrides,
     }}}
 
 
@@ -34,3 +32,19 @@ def frame(index=0, z=0., new=False, group=0, height_m=0., tactile=True):
         imu_samples=tuple(ImuSample(float(t), [0., 0., 9.81], [0., 0., 0.])
                           for t in np.linspace(time - .1, time, 11)),
     )
+
+
+def loop_records(poses, gravities=None, groups=None):
+    """Navigation seeds and measured IMU for standalone global graph tests."""
+    gravities = [np.array([0., 0., -9.81])] * len(poses) if gravities is None else gravities
+    groups = [0] * len(poses) if groups is None else groups
+    records = []
+    for key, (pose, gravity, group) in enumerate(zip(poses, gravities, groups)):
+        time = 1. + .1*key
+        acceleration = np.asarray(pose)[:3, :3].T @ -np.asarray(gravity)
+        records.append(SimpleNamespace(new_trial_flag=key == 0 or groups[key-1] != group,
+            trial_group=group, gravity=np.asarray(gravity), tactile_valid=True,
+            navigation_state=NavigationState(time, np.asarray(pose).copy(), np.zeros(3), np.zeros(3), np.zeros(3)),
+            imu_samples=tuple(ImuSample(float(t), acceleration, [0., 0., 0.])
+                              for t in np.linspace(time-.1, time, 11))))
+    return records

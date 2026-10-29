@@ -46,16 +46,14 @@ def solve(visual, pose, **config):
 
 
 @pytest.mark.parametrize('fixed_previous', [False, True])
-@pytest.mark.parametrize('fixed_bias', [False, True])
-def test_cached_reference_direction_is_unused_from_first_iteration(fixed_previous, fixed_bias):
+def test_cached_reference_direction_is_unused_from_first_iteration(fixed_previous):
     image = frame()
     pose = np.eye(4)
     pose[0, 3] = .001
     visual = DenseNormalResidual(image, image, 1., np.eye(4), pose, 1500)
     # The cached reference derivative now points uphill for the actual image.
     visual.candidate_normal_jacobian *= -1
-    solver, result = solve(visual, pose, frontend_fix_previous_state=fixed_previous,
-                           frontend_fix_bias=fixed_bias)
+    solver, result = solve(visual, pose, frontend_fix_previous_state=fixed_previous)
     first, = solver.last_optimization_trace
     assert first['iteration'] == 0
     assert first['update_rule'] == 'full_gauss_newton'
@@ -64,9 +62,6 @@ def test_cached_reference_direction_is_unused_from_first_iteration(fixed_previou
     assert first['normal_jacobian_source'] == 'target_normal_map'
     assert first['accepted_cost'] < first['base_cost'] * .001
     assert abs(result.pose[0, 3]) < 1e-5
-    if fixed_bias:
-        assert np.array_equal(result.accel_bias, np.zeros(3))
-        assert np.array_equal(result.gyro_bias, np.zeros(3))
     if not fixed_previous:
         assert solver.pending_marginal_prior is not None
 

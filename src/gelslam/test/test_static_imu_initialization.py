@@ -133,25 +133,59 @@ def fixed_config(start=1.0, end=2.0, **options):
         enabled=True, mode="fixed_time", start_time_s=start, end_time_s=end, **options))
 
 
-@pytest.mark.parametrize('contact_time', [2., 2.1])
-def test_fixed_bias_overrides_static_bias_estimates(contact_time):
-    settings = fixed_config()
-    accel_bias = np.array([.003, -.002, .004])
-    gyro_bias = np.array([.0002, -.0001, .00015])
-    settings.update(frontend_fix_bias=True,
-                    initial_accel_bias_mps2=accel_bias.tolist(),
-                    initial_gyro_bias_rps=gyro_bias.tolist())
-    detector, buffer, extrinsic = initializer(settings)
-    # A radial acceleration offset and nonzero mean gyro must not replace config.
-    samples = stationary_samples(end=contact_time + .005,
-        acceleration=accel_bias + [0., 0., 9.85], gyro=gyro_bias + [.001, -.002, .003])
-    feed(detector, buffer, samples)
-    seed = predict(detector, buffer, extrinsic, contact_time)
+def startup_config(duration=1.0, **options):
+    return config(static_initialization=dict(
+        enabled=True, mode="startup_duration", duration_s=duration, **options))
+
+
+@pytest.mark.parametrize("duration", [None, False, 0, -1, np.nan, np.inf])
+def test_startup_duration_requires_positive_finite_seconds(duration):
+    with pytest.raises(ValueError, match="duration_s"):
+        initializer(startup_config(duration))
+
+
+@pytest.mark.parametrize("options", [
+    {"mode": "fixed_time", "start_time_s": 1., "end_time_s": 2., "duration_s": 1.},
+    {"mode": "stationary_detection", "duration_s": 1.},
+    {"mode": "startup_duration", "duration_s": 1., "start_time_s": 1., "end_time_s": 2.},
+])
+def test_startup_duration_cannot_mix_relative_and_absolute_settings(options):
+    with pytest.raises(ValueError, match="require"):
+        initializer(config(static_initialization=dict(enabled=True, **options)))
+
+
+@pytest.mark.parametrize("start", [0., 41., 1792046893.])
+def test_startup_duration_uses_first_imu_time_and_freezes_before_approach(monkeypatch, start):
+    detector, buffer, extrinsic = initializer(startup_config())
+    monkeypatch.setattr(detector, "_statistics", lambda _: pytest.fail("stationary test must not run"))
+    detector.observe(())
+    rest = [ImuSample(start + i * .005, [0, 0, 9.81], [0, 0, 0]) for i in range(201)]
+    feed(detector, buffer, rest[:101])
+    assert detector.stationary is None
+    feed(detector, buffer, rest[101:])
+    assert detector.stationary[0] == start + 1.
+    feed(detector, buffer, [ImuSample(start + i * .005, [0.2, 0, 9.81], [0, 0, 0])
+                            for i in range(201, 302)])
+    seed = predict(detector, buffer, extrinsic, start + 1.5)
     assert seed is not None
-    assert np.array_equal(seed.state.accel_bias, accel_bias)
-    assert np.array_equal(seed.state.gyro_bias, gyro_bias)
-    assert np.array_equal(seed.prior.A[:, 9:], np.zeros_like(seed.prior.A[:, 9:]))
-    assert np.linalg.norm(seed.prior.A[:, :9]) > 0
+    assert seed.stationary_timestamp == start + 1.
+    assert seed.state.velocity[0] == pytest.approx(.0995, abs=1e-6)
+    np.testing.assert_allclose(detector.stationary[1], [0, 0, 9.81], rtol=0, atol=1e-12)
+
+
+def test_startup_duration_does_not_shift_start_when_initial_measurements_are_missing():
+    detector, _, _ = initializer(startup_config())
+    detector.observe(stationary_samples(start=1.1, end=2.1), stream_start_time=1.)
+    assert detector.stationary is None
+    assert "no start coverage" in detector.status
+
+
+def test_real_far_preset_uses_first_five_imu_seconds():
+    cfg = yaml.safe_load((Path(__file__).parents[1] / "config" / "real_far_config.yaml").read_text())
+    _, settings, _ = resolve_static_imu_config(cfg["imu_config"], np.array(cfg["imu_config"]["gelsight_T_imu"]))
+    assert settings["enabled"]
+    assert settings["mode"] == "startup_duration" and settings["duration_s"] == 5.
+    assert settings["start_time_s"] is None and settings["end_time_s"] is None
 
 
 @pytest.mark.parametrize("options,match", [
@@ -586,6 +620,41 @@ def test_fixed_clock_offset_handoff_and_timeout_do_not_reset_interval(monkeypatc
     assert "no later rest window" in tracker._static_imu_initializer.status
 
 
+def test_startup_duration_uses_accepted_imu_origin_before_first_image(monkeypatch):
+    tracker, _, _ = make_tracker(monkeypatch)
+    tracker.imu_config, tracker._static_imu_settings, _ = resolve_static_imu_config(startup_config(), np.eye(4))
+    tracker._static_imu_initializer = StaticImuInitializer(tracker._static_imu_settings, tracker.imu_config)
+    for sample in stationary_samples(end=2.1):
+        assert tracker.add_imu_sample(sample)
+    assert not tracker.add_imu_sample(ImuSample(.5, [0, 0, 9.81], [0, 0, 0]))
+    assert tracker._imu_stream_start_time == 1.
+    tracker.timestamp_source = "recorded_source"
+    tracker.image_to_imu_time_offset_s = .025
+    h = header(100.)
+    tracker.set_recorded_image_timestamp(h, 1.475)
+    tracker._observe_static_imu(h)
+    assert tracker._static_imu_initializer.stationary is None  # Future IMU must not complete the interval.
+    tracker.set_recorded_image_timestamp(h, 1.975)
+    tracker._observe_static_imu(h)
+    assert tracker._static_imu_initializer.stationary[0] == 2.
+    assert tracker._prepare_static_trial(h)
+    assert tracker._static_trial_seed.state.timestamp == 2.
+    # The same startup interval remains fixed after its propagation deadline.
+    tracker.set_recorded_image_timestamp(h, 7.975)
+    tracker._observe_static_imu(h)
+    assert tracker._static_imu_initializer.stationary[0] == 2.
+    assert not tracker._prepare_static_trial(h)
+    assert "no later rest window" in tracker._static_imu_initializer.status
+    # A later disconnected trial must not treat its first image as a new origin.
+    tracker._static_imu_collecting = False
+    for sample in stationary_samples(start=8., end=9.1):
+        tracker.add_imu_sample(sample)
+    tracker.set_recorded_image_timestamp(h, 8.975)
+    tracker._observe_static_imu(h)
+    assert not tracker._prepare_static_trial(h)
+    assert "no start coverage" in tracker._static_imu_initializer.status
+
+
 def test_timed_out_approach_can_recover_after_new_no_contact_rest(monkeypatch):
     tracker, _, _ = make_tracker(monkeypatch)
     for sample in stationary_samples():
@@ -629,3 +698,136 @@ def test_image_time_offset_and_no_future_stationary_evidence(monkeypatch):
     valid, _ = tracker.track(image, later)
     assert valid
     assert np.isclose(tracker._frontend_vi_state.timestamp, 2.0)
+
+
+def event_config(**options):
+    return config(static_initialization=dict(enabled=True, mode="recorded_rest_event", **options))
+
+
+REST = {"recorded_rest_started": 1.0, "recorded_rest_completed": 2.0, "trial_ready": 2.2}
+
+
+def segment(start, end, acceleration=(0, 0, 9.81), gyro=(0, 0, 0)):
+    return [ImuSample(round(float(t), 9), acceleration, gyro)
+            for t in np.arange(start, end - 0.0025, 0.005)]
+
+
+@pytest.mark.parametrize("cfg,match", [
+    (config(static_initialization=dict(enabled=True, mode="fixed_time", start_time_s=1.,
+                                       end_time_s=2., motion_check=True)), "motion_check requires"),
+    (event_config(motion_check=1), "motion_check must be a boolean"),
+    (event_config(motion_check=True, motion_pre_peak_margin_s=0), "motion_pre_peak_margin_s"),
+    (event_config(events_topic=""), "events_topic"),
+    (dict(event_config(), timestamp_source="recorded_source"), "timestamp_source: header"),
+])
+def test_recorded_rest_event_config_guards(cfg, match):
+    with pytest.raises(ValueError, match=match):
+        resolve_static_imu_config(cfg, np.eye(4))
+
+
+def test_recorded_rest_event_waits_for_events_and_propagates_from_go():
+    detector, buffer, extrinsic = initializer(event_config())
+    samples = segment(0.5, 2.6) + segment(2.6, 3.005, acceleration=(0.2, 0, 9.81))
+    for sample in samples:
+        buffer.add(sample)
+    detector.observe(buffer.samples_between(0., 3.0), rest_events={"trial_ready": 2.2})
+    assert detector.stationary is None and "recorded_rest_started" in detector.status
+    detector.observe(buffer.samples_between(0., 3.0), rest_events=dict(REST, trial_ready=1.5))
+    assert detector.stationary is None and "not ordered" in detector.status
+    detector.observe(buffer.samples_between(0., 3.0), rest_events=REST)
+    assert detector.stationary[0] == 2.2 and "GO=2.2" in detector.status
+    np.testing.assert_allclose(detector.stationary[1], [0, 0, 9.81], atol=1e-12)
+    seed = predict(detector, buffer, extrinsic, 3.0)
+    assert seed.stationary_timestamp == 2.2
+    # Zero velocity at GO; the first motion pair contributes half a step.
+    assert seed.state.velocity[0] == pytest.approx(.1 * .005 + .2 * .4, abs=1e-9)
+
+
+def test_recorded_rest_event_excludes_samples_outside_the_rest_interval():
+    detector, buffer, _ = initializer(event_config())
+    samples = (segment(0.5, 1.0, acceleration=(1, 0, 9.81)) + segment(1.0, 2.005)
+               + segment(2.005, 2.3, acceleration=(1, 0, 9.81)))
+    for sample in samples:
+        buffer.add(sample)
+    detector.observe(buffer.samples_between(0., 2.3), rest_events=REST)
+    # Interpolated endpoints include half of each neighbouring sample's offset.
+    assert abs(detector.stationary[1][0]) < 1. * .005 / 1.0 + 1e-9
+
+
+# After the peak at 2.6: the 2.595/2.6 pair averages .15 m/s^2, then .25 m/s^2.
+MOTION_VELOCITY = .15 * .005 + .25 * .4
+
+
+@pytest.mark.parametrize("motion_check,anchor,velocity", [
+    (False, 2.2, .05 * .395 + MOTION_VELOCITY),  # Sub-threshold offset integrates from GO.
+    (True, 2.5, .05 * .095 + MOTION_VELOCITY),   # Zero velocity restated 0.1 s before the peak.
+])
+def test_motion_check_restates_zero_velocity_before_first_peak(motion_check, anchor, velocity):
+    detector, buffer, extrinsic = initializer(event_config(motion_check=motion_check))
+    samples = (segment(0.5, 2.2) + segment(2.2, 2.6, acceleration=(0.05, 0, 9.81))
+               + segment(2.6, 3.005, acceleration=(0.25, 0, 9.81)))
+    for sample in samples:
+        buffer.add(sample)
+    detector.observe(buffer.samples_between(0., 3.0), rest_events=REST)
+    seed = predict(detector, buffer, extrinsic, 3.0)
+    assert seed.stationary_timestamp == pytest.approx(anchor, abs=1e-9)
+    assert seed.state.velocity[0] == pytest.approx(velocity, abs=1e-9)
+    assert ("pre-motion" in detector.status) == motion_check
+
+
+def test_motion_check_carries_go_attitude_through_slow_rotation(monkeypatch):
+    rate = np.array([0.008, 0, 0])  # Below the 0.01 rad/s peak threshold.
+    detector, buffer, extrinsic = initializer(event_config(motion_check=True))
+    samples = (segment(0.5, 2.2) + segment(2.2, 2.6, gyro=rate)
+               + segment(2.6, 3.005, gyro=(0, 0.5, 0)))
+    for sample in samples:
+        buffer.add(sample)
+    detector.observe(buffer.samples_between(0., 3.0), rest_events=REST)
+    starts = []
+    original = initialization_module.preintegrate_imu
+
+    def capture_start(samples, previous, *args):
+        starts.append(previous.copy())
+        return original(samples, previous, *args)
+
+    monkeypatch.setattr(initialization_module, "preintegrate_imu", capture_start)
+    seed = predict(detector, buffer, extrinsic, 3.0)
+    assert seed.stationary_timestamp == pytest.approx(2.5)
+    go, zero_velocity = starts
+    assert go.timestamp == 2.2 and zero_velocity.timestamp == pytest.approx(2.5)
+    # The pre-peak attitude includes 0.3 s of slow rotation; velocity is reset.
+    np.testing.assert_allclose(zero_velocity.pose[:3, :3], go.pose[:3, :3] @ so3_exp(rate * .3), atol=1e-9)
+    np.testing.assert_array_equal(zero_velocity.velocity, np.zeros(3))
+
+
+def test_motion_check_without_peak_keeps_go_and_timeout_uses_moved_anchor():
+    detector, buffer, extrinsic = initializer(event_config(motion_check=True, max_propagation_s=1.0))
+    samples = segment(0.5, 4.0) + segment(4.0, 4.505, acceleration=(0.3, 0, 9.81))
+    for sample in samples:
+        buffer.add(sample)
+    detector.observe(buffer.samples_between(0., 4.5), rest_events=REST)
+    assert predict(detector, buffer, extrinsic, 3.0).stationary_timestamp == 2.2
+    # GO is 2.3 s old, but the zero-velocity anchor 3.9 is within 1.0 s.
+    seed = predict(detector, buffer, extrinsic, 4.5)
+    assert seed.stationary_timestamp == pytest.approx(3.9)
+
+
+def test_tracker_forwards_rest_events_and_restart_clears_sequence(monkeypatch):
+    tracker, _, _ = make_tracker(monkeypatch)
+    tracker.imu_config, tracker._static_imu_settings, _ = resolve_static_imu_config(event_config(), np.eye(4))
+    tracker._static_imu_initializer = StaticImuInitializer(tracker._static_imu_settings, tracker.imu_config)
+    for sample in segment(0.5, 2.5):
+        tracker.add_imu_sample(sample)
+    tracker.add_rest_event("trial_ready", 9.0)
+    tracker.add_rest_event("recorded_rest_started", 1.0)
+    assert tracker._recorded_rest_events == {"recorded_rest_started": 1.0}
+    tracker.add_rest_event("recorded_rest_completed", 2.0)
+    tracker._observe_static_imu(header(2.2))
+    assert tracker._static_imu_initializer.stationary is None
+    tracker.add_rest_event("trial_ready", 2.2)
+    tracker._observe_static_imu(header(2.4))
+    assert tracker._static_imu_initializer.stationary[0] == 2.2
+    assert tracker._prepare_static_trial(header(2.4))
+    assert tracker._static_trial_seed.stationary_timestamp == 2.2
+    with pytest.raises(ValueError):
+        tracker.add_rest_event("trial_ready", np.nan)

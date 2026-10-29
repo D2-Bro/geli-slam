@@ -99,18 +99,15 @@ def test_dense_information_prior_has_zero_anchor_gradient_and_preserves_reframe_
     assert transformed.error(transformed.anchor) == pytest.approx(0., abs=1e-25)
 
 
-@pytest.mark.parametrize('fixed_bias', [False, True])
-def test_tracker_load_converts_legacy_rhs_and_drops_uncommitted_prior(tmp_path, monkeypatch, fixed_bias):
+def test_tracker_load_converts_legacy_rhs_and_drops_uncommitted_prior(tmp_path, monkeypatch):
     tracker = object.__new__(Tracker)
     tracker.bg_image = np.zeros((2, 2, 3))
     tracker.curr_kid = -1
     tracker.imu_config = {}
-    solver = GtsamVisualInertialSolver({'frontend_fix_bias': fixed_bias})
+    solver = GtsamVisualInertialSolver({})
     tracker.frontend_visual_inertial = solver
     rng = np.random.default_rng(99)
     rows = rng.normal(size=(20, 15))
-    if fixed_bias:
-        rows[:, 9:] = 0.
     solver.marginal_prior = NavigationPrior(state(), rows, np.ones(20))
     solver.pending_marginal_prior = NavigationPrior.initial(state(), np.ones(15))
     with (tmp_path / 'tracker.pkl').open('wb') as file:
@@ -124,5 +121,3 @@ def test_tracker_load_converts_legacy_rhs_and_drops_uncommitted_prior(tmp_path, 
     assert prior.error(prior.anchor) == 0.
     assert np.array_equal(prior.rhs, np.zeros(15))
     assert restored.frontend_visual_inertial.pending_marginal_prior is None
-    if fixed_bias:
-        assert np.array_equal(prior.A[:, 9:], np.zeros((15, 6)))

@@ -9,12 +9,19 @@ adapter; none of the standard launches starts it.
 ## Data flow and ownership
 
 - Tracking owns reconstruction, the frontend prior, initialization and IMU buffers.
-  Image callbacks are mutually exclusive. The ROS executor can ingest IMU separately.
+  Image callbacks and the IMU-ready guard share one mutually exclusive group.
+  When IMU is enabled, tracking waits until the latest accepted IMU timestamp
+  reaches the image's selected IMU time. One pending image is retained; a newer
+  image replaces it. Accepted IMU callbacks trigger the guard in the image group,
+  without tracking or blocking in the IMU group. The ROS executor can continue
+  receiving IMU while an image waits or a ready image is being tracked.
+  The experimental single-process adapter enqueues guard wakeups to its tracking
+  worker, which retains sole ownership of image and tracker mutations.
 - Reliable `keyframe` messages carry immutable surface observations, a full-precision
   navigation seed, the complete previous-keyframe IMU interval, tracking session ID,
   original trial ID and the anchor basis used to initialize the seed.
 - Backend ROS callbacks enqueue keyframes. One backend worker owns decoding, feature
-  search, mutable databases, local VI, separate loop PGO, groups and coverage.
+  search, mutable databases, loop PGO, groups and coverage.
   Queue draining preserves accepted keyframes when an optimization takes a long time.
 - The backend returns only poses, velocities and biases on `backend_feedback`, with
   session, epoch, solution revision and per-keyframe revisions. Surface maps are not
@@ -28,7 +35,7 @@ atomic solution versions used by the LocalMapping service. It is not shared memo
 between ROS processes. Snapshot and feedback callbacks do not run an optimizer.
 
 All standard launches accept `backend_feedback:=false`. It disables backend
-feedback publication and the tracker feedback subscription. Backend local VI,
+feedback publication and the tracker feedback subscription. Backend
 loop PGO, map/mesh output and final backend evaluation continue. The backend
 records the effective flag and the number of published feedback messages in
 its process diagnostics. The bag launch defaults this flag to `backend`; both
@@ -39,19 +46,28 @@ live launches default it to true.
 Let K_k be a corrected keyframe in the active original tracking trial, F_i the last
 accepted image and F_j the image now being processed.
 
+A pure gravity-preserving frame correction transports F_i's pose, world velocity and full marginal
+prior together. F_i keeps its timestamp and sensor-frame biases. The saved last
+tactile pose follows the same correction. This special case needs no older
+K_k-to-F_j IMU history. Global 15D corrections that change velocity, either bias,
+or gravity attitude use the fixed-keyframe path below.
+
+Navigation feedback uses this fixed-keyframe path:
+
 1. At the start of F_j, tracking reads one immutable feedback snapshot.
 2. A correction requires the complete retained raw IMU interval t_k to t_j.
    Missing endpoints or a gap above the configured bound defer the correction.
 3. The accepted F_i pose follows the corrected reference K_k while preserving
-   its previously accepted K_k-to-F_i relative pose. This update does not
-   propagate F_i with IMU. F_i retains its timestamp, velocity and biases.
+   its previously accepted K_k-to-F_i relative pose. F_i's world velocity follows
+   the same correction rotation. This update does not propagate F_i with IMU.
+   F_i retains its timestamp and sensor-frame biases.
 4. The corrected K_k pose, velocity and biases initialize the IMU prediction for F_j.
    A fixed-anchor solve uses direct tactile rows, IMU and bias factors. It omits the
    stale marginal prior from F_i.
 5. Only an accepted F_j posterior replaces the frontend prior. A rejected target
    retains its correction anchor. Following accepted images resume the usual prior path.
 6. Each incoming keyframe seed is converted from its transmitted tracking anchor
-   basis into the corresponding local VI anchor basis. This also handles a seed
+   basis into the corresponding stored backend anchor basis. This also handles a seed
    captured before a backend correction and multiple queued keyframes in one batch.
    This changes initialization and adds no measurement factor.
 
@@ -63,69 +79,11 @@ counter measures reception-to-application time in the tracking process.
 ## Preserved estimator behavior
 
 - Each backend keyframe retains pose, velocity and both biases: 15 dimensions.
-- Each observed keyframe pair has one `gelsight` factor. It stacks the normal
-  residual rows and one mean-height row, followed by separate native 9D IMU and
-  6D bias random-walk factors and initialization priors. Only temporal neighbors
-  have tactile factors. Relative-pose measurement factors remain absent from local VI.
-- The local window, marginalization and iteration settings remain in YAML.
-- Local VI runs only when the incoming batch adds at least one tactile factor.
-  IMU recovery keyframes and bias random-walk factors are still appended. Their
-  seeds are published without solving or advancing the marginalization window.
-  The first valid contact after an invalid tactile endpoint also adds no tactile
-  factor. A later tactile pair resumes local VI, including recovery states still
-  inside the window. Initialization-only batches retain their supplied seeds.
-  Accepted loop events run the separate 4DoF PGO even without a new tactile factor;
-  loop-only events do not run local VI. Mixed batches run both when required.
-- With `marginalization_enabled: false`, the temporal predecessor immediately
-  before the window has its complete 15D navigation state fixed. This requires
-  an actual IMU link into the window. Trial-start anchors inside the window and
-  any other outside observation endpoints have only their poses fixed; their
-  velocities and biases remain free. Fixed increment columns are removed from
-  sparse QR, so fixed values stay exact.
-  The crossing 9D IMU factor uses 0.01 times its native information matrix and
-  block Huber loss with delta `sqrt(16.92)`, following ORB-SLAM3. It is cloned
-  when constructing the local window. Stored factors, preintegration data,
-  interior IMU factors and all bias random-walk factors keep their original
-  information. Window advances do not accumulate the information scaling.
-  Existing observations and initialization priors among included states stay
-  in the graph when they constrain free variables. Outside selection does not
-  recursively expand through older temporal links. A full window normally has
-  `local_window_size` states plus its outside context. For example, K50..K59
-  fixes all 15 components of temporal predecessor K49; an inside trial-start
-  anchor K53 fixes only its pose. A loop event retains these boundary choices
-  and runs separate 4DoF PGO.
-- With `marginalization_enabled: true`, the existing Schur window prior remains
-  available. It retains the information matrix and uses a zero-gradient anchor.
-- Normal and height share one callback and projection. Their sigmas remain
-  independent. Normal rows use mean squared error without Huber loss; no
-  robust weight is applied to either residual block or the combined vector.
-- Residual-only evaluation skips pose Jacobians.
-  Both backend maps use origin's `wide_remap` /
-  `cv2.remap(INTER_LINEAR)`, with float32 maps and pixel coordinates. Contact
-  selection uses `INTER_NEAREST` and origin's image bounds. The normal/height
-  maps are not converted to full-image float64. Target-map image gradients and
-  neighboring-pixel float64 gathers are not needed for linearization.
-- Backend normal geometry now uses the same reference-map IC basis and
-  right-local chart mapping as `DenseNormalResidual.evaluate_ic()`. Its 5D
-  cached reference basis is embedded in 6D with a zero reference-Z column.
-  The shared mapping helper is used by the frontend and backend. Active rows
-  and chart mapping update with the current endpoint poses.
-- The backend mean-height residual is still resampled at each pose, but its
-  linear model holds rotation, XY and correspondences fixed and uses only
-  target GelSight body-local Z, exactly as the frontend's height row. With
-  `T = inverse(target) * reference`, `J_target = [0,0,0,0,0,1]` and
-  `J_reference = -J_target * Ad(T)` before sigma/extrinsic mapping. This
-  reference transport preserves the common rigid-motion nullspace. It can
-  contain reference rotation/XY entries; the IMU extrinsic also introduces
-  lever-arm rotation entries. Z-only describes the relative target-GelSight
-  model, not a world-Z constraint or zeros in every IMU Jacobian column.
-  The row stays in the same GelSight factor, independently weighted from the
-  normal rows. Splitting it out gives the same linear least-squares system.
-- IC and conditional-Z rows are approximations to the full resampled cost.
-  OpenCV sampling and independent sigmas remain unchanged. Backend normal
-  rows use ordinary least squares in every iteration. The frontend retains its
-  configured initial Huber phase. The backend still uses LM; it does not inherit
-  the frontend's undamped GN update or iteration-dependent Huber schedule.
+  These states are the tracking keyframe seeds. The backend has no local VI
+  window, no direct normal/height keyframe factor and no marginalization.
+- Keyframe batches without an accepted loop run no optimizer. Their seeds are
+  published with the last global pose, velocity and bias corrections.
+  Accepted loop events run the separate global 15D PGO.
 - Native midpoint IMU integration, fixed-anchor frontend feedback and bounded raw IMU
   retention remain enabled according to the existing configuration.
 - `backend:=false` in the bag launch disables optimization and frontend feedback and
@@ -134,48 +92,52 @@ counter measures reception-to-application time in the tracking process.
 
 ## Separate loop correction
 
-`LoopPoseGraph` contains world yaw and XYZ variables for each GelSight keyframe.
-Local VI first solves its configured window only if the batch adds a tactile
-factor. PGO then uses relative poses between
-temporal local VI neighbors and fixed `reference_T_target` loop measurements.
-Loop search supplies `target_T_reference`; PGO stores its inverse. SIFT inliers
-and normalflow SCR/CCS still validate registration before insertion.
+Global PGO has an IMU Pose3 (6), world velocity (3), accelerometer bias (3) and
+gyroscope bias (3) at every keyframe. It uses the existing split-pose retraction
+and sparse QR/LM solver. Roll and pitch are variables alongside yaw and XYZ.
+The pose of each remaining component root is fixed exactly for the gauge.
+Root velocity and bias priors remain soft observations, including at merged roots.
 
-The 4DoF PGO follows ORB-SLAM3's world-frame yaw/XYZ updates, with the existing
-temporal odometry/registered-loop edge structure. It uses
-rotation sigma 0.01 rad and translation sigma 0.0001 m for both edge types.
-Origin's translation sigma is 0.1 mm. This implementation uses metres throughout
-and retains the backend's split relative-pose errors and sparse QR/LM optimizer.
-All six measurement residuals remain in each edge; each endpoint Jacobian has
-only four columns. A remaining trial root has all four increments fixed exactly.
-The update is `R_map = Exp(up * yaw) R_base`, with independent world XYZ.
-`up` comes from the recorded gravity, so this also works in tilted world axes.
-Local gravity directions from disconnected trials are aligned to the first
-trial's map gravity. Subsequent corrections, including component alignment at
-loop insertion, contain only gravity-axis yaw and translation. Registration tilt
-errors cannot change the local VI gravity attitude.
+An accepted loop triggers a global 15D solve over all retained keyframes.
+Temporal edges contain native 9D IMU preintegration plus 6D bias random walk.
+They use raw keyframe IMU intervals, configured integration/noise and map gravity.
+Missing endpoints or gaps above the configured bound reject the solve.
 
-Let `L_k` be the local VI GelSight pose at keyframe K_k. Let `P_k` be the loop PGO
-solution. The saved correction is `C_k = P_k inverse(L_k)`. Map publication uses
-`C_k L_k`. The IMU pose and world velocity use the same correction and rotation;
-sensor-frame biases keep their local VI values. Tracking-trial feedback removes
-the original backend group's root map transform. A new temporal keyframe inherits
-its predecessor's correction until the next PGO. A new disconnected trial starts
-with identity map correction when its gravity axes already match the map. Other
-gravity axes receive a fixed gravity alignment, followed by yaw/XYZ corrections.
+Contact-valid temporal targets also retain a 6D relative-pose odometry observation
+from the frontend keyframe seeds. This is a fused pose observation,
+not an additional raw tactile factor. Incoming IMU-only recovery pairs omit
+pose odometry and keep only IMU/bias factors. Global PGO never re-evaluates normal
+or height maps. Registered loops are fixed 6D GelSight relative poses, with
+rotation sigma 0.01 rad and translation sigma 0.0001 m. The calibrated mounting
+maps their pose Jacobians to the IMU states. Loop search still uses SIFT and
+NormalFlow SCR/CCS, supplies target_T_reference, and PGO stores its inverse.
 
-PGO never changes local navigation states, gravity, initialization factors or the
-local marginal prior. Trial merging removes only the redundant PGO gauge anchor;
-each independent local VI trial retains its original pose/velocity/bias priors.
-Local-only solves retain the last PGO corrections. They do not optimize loop edges.
-Snapshot format v3 stores local states, fixed loop measurements and map corrections.
-New loop snapshots also record four optimization degrees of freedom. Historical
-6D corrections remain viewable; the next PGO projects their initialization into
-the gravity-preserving subspace before solving the retained measurements.
-Old v2 direct-loop snapshots require replay because their registered relative
-measurements were not saved. Old v2 snapshots without loops remain loadable.
+The global pose correction is C_k = P_k inverse(L_k). Map publication uses C_k L_k.
+Velocity additionally receives the solved offset from R(C_k) v_local, and sensor
+biases receive their solved additive offsets. The map-state API and ROS feedback
+publish those optimized 15D values. A newly appended temporal keyframe inherits
+all three corrections until the next loop solve. A new trial starts with its
+recorded gravity aligned to the first trial's map gravity. Disconnected component
+alignment may use full rotation and translation; the global IMU factors constrain
+the subsequent navigation solution.
+Conversion back to a tracking trial removes only its gravity-preserving frame
+gauge. Estimated roll/pitch changes remain in the returned navigation state;
+they are not canceled by using the optimized root pose as a frame transform.
+
+Global optimization does not change the stored keyframe seeds. Trial merging
+removes redundant global pose gauges while retaining initial velocity/bias
+observations. Snapshot format v4 stores the pose, velocity
+and bias offsets plus navigation anchor priors. Existing v3 pose-correction
+snapshots retain their poses, initialize navigation offsets to zero, and run a
+full 15D solve when the next loop requests it. Old v2 snapshots with direct loops
+still require replay because their registered relative measurements were not saved.
 
 ## Shutdown and diagnostics
+
+Each completed global solve logs 15D per keyframe, the optimized state dimension,
+and the initial/final cost. backend_process_summary.json records both
+loop_pgo_degrees_of_freedom and loop_pgo_optimized_state_dimension. The latter
+is zero if no global solve ran during that session.
 
 After the final image callback, tracking waits for keyframe/frame-pose DDS delivery
 and publishes a session end marker containing its last keyframe ID. On shutdown,

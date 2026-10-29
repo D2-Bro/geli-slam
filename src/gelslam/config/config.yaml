@@ -11,6 +11,8 @@ device_config:
   raw_imgh: 2464
   raw_imgw: 3280
   framerate: 25
+  # Process-wide Torch CPU intra-op threads for surface reconstruction.
+  torch_num_threads: 4
   # ROS topic for the tactile image stream. The live streamer publishes "image".
   image_topic: "image"
   # Path to calibration model (absolute, or relative to this config file)
@@ -20,6 +22,8 @@ device_config:
 # Enable subscription and buffering of calibrated IMU measurements. IMU-only
 # coasting activates only after gelsight_T_imu is calibrated and supplied.
 imu_config:
+  # Reject discontinuous IMU intervals before contact optimization or recovery.
+  max_sample_gap_s: 0.05
   # Requires GT IMU PoseStamped input and calibrated frontend VI.
   frontend_gt_previous_state_test:
     enabled: false
@@ -76,8 +80,18 @@ imu_config:
   # Use a local normal-flow + native GTSAM IMU solve for each tracked frame.
   # It activates only after gelsight_T_imu is populated.
   frontend_optimization: true
+  # pairwise: fixed visual reference, 15D retained navigation prior (legacy).
+  # reference_marginalization: variable reference + 15D state, 21D retained/36D solve.
+  # First contact pose is fixed: 9D initialization, 24D bootstrap solve, 15D retained.
+  # After reference replacement: 15D retained/30D shared-pose solve. Backend map only.
+  frontend_state_mode: "pairwise"
+  # Shared native preintegration: midpoint only (half-step attitude). It averages
+  # adjacent accel/gyro samples and composes rotations.
+  # Covers VI prediction, recovery, no-contact coast and backend IMU factors.
+  integration_method: "midpoint"
   # Set false to start each contact-frame solve from the previous VI state.
   # IMU preintegration still supplies the IMU factor in the solve.
+  # With true, initial shared points < 10 retries once from the previous State.
   frontend_initialize_from_imu_preintegration: true
   # Use the IMU-predicted State directly. Skip optimization and marginal prior.
   # Skip SCR/CCS too; retain each valid IMU prediction for the next frame.
@@ -87,9 +101,6 @@ imu_config:
   # Fix the previous pose/velocity/bias and optimize only the target state.
   # When true, bypass joint marginalization and its carried prior.
   frontend_fix_previous_state: false
-  # Hold both biases at initial_accel_bias_mps2 / initial_gyro_bias_rps.
-  # Bias variables are excluded; pose/velocity optimization stays enabled.
-  frontend_fix_bias: false
   # Joint previous/target state solve. Marginalize the previous 15D state.
   # The tracker commits the target prior only after its contact quality gate.
   gtsam_vi_marginalization: true
@@ -103,23 +114,22 @@ imu_config:
   frontend_gravity_initialization: "fixed_world_z"
   topic: "/imu/data"
   frame_id: "ebimu_link"
-  gelsight_frame_id: "gelsight"
   # Add this value to each image timestamp before IMU integration. Positive
   # means that the matching IMU state occurs later on the IMU clock.
   image_to_imu_time_offset_s: 0.0
   # IMU-only motion is a short bridge, not an unbounded pose source.
   max_coast_duration_s: 1.0
+  # Optional prediction-only velocity fit from recent accepted contact poses.
+  # Requires sufficient continuous contact history; otherwise retain VI velocity.
+  coast_velocity_fit:
+    enabled: false
+    model: "inertial_quadratic"
   gravity_mps2: 9.81
-  # ROS sensor_msgs/Imu defines angular_velocity in rad/s.  Set ``deg_s``
-  # only for a non-conforming publisher; conversion happens at ingestion.
+  # ROS sensor_msgs/Imu defines angular_velocity in rad/s; only rad_s is accepted.
   gyro_input_unit: "rad_s"
   # Reject a converted sample above this norm instead of integrating a likely
   # degree/radian mismatch. Set null only after validating the sensor range.
   gyro_max_rate_rad_s: 5.0
-  # Keep gyro-propagated attitude after initialization.  Replacing it with a
-  # noisy tactile normal-flow rotation can leave an uncompensated gravity term
-  # during no-contact propagation.  ``hard_reset`` keeps the legacy behavior.
-  tactile_attitude_correction: "gyro_propagated"
   buffer_max_samples: 6000
   # Noise density / bias random walk in SI units. Replace these conservative
   # defaults with the calibrated values from the IMU data sheet or Allan plot.
@@ -140,16 +150,24 @@ contact_mask_config:
 gelslam_config:
   # Configuration of how GelSLAM tracks
   track_config:
+    # Retain each rejected contact image as an IMU-predicted Frame for evaluation.
+    # Requires a valid initialized VI state and continuous IMU coverage to the image.
+    # Does not accept the prediction or add optimization keyframes. Default: false.
+    keep_imu_only_frames: false
     # Write/publish normal RGB, contact cloud and correspondence debug images.
     # false skips their construction; tracking and frame/keyframe output continue.
     debug_visualization_enabled: true
     # Promote a valid contact frame after this image-time gap. 0 disables it.
     keyframe_max_interval_s: 0.5
+    # Continuous-contact quality rejections: recover from IMU after this image-time gap.
+    # Recontact or missing correspondences use valid IMU immediately, without this wait.
+    contact_failure_keyframe_interval_s: 0.5
     # Sample at most 30 normal-flow pairs in the RViz Image panel.
     # This limit affects only the display. Set 0 to show all pairs.
     correspondence_max_lines: 30
     # DDS queue depth for device_config.image_topic. Keep 1 for lowest latency; increase only
     # when diagnosing dropped frames or accepting queued-frame latency.
+    # IMU synchronization also keeps only the latest image waiting for IMU.
     image_queue_size: 1
     contact_threshold: 500
     scr_threshold: 0.3
@@ -158,24 +176,18 @@ gelslam_config:
   pose_graph_config:
     # 15D states: IMU pose, world velocity, accelerometer and gyroscope biases.
     # Local VI uses tactile/IMU observations; tracker poses only initialize it.
-    # Separate 4DoF loop PGO: gravity-axis yaw + world XYZ; local VI tilt fixed.
+    # Separate global 15D PGO: full pose, world velocity and both IMU biases.
+    # Raw IMU/bias factors connect all temporal pairs; recovery pairs omit pose odometry.
     # Odometry/registered-loop residuals remain 6D, with the sigmas below.
     # Same relative-pose sigmas as gelslam-origin, converted from mm to metres.
     loop_pgo_rotation_sigma_rad: 0.01
     loop_pgo_translation_sigma_m: 0.0001
-    # false: skip backend local VI factors/solve; PGO uses frontend seed odometry.
-    # Frontend VI and no-contact IMU propagation keep their imu_config settings.
-    local_vi_enabled: true
-    loop_closure_only_optimization: false
-    local_window_optimization: true
-    local_window_size: 10
-    # false: fix the temporal predecessor's 15D state; inside anchors pose-only.
-    # Crossing IMU: information x0.01 + Huber(sqrt(16.92)); bias RW unchanged.
-    marginalization_enabled: true
-    # Direct normal-map and mean-height observations between contact keyframes.
-    tactile_max_samples: 500
-    tactile_normal_sigma: 1.0
-    tactile_height_sigma_m: 0.0001
+    # Minimum data-time gap between loop-search targets; 0 searches every KF.
+    # Skipped targets remain available as references. Not wall-clock throttling.
+    loop_search_min_interval_s: 0.0
+    # Exclude the previous N keyframes from loop candidates, across trial boundaries.
+    # K_t skips K_(t-1)..K_(t-N); 0 disables this candidate exclusion.
+    loop_search_exclude_recent_keyframes: 5
     # IMU/bias noise densities use imu_config; reject uncovered/gapped intervals.
     imu_max_sample_gap_s: 0.05
     initial_velocity_sigma_mps: 0.1

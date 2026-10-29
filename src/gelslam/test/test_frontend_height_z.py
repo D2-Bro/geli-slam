@@ -96,8 +96,7 @@ def test_height_linearization_maps_conditional_gel_z_to_offset_imu():
 
 
 @pytest.mark.parametrize('fixed_previous', [False, True])
-@pytest.mark.parametrize('fixed_bias', [False, True])
-def test_enabled_height_changes_target_z_and_is_recomputed(fixed_previous, fixed_bias, monkeypatch):
+def test_enabled_height_changes_target_z_and_is_recomputed(fixed_previous, monkeypatch):
     visual = visual_pair(.0002)
     seen = []
     evaluate = visual.target_z_height_correction
@@ -108,8 +107,7 @@ def test_enabled_height_changes_target_z_and_is_recomputed(fixed_previous, fixed
         return error
 
     monkeypatch.setattr(visual, 'target_z_height_correction', observe)
-    solver, result = solve(visual, frontend_fix_previous_state=fixed_previous,
-                           frontend_fix_bias=fixed_bias)
+    solver, result = solve(visual, frontend_fix_previous_state=fixed_previous)
     assert result is not None
     assert np.isclose(result.pose[2, 3], -.0002, atol=1e-7)
     assert np.allclose(result.pose[:2, 3], 0., atol=1e-9)
@@ -133,15 +131,13 @@ def test_enabled_height_changes_target_z_and_is_recomputed(fixed_previous, fixed
         assert solver.marginal_prior.matches(result)
 
 
-@pytest.mark.parametrize('fixed_bias', [False, True])
-def test_height_information_is_retained_once_without_pixel_count_scaling(fixed_bias):
+def test_height_information_is_retained_once_without_pixel_count_scaling():
     expected = np.zeros((15, 15))
     expected[5, 5] = 1e8
     for sample_count in (100, 400):
-        off, state_off = solve(visual_pair(samples=sample_count), gtsam_vi_height_z_enabled=False,
-                               frontend_fix_bias=fixed_bias)
+        off, state_off = solve(visual_pair(samples=sample_count), gtsam_vi_height_z_enabled=False)
         before = off.pending_marginal_prior.A.T @ off.pending_marginal_prior.A
-        on, state_on = solve(visual_pair(samples=sample_count), frontend_fix_bias=fixed_bias)
+        on, state_on = solve(visual_pair(samples=sample_count))
         assert np.allclose(state_on.pose, state_off.pose, atol=1e-12)
         after = on.pending_marginal_prior.A.T @ on.pending_marginal_prior.A
         assert np.allclose(after - before, expected, atol=1e-5, rtol=1e-8)

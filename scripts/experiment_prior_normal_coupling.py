@@ -10,7 +10,6 @@ import hashlib
 import json
 from pathlib import Path
 import sys
-import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import experiment_imu_objective_and_drift as exp

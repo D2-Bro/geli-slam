@@ -20,7 +20,8 @@ venv/
 # Downloaded data, local checkpoints and generated reconstruction results
 /data/
 /ckpt/
-/diagnostics/
+/diagnostics/*
+!/diagnostics/COLCON_IGNORE
 /output/
 gelslam_online/
 gelslam_offline/
@@ -50,11 +51,6 @@ gelslam_offline/
 .env
 .env.*
 !.env.example
-
-# Accidental pip output from unquoted version constraints
-/1.11.0
-/=1.11.0
-/=2.4.2
 
 # Editor and operating system files
 .vscode/

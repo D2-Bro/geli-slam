@@ -1,6 +1,5 @@
 """Motion/bias independence, random-walk noise, and active solver checks."""
 
-import gtsam
 import numpy as np
 import pytest
 

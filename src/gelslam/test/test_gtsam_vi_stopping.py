@@ -68,10 +68,9 @@ def force_step(monkeypatch, column=None, value=.1):
 
 
 @pytest.mark.parametrize('fixed_previous', [False, True])
-@pytest.mark.parametrize('fixed_bias', [False, True])
-def test_stationary_solve_can_converge_only_after_seven_steps(fixed_previous, fixed_bias):
+def test_stationary_solve_can_converge_only_after_seven_steps(fixed_previous):
     solver = gv.GtsamVisualInertialSolver({
-        'frontend_fix_previous_state': fixed_previous, 'frontend_fix_bias': fixed_bias})
+        'frontend_fix_previous_state': fixed_previous})
     result = solver.refine_current(FlatVisual(), np.eye(4), state(0.), state(.1),
                                    samples(), np.eye(4))
     assert result is not None

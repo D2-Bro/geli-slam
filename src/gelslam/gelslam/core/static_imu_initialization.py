@@ -12,7 +12,7 @@ import gtsam
 import numpy as np
 
 from gelslam.core.gtsam_vi import (
-    _bias, _bias_factor, _imu_factor, configured_fixed_bias,
+    _bias, _bias_factor, _imu_factor,
     navigation_factor_terms, preintegrate_imu,
 )
 from gelslam.core.marginal_prior import NavigationPrior, marginalize_rows_system
@@ -26,6 +26,7 @@ DEFAULTS = {
     "mode": "stationary_detection",
     "start_time_s": None,
     "end_time_s": None,
+    "duration_s": None,
     "window_s": 1.0,
     "min_samples": 50,
     "accel_std_threshold_mps2": 0.05,
@@ -36,6 +37,21 @@ DEFAULTS = {
     "max_sample_gap_s": 0.05,
     "max_propagation_s": 5.0,
     "velocity_sigma_mps": 0.01,
+    "gyro_bias_uncertainty_from_samples": False,
+    # recorded_rest_event: average [recorded_rest_started, recorded_rest_completed]
+    # and start propagation at trial_ready (GO) with zero velocity.
+    "events_topic": "/geli/events",
+    # Optional post-GO check: move the zero-velocity anchor before the first
+    # sample that departs from the rest means by either threshold.
+    "motion_check": False,
+    "motion_accel_threshold_mps2": 0.15,
+    "motion_gyro_threshold_rps": 0.01,
+    "motion_pre_peak_margin_s": 0.1,
+}
+
+REST_EVENTS = ("recorded_rest_started", "recorded_rest_completed", "trial_ready")
+MOTION_CHECK_OPTIONS = {
+    "motion_accel_threshold_mps2", "motion_gyro_threshold_rps", "motion_pre_peak_margin_s",
 }
 
 
@@ -58,9 +74,21 @@ def resolve_static_imu_config(config, gelsight_T_imu):
     if unknown:
         raise ValueError("unknown static_initialization settings: " + ", ".join(sorted(unknown)))
     settings = dict(DEFAULTS, **supplied)
+    if not isinstance(settings['gyro_bias_uncertainty_from_samples'], bool):
+        raise ValueError('static_initialization.gyro_bias_uncertainty_from_samples must be a boolean')
     mode = settings["mode"]
-    if mode not in {"stationary_detection", "fixed_time"}:
-        raise ValueError("static_initialization.mode must be 'stationary_detection' or 'fixed_time'")
+    if mode not in {"stationary_detection", "fixed_time", "startup_duration", "recorded_rest_event"}:
+        raise ValueError("static_initialization.mode must be 'stationary_detection', 'fixed_time', "
+                         "'startup_duration' or 'recorded_rest_event'")
+    if not isinstance(settings["motion_check"], bool):
+        raise ValueError("static_initialization.motion_check must be a boolean")
+    if settings["motion_check"] and mode != "recorded_rest_event":
+        raise ValueError("static_initialization.motion_check requires mode: recorded_rest_event")
+    if not isinstance(settings["events_topic"], str) or not settings["events_topic"]:
+        raise ValueError("static_initialization.events_topic must be a non-empty string")
+    if mode == "recorded_rest_event" and config.get("timestamp_source", "header") != "header":
+        # Event times are host receipt wall times; only header IMU stamps share that clock.
+        raise ValueError("static_initialization mode recorded_rest_event requires timestamp_source: header")
     if mode == "fixed_time":
         for name in ("start_time_s", "end_time_s"):
             value = settings[name]
@@ -72,14 +100,24 @@ def resolve_static_imu_config(config, gelsight_T_imu):
             raise ValueError("static_initialization.end_time_s must be after start_time_s")
     elif any(settings[name] is not None for name in ("start_time_s", "end_time_s")):
         raise ValueError("static_initialization start_time_s/end_time_s require mode: fixed_time")
+    if mode == "startup_duration":
+        value = settings["duration_s"]
+        if (value is None or isinstance(value, bool)
+                or not np.isfinite(float(value)) or float(value) <= 0):
+            raise ValueError("static_initialization.duration_s must be positive and finite")
+        settings["duration_s"] = float(value)
+    elif settings["duration_s"] is not None:
+        raise ValueError("static_initialization.duration_s requires mode: startup_duration")
     detection_options = {
         "window_s", "accel_std_threshold_mps2", "gyro_std_threshold_rps",
         "gyro_mean_threshold_rps", "accel_mean_change_threshold_mps2",
         "gravity_norm_tolerance_mps2",
     }
     for name, value in settings.items():
-        if (name in {"enabled", "mode", "start_time_s", "end_time_s", "min_samples"}
-                or (mode == "fixed_time" and name in detection_options)):
+        if (name in {"enabled", "mode", "start_time_s", "end_time_s", "duration_s", "min_samples",
+                     "gyro_bias_uncertainty_from_samples", "events_topic", "motion_check"}
+                or (mode != "stationary_detection" and name in detection_options)
+                or (not settings["motion_check"] and name in MOTION_CHECK_OPTIONS)):
             continue
         if isinstance(value, bool) or not np.isfinite(float(value)) or float(value) <= 0:
             raise ValueError("static_initialization.%s must be positive and finite" % name)
@@ -139,7 +177,8 @@ class StaticTrialSeed:
 
 
 class StaticImuInitializer:
-    """Initialize from a fixed absolute interval or two stationary windows.
+    """Initialize from a startup duration, absolute interval, recorded rest
+    events or stationary windows.
 
     Called only by the serialized image path. IMU data come from buffer snapshots
     bounded by the image's synchronized timestamp, never from future callbacks.
@@ -152,16 +191,37 @@ class StaticImuInitializer:
         self.samples = deque()
         self.last_timestamp = -np.inf
         self.stationary = None
+        self.stationary_gyro_sigma_rps = None
         self.reference_accel = None
         self.reference_gyro = None
         self.motion_detected = False
         self._fixed_interval_complete = False
+        self._fixed_start_time = settings["start_time_s"]
+        self._fixed_end_time = settings["end_time_s"]
         self.status = (
             "waiting for fixed absolute IMU interval %.9f -> %.9f"
             % (settings["start_time_s"], settings["end_time_s"])
             if settings["mode"] == "fixed_time"
             else "waiting for a stationary no-contact IMU window"
         )
+        if settings["mode"] == "startup_duration":
+            self.status = "waiting for the first %.3f s of IMU measurements" % settings["duration_s"]
+        self._go_time = None
+        if settings["mode"] == "recorded_rest_event":
+            self.status = "waiting for %s events on %s" % ("/".join(REST_EVENTS), settings["events_topic"])
+
+    def _resolve_rest_events(self, rest_events):
+        """Fix the averaging interval and GO time once all rest events exist."""
+        missing = [name for name in REST_EVENTS if name not in (rest_events or {})]
+        if missing:
+            self.status = "waiting for rest events: " + ", ".join(missing)
+            return False
+        start, end, go = (float(rest_events[name]) for name in REST_EVENTS)
+        if not (np.isfinite([start, end, go]).all() and start < end <= go):
+            self.status = "recorded rest events are not ordered started < completed <= trial_ready"
+            return False
+        self._fixed_start_time, self._fixed_end_time, self._go_time = start, end, go
+        return True
 
     @staticmethod
     def _statistics(samples):
@@ -171,9 +231,40 @@ class StaticImuInitializer:
                 np.sqrt(np.sum(np.var(accel, axis=0, ddof=1))),
                 np.sqrt(np.sum(np.var(gyro, axis=0, ddof=1))))
 
-    def observe(self, samples):
-        """Select the older stationary window, before detected motion starts."""
-        if self.settings["mode"] == "fixed_time":
+    def _set_stationary_anchor(self, samples, mean_accel, mean_gyro):
+        self.stationary = (samples[-1].timestamp, mean_accel, mean_gyro)
+        self.stationary_gyro_sigma_rps = None
+        if not self.settings.get('gyro_bias_uncertainty_from_samples', False):
+            return
+        times = np.array([sample.timestamp for sample in samples])
+        dt = np.diff(times)
+        if len(times) < 2 or np.any(dt <= 0.) or not np.isfinite(dt).all():
+            raise ValueError('stationary gyro uncertainty requires increasing sample times')
+        # Arithmetic measurement mean at the last stationary timestamp.
+        # Each sample has white variance sigma_w^2 / dt_i. The first uses
+        # the first observed period. Bias increments are independent, with
+        # variance sigma_wb^2 * dt_i and endpoint-minus-mean weight i/N.
+        count = len(times)
+        periods = np.r_[dt[0], dt]
+        white = float(self.config.get('gyroscope_noise_density', .002))**2 * np.sum(1./periods) / count**2
+        walk = float(self.config.get('gyroscope_bias_random_walk', .00002))**2 * np.sum(dt*(np.arange(1,count)/count)**2)
+        self.stationary_gyro_sigma_rps = float(np.sqrt(white+walk))
+
+    def observe(self, samples, *, stream_start_time=None, rest_events=None):
+        """Collect a fixed startup interval or select a past stationary window."""
+        if (self.settings["mode"] == "recorded_rest_event" and self._go_time is None
+                and not self._resolve_rest_events(rest_events)):
+            # Keep samples unconsumed; the caller resends them from its collection start.
+            return
+        if self.settings["mode"] == "startup_duration" and self._fixed_start_time is None:
+            samples = tuple(samples)
+            if stream_start_time is None:
+                if not samples:
+                    return
+                stream_start_time = samples[0].timestamp
+            self._fixed_start_time = stream_start_time
+            self._fixed_end_time = stream_start_time + self.settings["duration_s"]
+        if self.settings["mode"] != "stationary_detection":
             self._observe_fixed_interval(samples)
             return
         if self.motion_detected:
@@ -223,7 +314,7 @@ class StaticImuInitializer:
 
             if not is_stationary(old_stats):
                 continue
-            self.stationary = (older[-1].timestamp, old_stats[0], old_stats[1])
+            self._set_stationary_anchor(older, old_stats[0], old_stats[1])
             if self.reference_accel is None:
                 self.reference_accel = old_stats[0].copy()
                 self.reference_gyro = old_stats[1].copy()
@@ -234,7 +325,7 @@ class StaticImuInitializer:
                 return
 
     def _observe_fixed_interval(self, samples):
-        """Average only the configured absolute interval; do not detect rest.
+        """Average only the resolved fixed interval; do not detect rest.
 
         Keep one sample before the start and one after the end for interpolation.
         Once the end is covered, neither the interval nor its mean can change.
@@ -242,7 +333,7 @@ class StaticImuInitializer:
         """
         if self._fixed_interval_complete:
             return
-        start, end = self.settings["start_time_s"], self.settings["end_time_s"]
+        start, end = self._fixed_start_time, self._fixed_end_time
         capacity = int(self.config.get("buffer_max_samples", 6000))
         for sample in samples:
             if sample.timestamp <= self.last_timestamp:
@@ -258,7 +349,7 @@ class StaticImuInitializer:
             self._fixed_interval_complete = True
             raw = tuple(self.samples)
             if raw[0].timestamp > start:
-                self.status = "fixed IMU interval has no start coverage; replay from before start_time_s"
+                self.status = "fixed IMU interval has no start coverage; replay from before the interval start"
                 return
             if max(np.diff([item.timestamp for item in raw]), default=0.0) > self.settings["max_sample_gap_s"] + 1e-9:
                 self.status = "fixed IMU interval has an excessive raw sample gap"
@@ -273,8 +364,16 @@ class StaticImuInitializer:
             # No standard deviation, mean-change, gyro-rate, or gravity-norm gate.
             mean_accel = np.mean([item.acceleration for item in interval], axis=0)
             mean_gyro = np.mean([item.angular_velocity for item in interval], axis=0)
-            self.stationary = (end, mean_accel, mean_gyro)
-            self.status = "fixed absolute IMU interval ready: %.9f -> %.9f; samples=%d" % (start, end, len(interval))
+            self._set_stationary_anchor(interval, mean_accel, mean_gyro)
+            if self.settings["mode"] == "recorded_rest_event":
+                # Zero velocity holds from the end of rest to GO; propagate from GO.
+                self.stationary = (self._go_time, mean_accel, mean_gyro)
+                self.status = ("recorded rest interval ready: %.9f -> %.9f; GO=%.9f; samples=%d"
+                               % (start, end, self._go_time, len(interval)))
+            elif self.settings["mode"] == "startup_duration":
+                self.status = "startup IMU interval ready: first %.3f s; samples=%d" % (self.settings["duration_s"], len(interval))
+            else:
+                self.status = "fixed absolute IMU interval ready: %.9f -> %.9f; samples=%d" % (start, end, len(interval))
             return
 
     def predict_trial(self, buffer, timestamp, gelsight_T_imu, prior_sigmas):
@@ -282,11 +381,16 @@ class StaticImuInitializer:
         if self.stationary is None:
             return None
         anchor_time, mean_accel, mean_gyro = self.stationary
-        duration = timestamp - anchor_time
+        zero_velocity_time = anchor_time
+        if self.settings["motion_check"] and timestamp > anchor_time:
+            peak = self._first_motion_peak(buffer, anchor_time, timestamp, mean_accel, mean_gyro)
+            if peak is not None:
+                zero_velocity_time = max(anchor_time, peak - self.settings["motion_pre_peak_margin_s"])
+        duration = timestamp - zero_velocity_time
         if duration < 0 or duration > self.settings["max_propagation_s"]:
             self.status = (
                 "fixed IMU anchor exceeds max_propagation_s; no later rest window is substituted"
-                if self.settings["mode"] == "fixed_time" else
+                if self.settings["mode"] != "stationary_detection" else
                 "stationary anchor exceeds max_propagation_s; repeat no-contact rest"
             )
             return None
@@ -304,7 +408,6 @@ class StaticImuInitializer:
         if max(np.diff([item.timestamp for item in samples])) > self.settings["max_sample_gap_s"] + 1e-9:
             self.status = "IMU sample gap exceeds static_initialization.max_sample_gap_s"
             return None
-        fixed_bias = configured_fixed_bias(self.config)
         accel_bias = np.array(self.config.get("initial_accel_bias_mps2", (0, 0, 0)), dtype=float)
         force = mean_accel - accel_bias
         if np.linalg.norm(force) < 1e-9:
@@ -312,11 +415,9 @@ class StaticImuInitializer:
             return None
         direction = force / np.linalg.norm(force)
         gravity_magnitude = float(self.config.get("gravity_mps2", 9.81))
-        # Fixed configuration biases also take precedence over rest estimates.
-        if fixed_bias is None:
-            # Only the radial correction is identifiable from one static pose.
-            accel_bias += force - gravity_magnitude * direction
-        gyro_bias = mean_gyro.copy() if fixed_bias is None else fixed_bias[1].copy()
+        # Only the radial correction is identifiable from one static pose.
+        accel_bias += force - gravity_magnitude * direction
+        gyro_bias = mean_gyro.copy()
         gravity = np.array([0., 0., -gravity_magnitude])
         # At the stationary anchor, rotate measured IMU down into world -Z.
         # Start with the GelSight origin at zero and retain the IMU offset.
@@ -327,12 +428,21 @@ class StaticImuInitializer:
         )
         previous = NavigationState(anchor_time, initial_pose, np.zeros(3),
                                    accel_bias, gyro_bias)
+        if zero_velocity_time > anchor_time:
+            # No motion peak precedes this time: carry the GO attitude by
+            # integration, then restate zero velocity before the first peak.
+            pim = preintegrate_imu(buffer.samples_covering(anchor_time, zero_velocity_time),
+                                   previous, self.config, gelsight_T_imu, gravity)
+            moved = pim.predict(gtsam.NavState(gtsam.Pose3(previous.pose), previous.velocity), _bias(previous))
+            previous = NavigationState(zero_velocity_time, moved.pose().matrix(), np.zeros(3),
+                                       accel_bias, gyro_bias)
+            samples = buffer.samples_covering(zero_velocity_time, timestamp)
         sigmas = np.asarray(prior_sigmas).copy()
         sigmas[6:9] = self.settings["velocity_sigma_mps"]
+        if (self.settings.get('gyro_bias_uncertainty_from_samples', False)
+                and self.stationary_gyro_sigma_rps is not None):
+            sigmas[12:15] = self.stationary_gyro_sigma_rps
         initial_prior = NavigationPrior.initial(previous, sigmas)
-        state_width = 15 if fixed_bias is None else 9
-        if fixed_bias is not None:
-            initial_prior.A[:, 9:] = 0.0
         if duration == 0.0:
             state = previous.copy()
             information = initial_prior.A.T @ initial_prior.A
@@ -345,12 +455,10 @@ class StaticImuInitializer:
             factors = (_imu_factor(pim), _bias_factor(pim, self.config))
             rows = [navigation_factor_terms(factor, previous, state) for factor in factors]
             information = marginalize_rows_system(
-                np.vstack([initial_prior.A] + [row[0] for row in rows])[:, :state_width],
-                np.vstack([np.zeros((15, 15))] + [row[1] for row in rows])[:, :state_width],
+                np.vstack([initial_prior.A] + [row[0] for row in rows]),
+                np.vstack([np.zeros((15, 15))] + [row[1] for row in rows]),
                 np.concatenate([np.zeros(15)] + [row[2] for row in rows]),
             ).information
-            if fixed_bias is not None:
-                information = np.pad(information, ((0, 6), (0, 6)))
         # Preserve the first-contact heading convention without leaving the
         # gravity-aligned world. This coordinate rotation is about world Z only.
         contact_gel_pose = gelsight_pose(state.pose, gelsight_T_imu)
@@ -366,4 +474,17 @@ class StaticImuInitializer:
         state.pose[:3, 3] = contact_rotation @ gelsight_T_imu[:3, 3]
         prior.anchor = state.copy()
         self.status = "first-contact IMU state ready"
-        return StaticTrialSeed(state, gravity, prior, anchor_time)
+        if zero_velocity_time > anchor_time:
+            self.status += "; zero-velocity anchor moved from GO %.9f to pre-motion %.9f" % (
+                anchor_time, zero_velocity_time)
+        return StaticTrialSeed(state, gravity, prior, zero_velocity_time)
+
+    def _first_motion_peak(self, buffer, start, end, mean_accel, mean_gyro):
+        """Return the first raw sample time that departs from the rest means."""
+        for sample in buffer.samples_between(start, end):
+            if (np.linalg.norm(np.asarray(sample.acceleration) - mean_accel)
+                    > self.settings["motion_accel_threshold_mps2"]
+                    or np.linalg.norm(np.asarray(sample.angular_velocity) - mean_gyro)
+                    > self.settings["motion_gyro_threshold_rps"]):
+                return sample.timestamp
+        return None

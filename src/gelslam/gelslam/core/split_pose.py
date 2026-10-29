@@ -82,37 +82,6 @@ def split_between_factor(reference, target, measurement, noise, state_T_observat
     return gtsam.CustomFactor(noise, [reference, target], error)
 
 
-def split_linear_pose_factor(factor, values):
-    """Freeze a Gaussian marginal factor in separate rotation/position axes."""
-    linear = gtsam.JacobianFactor(factor)
-    keys = list(linear.keys())
-    A, rhs = linear.jacobian()
-    return split_pose_rows_factor(keys, A, rhs, values)
-
-
-def split_pose_rows_factor(keys, A, rhs, values):
-    """Freeze rows, including all pose cross terms, at the supplied poses."""
-    keys = list(keys)
-    A = np.array(A, dtype=np.float64, copy=True)
-    rhs = np.array(rhs, dtype=np.float64, copy=True)
-    anchors = [values.atPose3(key).matrix() for key in keys]
-
-    def error(_factor, current_values, jacobians):
-        coordinates = []
-        for index, (key, anchor) in enumerate(zip(keys, anchors)):
-            pose = current_values.atPose3(key).matrix()
-            coordinates.append(split_pose_coordinates(anchor, pose))
-            if jacobians is not None:
-                jacobians[index] = A[:, 6 * index:6 * (index + 1)] @ (
-                    split_pose_coordinate_jacobian(anchor, pose)
-                )
-        return A @ np.concatenate(coordinates) - rhs
-
-    return gtsam.CustomFactor(
-        gtsam.noiseModel.Isotropic.Sigma(len(rhs), 1.0), keys, error
-    )
-
-
 def solve_gaussian_qr(graph):
     """Use sparse sequential QR with the Python-exposed elimination function.
 

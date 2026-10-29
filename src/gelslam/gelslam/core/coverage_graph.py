@@ -202,7 +202,6 @@ class CoverageGraph:
         :param pose_graph_solutions: PoseGraphSolutions; Solved poses.
         """
         for new_kidx in new_member_kidxs:
-            new_keyframe = keyframedb[new_kidx]
             # Skip if the node is not active
             if not self.coverage_graph[new_kidx].is_active:
                 continue

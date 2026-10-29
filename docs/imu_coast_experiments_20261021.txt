@@ -1,0 +1,224 @@
+IMU 비접촉 전파 오차 실험 기록
+요청 시작: 2026-10-21 22:19:22 KST
+실험 종료 목표: 2026-10-22 00:19:22 KST
+기록 갱신: 2026-10-22 00:19:32 KST
+상태: 완료
+
+저장 기준과 비교하여 figure8 전용 설정의 위치·속도·자세 오차 RMSE가 모두 줄었다.
+새 로직은 선택 옵션으로 추가했다. 기존 공통 설정과 실제 센서 설정의 기본값은 꺼짐이다.
+최종 전용 설정은 정지 IMU 초기화, 초기 자이로 바이어스 공분산, 관측 가중치, 비접촉 진입 속도를 함께 조정한다.
+이 결과는 제공된 시뮬레이션 bag의 결과다. 실제 센서 보정 성능을 검증한 결과는 아니다.
+
+오프라인 재생은 181회다. 처리한 입력 이미지는 합계 205,338장이다. 발산 및 상태 미출력 조건도 포함한다.
+비교 범위는 프론트엔드 독립 재생이다. 입력 이미지는 1,501장이다.
+출력 상태는 1,411개다. 비접촉 예측 상태는 92개다.
+독립 재생의 출력 상태는 Tracker가 반환한 FrameMsg에 대응한다. 이 재생에서는 ROS 토픽 발행을 실행하지 않는다.
+별도의 ROS 실행 결과는 아래에서 구분한다.
+
+측정값                         저장 기준          최종 전용 설정       감소율
+전체 위치 RMSE               1.490387 mm        0.331167 mm       77.78%
+전체 속도 RMSE               3.039928 mm/s      0.600730 mm/s     80.24%
+전체 자세 RMSE               0.085444 deg       0.073602 deg      13.86%
+비접촉 위치 RMSE              2.220467 mm        0.637485 mm       71.29%
+비접촉 추가 변위 RMSE           1.620526 mm        0.445666 mm       72.50%
+비접촉 추가 변위 최대값: 5.386725 -> 1.447613 mm.
+전체 자세 최대값: 0.180350 -> 0.192709 deg.
+자세 RMSE는 줄었지만 자세 최대값은 조금 늘었다. 모든 시점의 오차가 동시에 줄어든 것은 아니다.
+
+위치는 GelSight 원점을 사용한다. 속도는 IMU 원점을 사용한다.
+각 trial의 첫 대응 IMU 자세에서 고정 SE(3) 변환 하나를 구한다. 이후 궤적과 속도를 이 변환으로 비교한다.
+전체 궤적에 대한 회전·이동·크기 맞춤은 사용하지 않는다.
+추가 변위 오차는 마지막 접촉 시각 이후의 변위 변화량 오차다. 접촉 시각에 이미 있던 위치 오차는 제외한다.
+
+코드 저장 기록
+baseline_code.tar.gz에 Git 추적 파일과 무시되지 않은 새 파일 240개를 저장했다.
+압축 파일 내부의 각 파일을 읽어 SHA-256을 대조했다. baseline_manifest.json에 결과를 저장했다.
+baseline_auxiliary.tar.gz에는 로컬 진단 도구도 저장했다. Git HEAD와 변경 패치도 별도로 저장했다.
+최종 코드는 final_code.tar.gz에 저장했다. 이번 작업의 차이는 final_implementation.patch에 저장했다.
+재현 도구는 experiment_reproduction_tools.tar.gz에 저장했다. 최종 압축 파일의 해시는 final_archive_manifest.json에 있다.
+Git 브랜치와 인덱스는 변경하지 않았다.
+기준 압축 파일 SHA-256: d9971be2540c3aa79b25201caaf6251734c99626a16ef71f0234eb355880fbe8
+기준 Git HEAD: 2ecc6579af4503f2aae27da4bb2041cbf056981d
+저장 위치: /home/dongjae/gelslam/diagnostics/imu_drift_2h_20261021_2219
+
+오차 원인 확인
+현재 기준 코드의 접촉 수락 시각 54.15 s에서 비접촉 목표 시각 55.05 s까지 분해했다.
+진입 속도 오차의 크기는 4.682 mm/s였다. 이 항만으로 0.9초 동안 4.214 mm의 변위 오차 벡터가 생겼다.
+실제 추가 변위 오차의 크기는 5.387 mm였다. 자세 오차와 측정 잔차도 영향을 주었다.
+다음 값은 GT world 축의 Y 성분이다. 단위는 mm다.
+진입 속도 -4.135243; 자세 -1.810506; 가속도 바이어스 +0.366648; 측정 잔차·평균 +0.392891;
+중력 약 0; GT 이산 근사 +0.000152. 각 벡터의 크기는 서로 더할 수 없다.
+독립 적분과 native GTSAM 적분의 최대 차이는 약 6.2e-15였다. 분해 합도 실제 오차와 일치했다.
+
+새 비접촉 속도 계산
+기준 시각 t_a는 마지막 접촉 수락 시각이다. 목표 시각 t는 그 이후의 비접촉 이미지 시각이다.
+t_a까지 수락한 접촉 위치와 IMU 측정만 사용하여 진입 속도를 구한다.
+inertial_quadratic은 접촉 위치 이력에서 측정 IMU 운동을 먼저 제거한다.
+그 잔차에 2차 곡선을 맞춘다. 마지막 접촉 시각의 속도만 보정에 사용한다.
+이력 시작 시각을 t_0, 마지막 접촉 시각을 t_a라고 한다. 모든 위치와 속도는 고정 trial 축의 IMU 원점 값이다.
+원시 IMU를 t_0부터 각 접촉 시각 t_j까지 사전 적분한다. 바이어스는 t_a의 수락 값을 사용한다.
+R_0 = R_a * DeltaR_0a^T; tau_j = t_j - t_0.
+D_j = 0.5 * g * tau_j^2 + R_0 * DeltaP_0j.
+q_j = (p_j - p_a) - (D_j - D_a).
+q_j = u * (t_j - t_a) + 0.5 * c * (t_j - t_a)^2로 맞춘다.
+v_seed = u + g * (t_a - t_0) + R_0 * DeltaV_0a; delta_v = v_seed - v_a.
+곡선의 가속도 계수는 비접촉 구간에 외삽하지 않는다.
+기본 조건은 최근 0.4초, 접촉 표본 5개 이상, 시간 폭 0.3초 이상이다.
+접촉 표본 간격은 0.15초 이하여야 한다. 곡선 오차는 0.05 mm 이하여야 한다.
+속도 변화는 20 mm/s 이하여야 한다. 조건을 만족하지 않으면 기존 VI 속도를 유지한다.
+접촉 중단, IMU 복구, trial 변경, 백엔드 좌표 보정 시에는 이력을 끊는다.
+접촉 없는 구간에서 얻은 IMU 예측을 촉각 측정으로 다시 사용하지 않는다.
+보정은 별도 비접촉 예측에만 적용한다. 접촉 수락 상태와 marginal prior를 변경하지 않는다.
+2026-10-22 수정: 위 분리는 비접촉 전파 중에만 유지한다. IMU recovery 수락 시에는
+target 위치에 delta_v * (t_target - t_anchor), 속도에 delta_v를 더한다.
+원래 IMU 전파 prior의 target 위치·속도 분포도 동일하게 이동한다. 전체 A/rhs와
+기준 pose 사이의 상관정보를 유지하고, 다른 시각의 pose와 첫 고정 pose는 이동하지 않는다.
+피팅 보정값은 확정값으로 취급한다. 피팅 불확실성을 새로 추정하거나 독립 속도 관측을
+추가하지 않는다. 수락 후에는 보정된 recovery state를 다음 기준으로 사용하고 이전
+보정값을 지워 중복 적용을 막는다. 비접촉과 recovery가 서로 다른 속도로 발행되던
+위치 불연속을 제거하기 위한 변경이다.
+상관된 과거 접촉 위치를 독립된 새 최적화 측정으로 다시 넣지 않는다. 곡선 오차를 상태 공분산으로 쓰지도 않는다.
+p_new(t) = p_native(t) + delta_v * (t - t_a)
+v_new(t) = v_native(t) + delta_v
+자세와 바이어스는 이 보정으로 변경하지 않는다.
+이 보정만 적용하면 figure8 추가 변위 RMSE는 1.621 -> 0.514 mm다.
+41개 비교에서 비접촉 이외의 상태 33,863개가 기준과 같았다.
+이 결과는 접촉 상태의 정확도 개선을 뜻하지 않는다. IMU 복구가 발생하면 기존 VI 예측으로 돌아갈 수 있다.
+
+정지 IMU 초기 공분산 계산
+정지 측정 구간은 1.0 -> 2.9 s다. 표본은 381개다. 첫 접촉 수락 시각은 4.35 s다.
+자이로 바이어스 평균과 그 불확실성은 정지 구간의 마지막 시각 2.9 s에 속한다.
+그 후 2.9 -> 4.35 s의 IMU 초기화 전파가 첫 접촉 상태와 상관 공분산을 만든다.
+gyro_bias_uncertainty_from_samples는 정지 평균값을 바꾸지 않는다. 그 평균의 초기 불확실성만 계산한다.
+N개 표본의 시각 차이를 dt_i라고 한다. 첫 표본의 잡음 주기에는 첫 관측 주기를 사용한다.
+백색잡음 분산: sigma_w^2 * sum(1 / dt_i) / N^2.
+구간 끝 바이어스와 표본 평균의 random walk 분산: sigma_wb^2 * sum(dt_i * (i/N)^2), i=1..N-1.
+이 식은 독립 백색잡음과 바이어스 random walk 모형에 대한 식이다. 표본의 실제 잡음 분산을 새로 보정한 식은 아니다.
+현재 설정에서는 정지 기준 시각의 자이로 바이어스 표준편차가 0.01 -> 0.000117237 rad/s가 된다.
+비균일 표본의 전체 Brownian 공분산 계산과 대조했다. 독립 Monte Carlo 12,000회와도 대조했다.
+설정으로 고정한 바이어스는 계속 상수로 취급한다. 옵션 기본값은 false다.
+
+최종 전용 설정의 변경값
+static_initialization.enabled: true; fixed_time: 1.0 -> 2.9 s.
+static_initialization.gyro_bias_uncertainty_from_samples: true.
+frontend_gravity_initialization: static_imu; frontend_first_trial_velocity_from_gt: false.
+gtsam_integration_sigma_m: 0.01 -> 0.0001.
+dense_normalflow_residual_weight: 1 -> 1000.
+coast_velocity_fit.enabled: true; model: inertial_quadratic.
+IMU 백색잡음·바이어스 random walk 설정값과 midpoint 적분식은 유지했다.
+simulation_ideal_imu와 GT 이전 상태 대입은 꺼져 있다. 기존 가속도 바이어스 보정값은 유지했다.
+선택한 전용 설정에서 GT는 평가에 사용한다. 자세·속도 초기화와 속도 보정에는 GT를 넣지 않는다.
+가중치와 초기화도 함께 바꾸었으므로 전체 개선을 속도 보정 하나의 효과로 해석하면 안 된다.
+gtsam_integration_sigma_m은 예전 이름이다. 실제 단위는 m/sqrt(s)다. GTSAM은 sigma^2 * dt를 위치 공분산에 더한다.
+이 항은 가속도계·자이로 측정 잡음과 별도다. 값만 줄인 실험은 크게 나빠졌다.
+
+다른 장면에서 속도 보정만 적용한 추가 변위 RMSE (mm)
+장면                         기준          inertial_quadratic
+rock zigzag                 1.934427      0.257797
+rock line                   1.661884      1.024014
+walnut                      7.305269      7.288237
+avocado                     0.949193      0.998994
+long rock sweep             3.036114      1.545548
+long sweep의 위치 GT는 bag 자세를 사용한다. 이 장면의 속도 GT만 세 표본 중앙 차분을 사용한다.
+avocado에서는 추가 변위 RMSE가 약 5% 늘었다. walnut에서는 개선이 작았다.
+periodic return과 plane yaw에서는 현재 설정에서 출력 상태가 없었다. 두 장면은 정확도 검증으로 계산하지 않는다.
+전용 가중치를 다른 물체에 그대로 적용한 실험도 일부 나빠졌다. 전용 설정을 공통 기본 설정으로 바꾸지 않았다.
+
+입력 잡음을 더한 검증
+같은 bag에 추가 Gaussian 잡음을 넣었다. IMU 시각과 촉각 이미지는 유지했다.
+추가 density는 sqrt(m^2 - 1) * 기존 설정 density다. m은 1.5와 2.0이다.
+원래 bag의 잡음은 남아 있다. 따라서 m을 실제 총 잡음 배수로 해석하면 안 된다.
+각 조건은 서로 다른 seed 5개를 사용했다.
+추가 조건       전체 위치 RMSE 평균 (기준 -> 최종, mm)    추가 변위 RMSE 평균 (기준 -> 최종, mm)
+m=1.5          50.711858 -> 1.464047                         8.049709 -> 1.126897
+m=2.0          221.454276 -> 2.226226                         28.361108 -> 1.737341
+최종 설정은 추가 잡음 재생 10회에서 접촉 최적화 수락 1,314회를 모두 유지했다.
+
+예측 시간의 제한
+64개의 접촉 수락 시각에서 이후 촉각 관측만 가상으로 중단했다.
+각 목표 시각까지의 실제 IMU 측정은 계속 사용했다. 미래의 촉각 관측이나 GT는 추정에 사용하지 않았다.
+다음 값은 기준 시각의 위치 오차를 제외한 추가 변위 RMSE다.
+접촉 후 시간       기준 (mm)       최종 설정 (mm)
+  0.2 s            0.640838         0.139836
+  0.5 s            1.784716         0.483669
+  1.0 s            4.171159         1.412228
+  2.0 s           11.059429         4.898980
+  3.0 s           21.334887        10.935898
+  5.0 s           54.827588        32.369395
+5초에서는 오차가 계속 크게 늘었다. 비접촉 허용 시간 1초는 유지했다.
+이 제한은 첫 비접촉 이미지 시각에서 시작한다. 마지막 접촉 시각부터의 전파 시간은 영상 간격만큼 더 길 수 있다.
+이 bag의 마지막 비접촉 출력은 마지막 접촉 시각으로부터 1.05초였다.
+
+채택하지 않은 계산
+위치 적분 불확실성만 낮추면 추적 실패와 오차가 늘었다.
+정지 관측 없이 속도를 0으로 설정하거나 장기 감쇠를 넣는 방법은 사용하지 않았다.
+곡선 가속도 보정을 비접촉 구간에 계속 적용한 방법은 검증 구간의 개선이 일관되지 않았다.
+접촉 이력으로 속도·기울기·바이어스를 함께 다시 맞춘 독립 실험의 최선 RMSE는 약 0.66 mm였다.
+속도 보정만 적용한 약 0.51 mm보다 좋지 않아 제품 경로에 추가하지 않았다.
+현재 bag에서는 orb_slam3 시작 자세 적분이 midpoint보다 나빴다. 적분식은 바꾸지 않았다.
+매우 큰 촉각 가중치 1e6에서는 발산했다. 이 설정은 사용하지 않는다.
+
+ROS 트래커와 백엔드 동시 재생
+GUI 없이 별도 ROS 도메인에서 실행했다. bag 재생 속도는 0.25배속이다.
+이 검증은 실시간 처리 속도 검증이 아니다. 수신·처리·저장 경로의 연결 검증이다.
+저장 원본: 최종 백엔드 위치 RMSE 0.813369 mm; 자세 RMSE 0.094284 deg; 대응 프레임 1410개.
+  launch 종료 코드 0; bag 종료 코드 0; 강제 종료 False.
+최종 설정: 최종 백엔드 위치 RMSE 0.242428 mm; 자세 RMSE 0.052662 deg; 대응 프레임 1411개.
+  launch 종료 코드 0; bag 종료 코드 0; 강제 종료 False.
+두 ROS 실행의 공통 시각은 1410개다. 저장 기준은 총 1,410개, 최종 설정은 총 1,411개가 평가되었다.
+공통 시각의 백엔드 위치 RMSE: 0.813369 -> 0.242514 mm.
+공통 시각의 백엔드 자세 RMSE: 0.094284 -> 0.052681 deg.
+백엔드 결과도 첫 대응 최종 자세의 고정 변환으로 정렬했다. 전체 궤적 맞춤은 사용하지 않았다.
+실행 인자, 설정 복사본, 노드 로그를 각 isolated_ros 폴더에 저장했다.
+별도 프로세스의 ROS 파라미터 조회는 환경의 CLI 의존성과 통신 제약으로 완료하지 못했다.
+저장 원본 실행은 보존한 baseline_source를 PYTHONPATH 앞에 넣어 사용했다. 실제 import 경로도 확인했다.
+두 실행 모두 그림 저장 중 기본 5초 종료 제한에 따른 SIGTERM 로그가 있었다. 저장 완료 후 모든 노드가 종료했다.
+
+검증
+새 테스트 30개가 통과했다. 관련 테스트 289개가 통과했다.
+전체 검증은 시작 기준 904개 통과, 16개 실패, 12개 오류였다.
+최종 검증은 934개 통과, 같은 16개 실패와 12개 오류였다. 추가 실패는 없었다.
+baseline과 final 로그 및 실패 ID 비교 JSON을 보관했다.
+gelslam 패키지를 빌드했다. 새 Python 모듈과 새 설정의 source/build/install 경로를 대조했다.
+새 Python 파일의 오류·미사용 import 검사를 통과했다. git diff --check도 통과했다.
+기능을 끈 상태의 출력 상태 1,411개는 저장 기준과 바이트 단위로 같았다.
+진입 속도 계산의 CPU 시간 중앙값은 약 3.8 ms였다. 이 값은 반복한 계산만의 측정값이며 ROS 콜백 전체 시간은 아니다.
+진입 속도는 기준 접촉 시각마다 한 번 계산한다. 같은 비접촉 구간에서 매 이미지마다 다시 맞추지 않는다.
+
+이번 작업의 변경 파일
+/home/dongjae/gelslam/src/gelslam/gelslam/core/contact_velocity.py
+/home/dongjae/gelslam/src/gelslam/gelslam/core/static_imu_initialization.py
+/home/dongjae/gelslam/src/gelslam/gelslam/core/tracker.py
+/home/dongjae/gelslam/src/gelslam/config/figure8_imu_refined_experiment.yaml
+/home/dongjae/gelslam/src/gelslam/config/bag_simulation_config.yaml
+/home/dongjae/gelslam/src/gelslam/config/config.yaml
+/home/dongjae/gelslam/src/gelslam/config/real_config.yaml
+/home/dongjae/gelslam/src/gelslam/config/real_far_config.yaml
+/home/dongjae/gelslam/src/gelslam/setup.py
+/home/dongjae/gelslam/src/gelslam/test/test_contact_velocity.py
+/home/dongjae/gelslam/src/gelslam/test/test_static_gyro_prior.py
+/home/dongjae/gelslam/README.md
+/home/dongjae/gelslam/docs/imu_preparation.md
+/home/dongjae/gelslam/docs/imu_coast_experiments_20261021.txt
+
+재생 명령 예
+source /opt/ros/humble/setup.bash
+source /home/dongjae/gelslam/install/setup.bash
+/home/dongjae/miniconda3/envs/gel-slam/bin/python /home/dongjae/gelslam/scripts/experiment_imu_coast_drift.py \
+  --bag /home/dongjae/dataset/GeLISLAM/fixture-rock-long-figure8-20261001-v1-gelslam-image/bag/bag_0.db3 \
+  --config /home/dongjae/gelslam/src/gelslam/config/figure8_imu_refined_experiment.yaml \
+  --source-path /home/dongjae/gelslam/src/gelslam --output /tmp/gelslam_imu_replay_repeat
+출력 폴더는 존재하지 않는 새 경로를 사용한다. 필요한 환경과 센서 모델은 현재 작업 환경의 것을 사용한다.
+
+주요 증거 파일
+/home/dongjae/gelslam/diagnostics/imu_drift_2h_20261021_2219/all_replay_results.csv
+/home/dongjae/gelslam/diagnostics/imu_drift_2h_20261021_2219/comparison.png
+/home/dongjae/gelslam/diagnostics/imu_drift_2h_20261021_2219/comparison.pdf
+/home/dongjae/gelslam/diagnostics/imu_drift_2h_20261021_2219/non_coast_state_identity.json
+/home/dongjae/gelslam/diagnostics/imu_drift_2h_20261021_2219/initialization_covariance_verification.json
+/home/dongjae/gelslam/diagnostics/imu_drift_2h_20261021_2219/build_install_verification.json
+/home/dongjae/gelslam/diagnostics/imu_drift_2h_20261021_2219/full_regression_final.log
+/home/dongjae/gelslam/diagnostics/imu_drift_2h_20261021_2219/coast_fit_microbenchmark.json
+
+적분 공분산의 정의는 GTSAM 공식 문서와 현재 native 구현을 대조했다.
+https://borglab.github.io/gtsam/imuintegrationcovariance/

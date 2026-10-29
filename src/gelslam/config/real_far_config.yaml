@@ -1,0 +1,245 @@
+# Configuration for the supplied simulated tactile/IMU ROS 2 bags.
+device_config:
+  device_name: "GelSight Mini simulation"
+  ppmm: 0.0634
+  imgh: 240
+  imgw: 320
+  raw_imgh: 2464
+  raw_imgw: 3280
+  framerate: 25
+  # Process-wide Torch CPU intra-op threads for surface reconstruction.
+  torch_num_threads: 4
+  # Input image topic in pilot-real-20261007-v1/trial_003/bag.
+  image_topic: "/gelsight/image_raw"
+  # GelI-SLAM normal-map MLP checkpoint paired with the simulation bags.
+  calibration_model_path: "/home/dongjae/dataset/GeLISLAM/real-objects-12-spatial-rebased-raw-time-20261029/models/nnmodel.pth"
+
+imu_config:
+  # Reject discontinuous IMU intervals before contact optimization or recovery.
+  max_sample_gap_s: 0.05
+  # The calibrated VI world always uses gravity along -Z and zero first-contact position.
+  # Use the first 5 seconds of IMU measurements for trial_004 startup rest.
+  # Time starts at the first accepted IMU sample in the selected IMU clock.
+  # Overrides GT/fixed gravity and GT velocity initialization while enabled.
+  # Requires IMU + frontend optimization + marginalization + calibrated T_GI.
+  static_initialization:
+    enabled: true
+    gyro_bias_uncertainty_from_samples: true
+    # mode: "startup_duration"
+    # duration_s: 8.9
+    # window_s: 1.0
+    # min_samples: 50
+    mode: "recorded_rest_event"
+    events_topic: "/geli/events"
+    motion_check: true
+    motion_accel_threshold_mps2: 0.15
+    motion_gyro_threshold_rps: 0.01
+    motion_pre_peak_margin_s: 0.05
+    accel_std_threshold_mps2: 0.05
+    gyro_std_threshold_rps: 0.005
+    gyro_mean_threshold_rps: 0.05
+    accel_mean_change_threshold_mps2: 0.1
+    gravity_norm_tolerance_mps2: 0.3
+    max_sample_gap_s: 0.05
+    max_propagation_s: 5.0
+    velocity_sigma_mps: 0.0001
+  enabled: true
+  frontend_optimization: true
+  # Use reference_marginalization / pairwise for a variable reference + current 21D prior.
+  # Requires estimated biases/previous state and disabled GT state overrides.
+  frontend_state_mode: "reference_marginalization"
+  # Previous 15D state in reference_marginalization (normal rows never touch it).
+  # joint: GN over [reference, previous, current] (36D); IMU relinearized each iteration.
+  # eliminate_first: eliminate previous from prior+IMU+bias once, GN over
+  # [reference, current] (21D); IMU fixed at the accepted previous state.
+  frontend_reference_previous_state: "eliminate_first"
+  # Shared native preintegration: midpoint only (half-step attitude). It averages
+  # adjacent accel/gyro samples and composes rotations.
+  # Covers VI prediction, recovery, no-contact coast and backend IMU factors.
+  integration_method: "midpoint"
+  # Set false to start each contact-frame solve from the previous VI state.
+  # IMU preintegration still supplies the IMU factor in the solve.
+  # With true, initial shared points < 10 retries once from the previous State.
+  frontend_initialize_from_imu_preintegration: true
+  # Use the target-frame IMU prediction directly; skip contact optimization.
+  frontend_imu_prediction_only: false
+  # Fix the previous pose, velocity and both biases during each frontend solve.
+  # Overrides joint marginalization; no carried marginal prior is used.
+  frontend_fix_previous_state: false
+  # Independent diagnostic interventions. Bias and target initialization are unchanged.
+  frontend_gt_previous_state_test:
+    enabled: false
+    previous_pose_from_gt: true
+    previous_velocity_from_gt: true
+    reference_pose_from_gt: true
+    reset_marginal_prior: true
+    # Keep pose/velocity at one time when toggling either GT input independently.
+    previous_state_time: accepted_state
+  # Joint previous/target state solve. Marginalize the previous 15D state.
+  # The tracker commits the target prior only after its contact quality gate.
+  gtsam_vi_marginalization: true
+  # Initial accepted-state uncertainty in SI units; used at each VI restart.
+  # 0.005 rad and 0.01 m/s^2: smallest values consistent with GT tilt and vertical velocity
+  # at first contact on thick-far trials 002-007 and 011 (recorded_rest_event, 2026-10-29).
+  gtsam_vi_prior_rotation_sigma_rad: 0.005
+  gtsam_vi_prior_translation_sigma_m: 0.0001
+  gtsam_vi_prior_velocity_sigma_mps: 0.02
+  gtsam_vi_prior_accel_bias_sigma_mps2: 0.01
+  gtsam_vi_prior_gyro_bias_sigma_rps: 0.02
+  # Subscribe to the paired timing topics; a bag path is optional.
+  # Start the tracker before the sensor publishers or bag player.
+  # timestamp_source: recorded_source
+  # camera_timing_topic: "/gelsight/timing"
+  # imu_device_time_topic: "/imu/device_time_ms"
+  # At each trial start, use one nearby GT GelSight attitude to set frontend
+  # gravity in the public trial axes. GT is not a factor.
+  frontend_gravity_initialization: "ground_truth_initial_pose"
+  gt_trial_attitude_max_age_s: 0.05
+  # Initialize first-trial IMU-origin velocity from GT IMU position differences.
+  frontend_first_trial_velocity_from_gt: true
+  # This bag's nonuniform ~30 Hz GT needs ~75 ms three-sample stencils.
+  # Bound each stencil span and its distance from the original anchor in seconds.
+  frontend_gt_velocity_window_s: 0.10
+  frontend_gt_velocity_max_age_s: 0.10
+  topic: "/imu/data_raw"
+  # sensor_msgs/Imu.header.frame_id in pilot-real-20261007-v1/trial_003/bag.
+  frame_id: "ebimu_sensor"
+  # T_SI is declared from the gel chart (gel_frame), not the optical frame.
+  # The supplied bag is synchronized. Keep this explicit so a replay with a
+  # known delay can change the integration boundaries without changing code.
+  image_to_imu_time_offset_s: 0.0
+  max_coast_duration_s: 3.0
+  # Experimental coast-entry velocity fit; validate on this sensor before enabling.
+  coast_velocity_fit:
+    enabled: false
+    model: "inertial_quadratic"
+    window_s: 0.4
+    min_samples: 5
+    min_span_s: 0.3
+    max_sample_gap_s: 0.15
+    max_fit_rmse_m: 0.00005
+    max_velocity_change_mps: 0.02
+  gravity_mps2: 9.80665
+  # The bag's sensor_msgs/Imu angular_velocity follows the ROS rad/s contract.
+  gyro_input_unit: "rad_s"
+  # The recorded gyro norm peaks at about 0.43 rad/s; retain margin while
+  # rejecting the typical ~57x degree/radian mismatch.
+  gyro_max_rate_rad_s: 5.0
+  # Used by legacy no-contact propagation when frontend VI is disabled.
+  # With frontend VI enabled, coasting uses frontend gravity and trial axes.
+  # It is not a legal input for a real estimator or accuracy claim.
+  # gravity_initialization: "ground_truth_initial_pose"
+  ground_truth_gel_pose_topic: "/ground_truth/gel_pose"
+  ground_truth_imu_pose_topic: "/ground_truth/imu_pose"
+  initial_accel_bias_mps2: [0.0, 0.0, 0.0]
+  # initial_gyro_bias_rps: [0.002555425, 0.000551925, 0.0004615445]
+  # Keep the current conservative SI noise values explicit for this replay.
+  # Frontend: 9D motion covariance and separate 6D bias random walk.
+  # On contact return, the frontend retains the accepted prior and full IMU interval.
+  accelerometer_noise_density: 0.002
+  gyroscope_noise_density: 0.00016
+  accelerometer_bias_random_walk: 0.00086
+  gyroscope_bias_random_walk: 0.000022
+  buffer_max_samples: 6000
+  # T_GI derived from this bag's /tf_static: IMU coordinates into gel_frame.
+  gelsight_T_imu:
+    - [0.017173800791730785, 0.9998482929479727, 0.0029071730926944336, -0.0007033380746503989]
+    - [ 0.9997697132922626, -0.017134885862564852, -0.01291960022538152, -0.002363167948767136]
+    - [-0.012867826151791582, 0.0031283822499537364, -0.9999123122927458, -0.1386849725007416]
+    - [0.0, 0.0, 0.0, 1.0]
+  # Strongest-curvature candidates; shared contact rows change each iteration.
+  dense_normalflow_samples: 500
+  # Positive relative objective weights for the joint frontend solve.
+  dense_normalflow_residual_weight: 1.0
+  # Shared objective weight for the separate IMU and bias factors.
+  imu_residual_weight: 0.0001
+  # Keep NormalFlow's original SCR/CCS loss-of-track gate independent of the
+  # (smaller) optimization sample set.
+  dense_normalflow_quality_samples: 500
+  # Huber threshold for each scaled three-component normal residual; 0 disables it.
+  gtsam_vi_normal_huber_delta: 0.4
+  # Only normal rows use Huber in steps 1..3; step 4 onward is least squares.
+  gtsam_vi_normal_huber_iterations: 3
+  # Mean height residual in the joint contact frontend; direct GelSight Z only.
+  gtsam_vi_height_z_enabled: true
+  # Sigma of the mean measurement in metres (initial value: 0.1 mm).
+  # Do not divide by sqrt(pixel count): integrated height errors are correlated.
+  gtsam_vi_height_z_sigma_m: 0.0001
+  gtsam_vi_max_iterations: 10
+  gtsam_vi_min_iterations: 5
+  # Reference-map IC Jacobian; contacts, coordinate mapping and weights update each iteration.
+  # Set target_relinearized to compare with current-target normal derivatives.
+  gtsam_vi_normal_linearization: "inverse_compositional"
+  # Full undamped GN steps; IMU/bias/prior terms are relinearized each iteration.
+  gtsam_integration_sigma_m: 0.01
+  # Original NormalFlow thresholds in reference GelSight IC coordinates.
+  # Z, velocity, bias and previous-state updates do not control convergence.
+  gtsam_vi_rotation_stop_rad: 0.001
+  gtsam_vi_translation_stop_m: 0.0001  # XY norm, 0.01 mm
+  gtsam_vi_normal_reference_z_from_imu: false
+contact_mask_config:
+  color_dist_threshold: 15
+  height_threshold: 0.2
+
+gelslam_config:
+  track_config:
+    # Retain each rejected contact image as an IMU-predicted Frame for evaluation.
+    # Requires a valid initialized VI state and continuous IMU coverage to the image.
+    # Does not accept the prediction or add optimization keyframes. Default: false.
+    keep_imu_only_frames: true
+    # Write/publish normal RGB, contact cloud and correspondence debug images.
+    # false skips their construction; tracking and frame/keyframe output continue.
+    debug_visualization_enabled: false
+    # Promote a valid contact frame after this image-time gap. 0 disables it.
+    keyframe_max_interval_s: 0.5
+    # Continuous-contact quality rejections: recover from IMU after this image-time gap.
+    # Recontact or missing correspondences use valid IMU immediately, without this wait.
+    contact_failure_keyframe_interval_s: 0.5
+    # Sample at most 30 pairs for display. Set 0 to show all pairs.
+    correspondence_max_lines: 30
+    # DDS queue depth for /image. 1 drops stale images when tracking is slow.
+    # IMU synchronization also keeps only the latest image waiting for IMU.
+    image_queue_size: 1
+    contact_threshold: 10
+    scr_threshold: 0.5
+    ccs_threshold: 0.3
+  pose_graph_config:
+    # 15D states: IMU pose, world velocity, accelerometer and gyroscope biases.
+    # Local VI uses tactile/IMU observations; tracker poses only initialize it.
+    # Separate global 15D PGO: full pose, world velocity and both IMU biases.
+    # Raw IMU/bias factors connect all temporal pairs; recovery pairs omit pose odometry.
+    # Odometry/registered-loop residuals remain 6D, with the sigmas below.
+    # Same relative-pose sigmas as gelslam-origin, converted from mm to metres.
+    loop_pgo_rotation_sigma_rad: 0.01
+    loop_pgo_translation_sigma_m: 0.0001
+    # Minimum data-time gap between loop-search targets; 0 searches every KF.
+    # Skipped targets remain available as references. Not wall-clock throttling.
+    loop_search_min_interval_s: 0.0
+    # Exclude the previous N keyframes from loop candidates, across trial boundaries.
+    # K_t skips K_(t-1)..K_(t-N); 0 disables this candidate exclusion.
+    loop_search_exclude_recent_keyframes: 10
+    # IMU/bias noise densities use imu_config; reject uncovered/gapped intervals.
+    imu_max_sample_gap_s: 0.05
+    initial_velocity_sigma_mps: 0.1
+    initial_accel_bias_sigma_mps2: 0.1
+    initial_gyro_bias_sigma_rps: 0.01
+    max_iterations: 10
+    coverage_graph_overlap_threshold: 50
+    min_sift_inliers: 8
+    scr_threshold: 0.3
+    ccs_threshold: 0.7
+
+# Resolve each stored FrameMsg through the final pose graph at shutdown, then
+# rigidly align it to this bag's GT trajectory.  The GT is evaluation-only.
+trajectory_evaluation:
+  enabled: true
+  ground_truth_pose_topic: "/ground_truth/gel_pose"
+  timestamp_tolerance_s: 0.03
+  # Frontend State.velocity evaluation requires matching simulation truth.
+  # Keep disabled for real data; replace truth_path before simulation replay.
+  state_velocity:
+    enabled: false
+    ground_truth_pose_topic: "/ground_truth/imu_pose"
+    truth_path: "/home/dongjae/dataset/GeLISLAM/fixture-rock-long-figure8-20261001-v1-gelslam-image/assets/trajectory_truth.npz"
+    time_offset_s: 1.0
+    timestamp_tolerance_s: 0.03

@@ -91,10 +91,6 @@ def test_prediction_is_kept_and_used_at_the_next_target_without_optimization(mon
         expected_relative = np.linalg.inv(tracker.trial_T_ref) @ gel_pose
         assert np.allclose(relative, expected_relative.astype(np.float32))
         assert projected == []
-        assert tracker._frontend_vi_prev_timestamp == target
-        assert np.array_equal(tracker._frontend_vi_prev_velocity, expected.velocity)
-        assert np.array_equal(tracker._frontend_vi_prev_bias,
-                              np.r_[expected.accel_bias, expected.gyro_bias])
         assert solver.marginal_prior is None and solver.pending_marginal_prior is None
         assert solver.last_optimization_trace == []
         assert solver.last_prior_source == 'imu_prediction_only'

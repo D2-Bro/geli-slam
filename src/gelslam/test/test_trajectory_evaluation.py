@@ -5,7 +5,6 @@ from scipy.spatial.transform import Rotation
 
 from gelslam.core.trajectory_evaluation import (
     apply_se3,
-    estimate_se3_alignment,
     estimate_first_pose_alignment,
     match_trajectory_timestamps,
     save_aligned_trajectory,
@@ -17,18 +16,6 @@ def pose_at(position):
     pose = np.eye(4)
     pose[:3, 3] = position
     return pose
-
-
-def test_se3_alignment_recovers_rotation_and_translation_without_scale_change():
-    estimated = [pose_at((0.0, 0.0, 0.0)), pose_at((1.0, 0.0, 0.0)), pose_at((0.0, 1.0, 0.0))]
-    transform = np.eye(4)
-    transform[:3, :3] = np.array(((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)))
-    transform[:3, 3] = (2.0, -3.0, 0.5)
-    ground_truth = [apply_se3(transform, pose) for pose in estimated]
-
-    alignment = estimate_se3_alignment(estimated, ground_truth)
-
-    assert np.allclose(alignment, transform)
 
 
 def test_timestamp_matching_interpolates_position_and_rotation_at_frame_time():

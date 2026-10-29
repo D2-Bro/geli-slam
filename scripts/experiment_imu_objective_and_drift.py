@@ -9,7 +9,6 @@ import argparse
 import copy
 import csv
 import hashlib
-import html
 import json
 from pathlib import Path
 import sys

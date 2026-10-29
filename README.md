@@ -43,6 +43,7 @@ GelSLAM is a real-time 3D SLAM system that enables ultra-high-fidelity object sh
 - NumPy 1.26.4, OpenCV 4.11.0.86, SciPy 1.15.2, Open3D 0.18.0.
 - GTSAM 4.3.0 Python 바인딩. `ImuFactorErrorMode.ComponentWise`와
   `PreintegrationParams.setImuFactorErrorMode`가 필요합니다.
+  IMU 적분에는 아래 패치의 midpoint API를 사용합니다.
 - RViz 또는 Open3D 화면을 사용하려면 데스크톱 화면 연결이 필요합니다.
 
 ### 🛠️ 설치
@@ -84,7 +85,7 @@ GTSAM은 다음 단계에서 별도로 설치합니다.
 
 버전 번호만 확인하지 말고 필요한 API도 확인해야 합니다.
 아래 소스 리비전은 현재 작업 공간에 설치된 GTSAM 리비전입니다.
-아래 명령은 GelSLAM 저장소 루트에서 실행합니다. 중간 자세 IMU 적분을 위해 제공된 GTSAM 패치를 적용합니다.
+아래 명령은 GelSLAM 저장소 루트에서 실행합니다. 중간 자세 및 ORB-SLAM3 IMU 적분을 위해 두 GTSAM 패치를 순서대로 적용합니다.
 빌드 절차는 [GTSAM Python 설치 문서](https://github.com/borglab/gtsam/blob/71a25ca36c084cbad1f872e812d6d97fbadfdb05/python/README.md)를 기준으로 합니다.
 
 ```bash
@@ -93,6 +94,7 @@ mkdir -p ~/libraries
 git clone https://github.com/borglab/gtsam.git ~/libraries/gtsam-4.3.0
 git -C ~/libraries/gtsam-4.3.0 checkout 71a25ca36c084cbad1f872e812d6d97fbadfdb05
 git -C ~/libraries/gtsam-4.3.0 apply "$PWD/patches/gtsam-midpoint-integration.patch"
+git -C ~/libraries/gtsam-4.3.0 apply "$PWD/patches/gtsam-orb-slam3-integration.patch"
 python -m pip install -r ~/libraries/gtsam-4.3.0/python/dev_requirements.txt
 cmake -S ~/libraries/gtsam-4.3.0 -B ~/libraries/gtsam-4.3.0/build-conda \
   -DCMAKE_BUILD_TYPE=Release \
@@ -109,11 +111,19 @@ import gtsam
 p = gtsam.PreintegrationParams([0.0, 0.0, -9.80665])
 p.setImuFactorErrorMode(gtsam.ImuFactorErrorMode.ComponentWise)
 p.setUseMidpointIntegration(True)
+p.setUseOrbSlam3Integration(True)
+assert p.getUseOrbSlam3Integration() and not p.getUseMidpointIntegration()
 print('GTSAM API OK:', gtsam.__file__)
 PYTHON
 ```
 
 #### 4. ROS 패키지 빌드와 확인
+
+`imu_config.integration_method`는 `midpoint`만 허용합니다. 이 방식은
+IMU 구간 중간 자세로 평균 가속도를 회전합니다. 양끝 가속도·각속도를 평균하고
+회전을 합성합니다.
+이 설정은 초기 IMU 전파, 프론트엔드 VI, 비접촉 전파, 복구, 백엔드 IMU factor에
+함께 적용됩니다. 설정을 바꾼 뒤 노드를 다시 실행합니다.
 
 ```bash
 cd ~/gelslam
@@ -155,6 +165,7 @@ bag, 모델, 결과 파일은 Git에 포함하지 않습니다. 데이터를 별
 선택한 YAML에서 다음 값을 데이터에 맞게 수정합니다.
 
 - `device_config.calibration_model_path`: 해당 GelPad의 `nnmodel.pth` 경로.
+- `device_config.torch_num_threads`: 표면 복원의 Torch CPU 연산 스레드 수. 기본값은 `4`이며, 모델 초기화 전에 적용됩니다. 같은 프로세스의 Torch CPU 연산에 적용됩니다.
 - `device_config.image_topic`, `imu_config.topic`, `imu_config.frame_id`: bag의 실제 값.
 - `imu_config.gelsight_T_imu`: IMU 좌표를 GelSight 좌표로 변환하는 보정 행렬.
 - `imu_config.image_to_imu_time_offset_s`: 이미지와 IMU의 측정 시각 차이.
@@ -175,9 +186,7 @@ GT가 없는 데이터에서는 `frontend_gravity_initialization`과
 정지 초기화와 시간 보정의 상세 조건은 [IMU 준비 문서](docs/imu_preparation.md)를 확인합니다.
 
 속도 평가를 켜면 `trajectory_evaluation.state_velocity.truth_path`를 해당 데이터의
-`trajectory_truth.npz`로 변경합니다. 시뮬레이션 설정의
-`simulation_ideal_imu.enabled` 기본값은 `false`입니다.
-이를 켜는 실험에서는 그 항목의 `truth_path`도 설정합니다.
+`trajectory_truth.npz`로 변경합니다.
 저장소에 있는 `/home/dongjae/...` 경로는 각 설치 환경의 경로로 변경해야 합니다.
 
 #### 2. 터미널 A: GelSLAM 시작
@@ -218,6 +227,59 @@ ros2 bag play /absolute/path/to/bag --clock --rate 1.0
 프런트엔드 처리가 입력 속도를 따라가지 못하면 재생 속도를 낮춥니다.
 현재 시뮬레이션 설정의 이미지 큐 깊이는 1이므로 오래된 이미지는 생략될 수 있습니다.
 bag 재생이 끝나면 터미널 A에서 `Ctrl+C`를 누르고 결과 저장이 끝날 때까지 기다립니다.
+
+접촉 중 VI 최적화 결과는 CCS, 수치 유효성, IMU 예측 일관성 검사로 수용합니다.
+SCR만 기준보다 낮으면 현재 최적화 상태와 prior를 유지하고 현재 영상을 즉시 키프레임으로 만듭니다.
+공유점이 10개 미만이거나 CCS가 낮으면 이 경로를 사용하지 않습니다.
+
+연속 접촉 중 CCS, 수치 유효성, IMU 예측 일관성 검사 실패가
+`gelslam_config.track_config.contact_failure_keyframe_interval_s` 동안 지속되면
+IMU 예측 상태로 현재 접촉 영상을 키프레임으로 만듭니다. 기본값은 0.5초입니다.
+첫 품질 검사 실패 영상의 센서 시각부터 계산하며, 생성 후 같은 간격으로 반복합니다.
+재접촉 정합 실패 또는 대응점 부족은 이 시간을 기다리지 않습니다. IMU 구간이
+유효하면 현재 프레임을 즉시 IMU 예측 상태로 승인하고 새 기준 키프레임으로 만듭니다.
+다음 프레임은 이 기준으로 정합합니다. IMU가 유효하지 않으면 마지막 승인 상태를 유지합니다.
+접촉 추적 성공, 비접촉, 품질 검사 이외의 정합 실패는 품질 검사 실패 타이머를 초기화합니다.
+이 상태는 `imu_only`이고 촉각 성공 시각은 갱신하지 않습니다. 15D prior는 IMU로 전파합니다.
+정상 추적의 `keyframe_max_interval_s`는 별도 설정입니다.
+
+무접촉 시간은 따로 계산합니다. `imu_config.max_coast_duration_s`를 넘으면 새 구간을
+준비하고 접촉 영상 쌍을 한 번 수용한 뒤 발행합니다. IMU가 연속이면 이동 중에도
+재시작합니다. IMU 간격이 `imu_config.max_sample_gap_s`를 넘으면 새로운 정지 구간이
+필요합니다. `FrameMsg`와 `FramePoseMsg`의 `tracking_status`, `pose_valid`,
+`pose_timestamp`는 추정 상태와 실제 자세 시각을 구분합니다.
+
+`imu_config.coast_velocity_fit.enabled: true`는 최근 접촉 수락 위치에서
+비접촉 진입 속도를 다시 계산하는 옵션입니다. 코드 기본값은 `false`이며,
+현재 시뮬레이션 재생 설정과 figure8 전용 설정에서는 `true`입니다.
+`model: inertial_quadratic`은 해당 접촉 시각까지의 IMU 운동을 제거한 뒤
+위치 곡선을 맞춥니다. `model: quadratic`은 접촉 위치에 직접 2차 곡선을 맞춥니다.
+두 방법 모두 IMU 원점과 고정 trial 좌표를 사용합니다. 비접촉 중에는 별도 예측에만
+보정을 적용하고 마지막 접촉 수락 상태와 prior는 유지합니다. 같은 접촉 기준에서
+IMU 복구를 수락하면 복구 시각의 위치에 `delta_v * 경과 시간`을 더하고 속도에
+`delta_v`를 더합니다. 전파한 prior의 target 위치·속도 분포도 같은 양만큼 이동합니다.
+prior의 전체 행, 우변, 상관정보와 다른 시각의 기준 pose는 유지합니다. 피팅 보정은
+확정값으로 취급하며 새 독립 관측 factor를 추가하지 않습니다. 복구 수락 후 보정값을
+지우고 보정된 복구 상태에서 다음 IMU 전파를 시작하므로 같은 보정을 중복 적용하지 않습니다.
+기본 조건은 이력 0.4초, 표본 5개 이상, 시간 폭 0.3초 이상, 접촉 표본 간격
+0.15초 이하, 곡선 적합 오차 0.05 mm 이하, 속도 변화 20 mm/s 이하입니다.
+조건을 충족하지 않으면 VI 속도를 유지합니다. 접촉 중단, IMU 복구,
+trial 변경, 백엔드 좌표 보정 시에는 접촉 이력을 끊습니다.
+
+`src/gelslam/config/figure8_imu_refined_experiment.yaml`은 제공된 긴 figure8 bag
+전용 설정입니다. 1.0–2.9초의 정지 IMU 초기화를 사용합니다. 현재 이 설정과
+`bag_simulation_config.yaml`에는 비접촉 진입 속도 보정과 정지 자이로 바이어스
+불확실성 계산만 적용합니다. 촉각 가중치는 `1.0`, `gtsam_integration_sigma_m`은
+`0.01`로 유지합니다. 다른 물체와 실제 센서에는 별도 검증이 필요합니다.
+이 설정은 `static_initialization.gyro_bias_uncertainty_from_samples: true`도 사용합니다.
+정지 구간의 마지막 측정 시각에서 자이로 바이어스 평균의 불확실성을 계산합니다.
+계산에는 표본 시각, 자이로 잡음 density, 바이어스 random walk를 사용합니다.
+구간 이후의 IMU 전파는 이 초기 공분산을 사용합니다. 코드 기본값은 `false`이며,
+현재 두 시뮬레이션 설정에서는 `true`입니다.
+아래 보고서의 최종 수치는 가중치 조정도 포함한 과거 실험 결과입니다.
+현재 1·2번만 적용한 설정의 성능 수치로 사용하면 안 됩니다.
+측정값, 실패한 실험, 복구 시점의 제한은
+[`docs/imu_coast_experiments_20261021.txt`](docs/imu_coast_experiments_20261021.txt)에 있습니다.
 
 주요 launch 옵션은 다음과 같습니다.
 
@@ -364,47 +426,60 @@ ros2 launch gelslam live_demo_launch.py data_dir:="/absolute/path/to/path_to_sav
 
 ### Backend navigation optimization
 
-The standard launches run `tracker_node` and `pose_graph_node` in separate processes. Keyframes and versioned 15D corrections travel over ROS topics. Tracking applies corrections at an image boundary and rebuilds the prior after target acceptance. See [ROS process ownership and feedback](docs/slam_thread_architecture.md).
+The standard launches run `tracker_node` and `pose_graph_node` in separate processes. Keyframes and versioned 15D corrections travel over ROS topics. Tracking applies corrections at an image boundary. Navigation feedback uses corrected keyframe pose, velocity and biases to predict the next target. See [ROS process ownership and feedback](docs/slam_thread_architecture.md).
 
-The backend optimizes a 15D state per keyframe: IMU pose, world velocity,
-accelerometer bias and gyroscope bias. Each observed keyframe pair uses one
-GelSight factor containing independently weighted normal and mean-height rows,
-alongside IMU preintegration and bias random walk. Tracker poses are initial
-values in this local VI graph. The default local window contains 10 keyframes;
-`marginalization_enabled` selects its boundary treatment.
+The backend stores a 15D state per keyframe: IMU pose, world velocity,
+accelerometer bias and gyroscope bias. These states are the tracking keyframe
+seeds. The backend has no local VI window, no direct tactile keyframe factor
+and no marginalization.
 
-Loop correction uses a separate 4DoF pose graph with world yaw and XYZ updates,
-following ORB-SLAM3's inertial essential graph. Yaw rotates about the recorded
-gravity axis, preserving each local VI pose's gravity attitude. Each remaining
-component anchor is fixed. Relative-pose residuals retain all six measured rows.
-Its edges are local-VI relative odometry and fixed registered loop poses.
-The PGO never evaluates tactile maps and never enters the local marginal prior.
-Per-keyframe map corrections affect output and frontend feedback; new frontend
-seeds are converted back to the independent local VI coordinates.
+Global loop correction uses a separate 15D navigation graph. Each keyframe has
+full 3-axis rotation, position, world velocity and both sensor biases. Raw IMU
+preintegration and bias random walk connect temporal neighbors. Contact-valid
+targets also retain relative pose odometry from the frontend keyframe seeds.
+Incoming IMU-only recovery pairs have no pose-odometry factor. Registered loop
+poses constrain all six relative-pose components, including roll and pitch.
+Each remaining component root has only its pose fixed; velocity and bias priors
+remain soft observations. Global optimization does not evaluate tactile maps or
+modify the stored keyframe seeds. Accepted loop measurements trigger PGO;
+batches without a new loop publish seeds with the last pose, velocity and bias
+corrections. Global pose, velocity and bias corrections affect output and
+frontend feedback; new frontend seeds are converted back to the stored
+keyframe coordinates.
 The relative-pose sigmas are 0.01 rad and 0.0001 m, matching origin's 0.1 mm.
+Synchronized navigation seeds, gravity, calibrated mounting and IMU intervals
+are required. When global feedback changes velocity, biases or gravity attitude,
+tracking requires retained IMU from the corrected keyframe to the target image.
+It uses the corrected full navigation state as the fixed prediction/optimization
+anchor and replaces the frontend prior only after accepting the target. A pure
+yaw/XYZ frame change that preserves sensor biases and only rotates velocity
+retains the existing state/prior transport path without requiring older
+keyframe IMU.
 
-To use only global PGO in the backend, set the following in the YAML supplied
-through `config_path` and keep backend optimization enabled (`backend:=true`
-for the bag launch):
+Set `gelslam_config.pose_graph_config.loop_search_exclude_recent_keyframes` to
+the number of preceding keyframes excluded from loop candidates. The default
+`5` excludes `K_(t-1)` through `K_(t-5)` for target `K_t`; `K_(t-6)` is the
+newest eligible reference. The exclusion uses DB insertion order, including
+across trial boundaries, and runs before SIFT matching or NormalFlow
+registration. It applies separately to every target in a queued batch.
+Values must be nonnegative integers; `0` disables this candidate exclusion.
+Set this in the YAML passed as `config_path`, then restart the node.
 
-```yaml
-gelslam_config:
-  pose_graph_config:
-    local_vi_enabled: false
-```
-
-The default is `true`. With `false`, the backend builds no local tactile, IMU,
-bias or initialization factors and runs no local VI solve or marginalization.
-Frontend keyframe seeds supply the temporal relative poses for the separate
-4DoF PGO. Accepted loop measurements trigger PGO; batches without a new loop
-publish the seed poses with the last map corrections. Frontend VI, no-contact
-IMU propagation and backend feedback keep their existing settings. Synchronized
-navigation seeds, gravity, calibrated mounting and IMU intervals are still required.
-`local_window_optimization: false` only selects a full local VI graph when
-local VI is enabled; it does not disable local VI.
+Set `gelslam_config.pose_graph_config.loop_search_min_interval_s` to the minimum
+seconds between loop-search target timestamps. The default `0.0` searches every
+new keyframe, including every eligible keyframe in a queued batch. For example,
+`0.5` searches the first eligible target, then targets at least 0.5 data seconds
+after the last searched target, whether or not that search found a loop.
+Targets within the interval are skipped once; their features stay in the DB for
+use as references. This does not change keyframe creation.
+The search uses the navigation-state timestamp, or the image header timestamp
+when navigation is unavailable, so bag replay speed does not change selection.
+A new map epoch/session resets the interval. Missing or backwards timestamps
+restart the interval with an immediate search. Values must be finite and
+nonnegative. Set this in the YAML passed as `config_path`, then restart the node.
 
 Add `backend_feedback:=false` to any standard launch to disable backend feedback
-publication and frontend correction reception while keeping local VI, loop PGO,
+publication and frontend correction reception while keeping loop PGO,
 map output and final backend evaluation active. The default is enabled (the bag
 launch follows `backend` by default). Example:
 
@@ -423,9 +498,31 @@ do not retain the registered loop measurements. New v3 snapshots retain both gra
 
 When `trajectory_evaluation.enabled` is true and at least two timestamp matches exist, the final backend trajectory is aligned using the **first matched pose** at `t0`: `A = T_GT_sensor(t0) inverse(T_map_sensor(t0))`. This single SE(3) transform is fixed for the whole selected trajectory. Both position and orientation of the anchor match GT; no later poses, position-based least-squares fit or scale fit are used. Stationary/collinear motion is supported. The anchor timestamp, frame ID and transform are saved in `trajectory_metrics.json`. The sensor is the GelSight surface frame, and the poses are resolved through final backend reference keyframes, independently of frontend State evaluation.
 
+`gelslam_config.track_config.keep_imu_only_frames: true`로 설정하면 접촉 추적 실패로
+제외하던 각 GelSight 이미지에도 IMU 예측 Frame 노드를 생성합니다. 기본값은 `false`입니다.
+마지막 확정 상태 또는 적용 가능한 백엔드 보정 상태에서 해당 이미지의 IMU 시각까지
+예측합니다. `tracking_status`는 `imu_prediction`입니다. 현재 이미지와 이미지 시각을
+사용하며, 최종 궤적 평가는 기준 키프레임의 최종 자세로 이 Frame의 자세를 계산합니다.
+확정 상태, marginal prior, 촉각 이력과 복구 키프레임 생성 주기는 유지합니다.
+비접촉 전파의 유효한 Frame은 기존에도 평가에 포함됩니다.
+초기화 전, IMU 구간 누락, 비접촉 전파 제한 시간 초과 또는 입력 큐에서 교체된 이미지는
+추가하지 않습니다. 이 설정은 처리된 이미지에 적용됩니다. 평가 파일을 저장하려면
+`trajectory_evaluation.enabled: true`도 필요합니다. 설정을 바꾼 뒤 노드를 다시 실행합니다.
+
 The directory also contains `trajectory_translation_error.png` and `trajectory_rotation_error.png`. Each figure shows the first-pose-aligned final backend trajectory in 3D and XY, with matched GT as a dashed grey line. Pose colours show translation error in mm or SO(3) rotation-angle error in degrees. The colour bar runs from zero to the maximum error in that figure; its scale can differ between runs. Point colours use per-frame errors, and segment colours use the mean of the two endpoint errors. Gaps longer than three median sample intervals are left open. The existing `trajectory_se3_aligned.png` filename is retained for compatibility.
 
 With `trajectory_evaluation.state_velocity.enabled: true`, the tracker records **actual frontend `State.velocity`** for published accepted contact states and no-contact predictions. The state timestamp, image timestamp, trial, raw IMU pose and unmodified velocity are saved in `state_velocity_states.jsonl`. Stale states and tactile-hold publications are excluded. This evaluation covers all recorded trials independently of backend component selection.
+
+`keep_imu_only_frames`를 켜면 추가된 Frame의 예측 속도도 `imu_frame_prediction` 단계로
+기록합니다. 이 예측 상태는 프론트엔드의 확정 상태와 구분합니다.
+
+`state_velocity_states.jsonl`은 같은 상태의 `accel_bias`(m/s²), `gyro_bias`(rad/s),
+`gravity_world_mps2`도 기록합니다. 해당 상태 시각의 IMU 측정이 버퍼에 있으면
+`specific_force_imu_mps2`, `angular_velocity_imu_rps`와 `linear_acceleration_world_mps2`를
+추가합니다. bias와 IMU 측정은 IMU 축을 사용합니다. 중력과 선형 가속도는 해당 trial의
+상태 world 축을 사용합니다. 선형 가속도는 `R_WI (a_measured - b_a) + g_W`입니다.
+이 값은 상태 시각의 진단값입니다. 구간 평균과 설정된 회전 적분법을 사용하는 실제 IMU
+사전 적분의 평균 가속도와 구분해야 합니다. GT는 이 기록 계산에 사용하지 않습니다.
 
 The simulation profile compares IMU-origin velocities using the same native GT formula as `first10_contact_state_errors_20261018` and `last_run_state_errors_20261016`: `v_WI = velocity_WS_m_s + cross(R_WI @ ideal_gyro_rad_s, p_WI - p_WS)`. The paired `trajectory_truth.npz` poses must match the received `/ground_truth/imu_pose` messages. An unrelated truth file is rejected. GT velocity is interpolated at **State.timestamp**; no extrapolation or velocity fitting is used. One fixed IMU pose transform at the first matched state of each trial maps state-world axes to GT-world axes. The configuration controls the GT pose topic, native truth file and truth time offset. This GT evaluation is independent of the IMU input replacement option.
 

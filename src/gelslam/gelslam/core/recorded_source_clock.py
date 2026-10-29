@@ -50,21 +50,48 @@ def _paired_rows(connection, topics, sensor_topic, timing_topic):
         yield sensor[1], timing[1]
 
 
-def _unwrap_device_ms(raw_values):
-    """Keep uint32 millisecond wraparound from reversing the IMU time axis."""
-    values = []
-    wraps = 0
-    previous = None
-    for raw in raw_values:
+class DeviceMillisecondClock:
+    """Unwrap a sequential minute or uint32 millisecond counter.
+
+    Infer the period only at a backward jump larger than half its range.
+    Once identified, keep that period for the entire recording. Small backward
+    jumps, duplicates and changes in counter format remain errors.
+    """
+    def __init__(self):
+        self.offset = 0
+        self.period = None
+        self.largest_raw = 0
+        self.previous = None
+
+    def unwrap(self, raw):
         raw = int(raw)
-        if previous is not None and raw < previous and previous - raw > 2**31:
-            wraps += 1
-        value = raw + wraps * 2**32
-        if values and value <= values[-1]:
+        period, offset = self.period, self.offset
+        largest_raw = max(self.largest_raw, raw)
+        if self.previous is not None and raw < self.previous:
+            backward = self.previous - raw
+            if period is None:
+                if backward > 2**31:
+                    period = 2**32
+                elif largest_raw < 60000 and backward > 30000:
+                    period = 60000
+            if (period is None or not 0 <= raw < self.previous < period
+                    or backward <= period // 2):
+                raise ValueError("recorded IMU device times are not increasing")
+            offset += period
+        if period is not None and not 0 <= raw < period:
             raise ValueError("recorded IMU device times are not increasing")
-        values.append(value)
-        previous = raw
-    return np.asarray(values, dtype=np.float64)
+        value = raw + offset
+        if self.previous is not None and value <= self.previous + self.offset:
+            raise ValueError("recorded IMU device times are not increasing")
+        self.previous, self.offset = raw, offset
+        self.period, self.largest_raw = period, largest_raw
+        return value
+
+
+def _unwrap_device_ms(raw_values):
+    """Restore elapsed milliseconds for a complete recording."""
+    clock = DeviceMillisecondClock()
+    return np.asarray([clock.unwrap(raw) for raw in raw_values], dtype=np.float64)
 
 
 def _fit_to_host(source_seconds, host_seconds):

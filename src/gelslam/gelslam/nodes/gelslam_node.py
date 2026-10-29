@@ -8,12 +8,12 @@ import signal
 import threading
 import yaml
 import rclpy
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.signals import SignalHandlerOptions
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 from gelslam_msgs.msg import VisibleCoverageGraphMsg
 from gelslam.nodes.tracker_node import TrackerNode
+from gelslam.nodes.tracker_executor import TrackerExecutor
 from gelslam.nodes.pose_graph_node import PoseGraphNode
 from gelslam.core.local_mapping import LocalMapping, LoopSearch
 from gelslam.core.slam_system import SlamSystem
@@ -73,8 +73,25 @@ class GelSlamNode(TrackerNode):
             'Single process: tracking and raw keyframe storage; backend/loop/feedback disabled')
 
     def _track_image(self, message):
-        before = getattr(self.tracker, '_frontend_tracking_counts', {}).get('backend_feedback_applied', 0)
         TrackerNode.image_callback(self, message)
+
+    def _resume_image_after_imu(self):
+        # The ROS guard only enqueues work. The tracking worker owns pending
+        # images, clock mappings, tracking, and publication in this adapter.
+        return self.system.submit_input(TrackerNode._resume_image_after_imu, self)
+
+    def _resume_source_imu(self):
+        return self.system.submit_input(TrackerNode._drain_source_imus, self)
+
+    def source_camera_timing_callback(self, message):
+        return self.system.submit_input(TrackerNode.source_camera_timing_callback, self, message)
+
+    def source_imu_timing_callback(self, message):
+        return self.system.submit_input(TrackerNode.source_imu_timing_callback, self, message)
+
+    def _process_image(self, message):
+        before = getattr(self.tracker, '_frontend_tracking_counts', {}).get('backend_feedback_applied', 0)
+        TrackerNode._process_image(self, message)
         delay = getattr(self.tracker, 'last_backend_feedback_delay_s', None)
         after = getattr(self.tracker, '_frontend_tracking_counts', {}).get('backend_feedback_applied', 0)
         if delay is not None and after > before:
@@ -93,11 +110,29 @@ class GelSlamNode(TrackerNode):
     def ground_truth_imu_pose_callback(self, message):
         return self.system.submit_input(TrackerNode.ground_truth_imu_pose_callback, self, message)
 
+    def _release_initialization_imu_gt(self):
+        """After ROS dispatch stops, retire GT behind the tracking worker's queued inputs."""
+        done, outcome = threading.Event(), {}
+
+        def release():
+            try:
+                outcome['result'] = TrackerNode._release_initialization_imu_gt(self)
+            except BaseException as error:
+                outcome['error'] = error
+            finally:
+                done.set()
+
+        if not self.system.submit_input(release):
+            self.system.raise_if_failed()
+            raise RuntimeError('Tracking worker stopped before initialization GT cleanup')
+        while not done.wait(.1):
+            self.system.raise_if_failed()
+        if 'error' in outcome:
+            raise outcome['error']
+        return outcome['result']
+
     def _state_velocity_gt_callback(self, message):
         return self.system.submit_input(TrackerNode._state_velocity_gt_callback, self, message)
-
-    def _release_initialization_imu_gt(self):
-        return self.system.submit_input(TrackerNode._release_initialization_imu_gt, self)
 
     def _publish_tracking_result(self, frame, keyframes):
         self.system.accept_keyframes(keyframes)
@@ -156,7 +191,7 @@ class GelSlamNode(TrackerNode):
 def main(args=None):
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = GelSlamNode()
-    executor = MultiThreadedExecutor(num_threads=2)
+    executor = TrackerExecutor(num_threads=2)
     executor.add_node(node)
     handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
 
@@ -169,14 +204,21 @@ def main(args=None):
         while rclpy.ok():
             executor.spin_once(timeout_sec=.1)
             node.system.raise_if_failed()
+            if node._initialization_imu_gt_release_ready():
+                executor.shutdown()
+                node._release_initialization_imu_gt()
+                executor = TrackerExecutor(num_threads=2)
+                executor.add_node(node)
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         for number in handlers:
             signal.signal(number, signal.SIG_IGN)
         try:
-            executor.shutdown()
-            node.destroy_node()
+            try:
+                executor.shutdown()
+            finally:
+                node.destroy_node()
         finally:
             rclpy.try_shutdown()
             for number, handler in handlers.items():

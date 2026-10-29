@@ -2,31 +2,58 @@
 
 ## Recorded source clock option
 
-For replay of a bag containing paired `/gelsight/image_raw` and
-`/gelsight/timing` messages and paired `/imu/data_raw` and
-`/imu/device_time_ms` messages, set these `imu_config` fields in the YAML
-passed as `config_path`:
+For paired `/gelsight/image_raw` and `/gelsight/timing` messages and paired
+`/imu/data_raw` and `/imu/device_time_ms` messages, set this `imu_config` field
+in the YAML passed as `config_path`:
 
 ```yaml
 timestamp_source: recorded_source
-recorded_source_bag_path: /absolute/path/to/bag_0.db3
-image_to_imu_time_offset_s: 0.0
 ```
 
-The tracker reads the timing topics from that database at startup. It matches
-replayed images and IMU messages to their recorded partners, then uses camera
-`source_pts_ns` and IMU `device_time_ms` for integration times. A missing match
-is dropped; it never falls back to the ROS header time in this mode. Frame and
-keyframe output headers remain the original ROS headers.
+Without `recorded_source_bag_path`, the tracker subscribes to
+`camera_timing_topic` (default `/gelsight/timing`, `std_msgs/String`) and
+`imu_device_time_topic` (default `/imu/device_time_ms`, `std_msgs/UInt32`).
+It uses camera `source_pts_ns` and unwrapped IMU device milliseconds for
+integration. Image and IMU subscriptions still use their configured input
+topics. No bag database is opened in this mode.
 
-The two source clocks have different origins. Separate robust affine fits to
-their paired host receipt times put them on one host time axis. The existing
-`image_to_imu_time_offset_s` is then added to each camera integration time.
-This host alignment is an initial estimate. It does not measure camera exposure
-delay or the camera-to-IMU latency difference. Calibrate the remaining offset
-before using the trajectory as a synchronized measurement result. This option
-requires replay of the indexed bag; it does not pair headerless timing topics
-from unrelated live ROS subscriptions.
+Camera timing is matched by `host_wall_ns` to the original image header.
+The IMU timing message has no header or sample identifier. Its messages are
+paired with IMU measurements in FIFO order. Start the tracker before the two
+sensor publishers or bag player, and deliver both IMU topics in the same order
+without independent message loss. Both subscriptions use reliable queues of
+depth 1000. A missing headerless partner cannot always be detected from the
+remaining data. Camera drops do not shift timing onto the next image.
+
+The two source clocks have different origins. During startup,
+`recorded_source_warmup_s` seconds (default 1.0, at least three matched pairs
+per sensor) determine separate median host offsets. Source clock rates remain
+one second per SI second; offsets are frozen before any sample is released.
+This avoids moving previously used navigation times when later receipt jitter
+changes. Topic mode does not estimate long-term clock-rate drift. Pending
+queues are bounded; invalid clock transitions or overflow stop source timing
+with an error, without a header-time fallback.
+
+For deterministic offline pairing and full-recording clock-rate estimation,
+optionally set `recorded_source_bag_path: /absolute/path/to/bag_0.db3`.
+The tracker then reads the paired timing topics from that database at startup,
+matches replayed messages to their recorded partners, and fits separate robust
+affine source-to-host maps. This explicit database mode does not subscribe to
+the timing topics. An unmatched replayed message is dropped.
+
+In both modes, `image_to_imu_time_offset_s` is added to camera integration
+times. Published frame/keyframe headers retain the original ROS headers.
+Host alignment does not measure camera exposure delay or the camera-to-IMU
+latency difference. Calibrate the remaining offset before treating the
+trajectory as a synchronized measurement result.
+
+The recorded IMU millisecond counter can wrap at 60,000 ms or at the uint32
+limit. The loader infers the period from a backward jump larger than half the
+counter range, then retains that period for the recording. For example,
+`59997, 2, 7` becomes `59997, 60002, 60007` ms. This also supports repeated
+minute wraps. Duplicate device times, small backward jumps, and inconsistent
+counter formats remain errors. This unwrapping applies to `recorded_source`
+mode; `header` mode continues to use the incoming ROS header times.
 
 The tracker node subscribes to `/imu/data` and buffers calibrated gyro/accel
 measurements as timestamped SI-unit `ImuSample` records. With
@@ -63,30 +90,60 @@ and backend behavior are unchanged. Statistics use `imu_prediction_only_calls`,
 optimization calls. The legacy `imu_prediction_only_quality_rejected` counter
 remains zero because this mode no longer evaluates visual quality.
 
-Set `imu_config.frontend_fix_bias: true` to hold accelerometer and gyroscope
-biases at `initial_accel_bias_mps2` and `initial_gyro_bias_rps`, respectively
-(three-vectors in IMU axes, m/s² and rad/s; omitted vectors default to zero).
-The flag defaults to false. It removes both previous and target bias increments
-from the solve. Pose and velocity still follow the existing joint/fixed-previous
-mode. Joint marginalization retains pose/velocity information without bias
-columns. Prediction, IMU recovery, and no-contact propagation use the same
-configured constants. Static initialization can still initialize gravity and
-velocity, but cannot replace these biases with stationary estimates. Prediction
-only mode also uses these constants. Set the flag to false to restore the
-previous bias policy. Bias estimation from motion also requires joint state
-optimization (`frontend_fix_previous_state: false` and
-`gtsam_vi_marginalization: true`). The bag simulation preset enables this mode; other
-presets leave it disabled.
+Bias estimation from motion requires joint state optimization
+(`frontend_fix_previous_state: false` and `gtsam_vi_marginalization: true`).
 
-IMU preintegration averages the two observations bounding each sample interval.
-The patched GTSAM Tangent backend subtracts the anchor biases, computes the
-half-step attitude with `Exp(omega * dt / 2)`, and uses that attitude to rotate
-the averaged specific force. It advances rotation with `Exp(omega * dt)`.
-The bias Jacobians and covariance include the resulting gyro-to-acceleration
-coupling. This shared path covers static startup propagation, frontend
-prediction/recovery, calibrated VI no-contact propagation, and backend IMU
-factors. It requires the native `setUseMidpointIntegration` API; rebuild the
-local GTSAM dependency before running the updated package.
+`imu_config.integration_method` accepts only `midpoint` (default). It averages
+the two observations bounding each sample interval, subtracts the anchor biases,
+and composes rotation with `Exp(omega * dt)`. It rotates the averaged specific
+force with the half-step attitude, including `Exp(omega * dt / 2)`. Bias
+Jacobians and covariance follow this method. Image-time endpoint handling and
+the GelSLAM solver remain as configured.
+
+This shared path covers static startup propagation, frontend prediction/recovery,
+calibrated VI no-contact propagation, and backend IMU factors. The legacy
+`InertialPropagator` path with frontend VI disabled keeps its existing rule.
+The native `setUseMidpointIntegration` API comes from the patches documented in
+the README. Rebuild GTSAM after applying them.
+
+The experimental `imu_config.coast_velocity_fit` option uses past accepted
+contact positions to estimate the velocity at the last accepted contact time.
+`inertial_quadratic` first subtracts the measured IMU motion over that history;
+`quadratic` fits positions directly. The fit changes no-contact predictions
+only. The accepted contact state, recovery state and correlated prior retain
+their existing ownership. A recovery can therefore return to the original
+VI prediction; this option does not solve that recovery error.
+
+The code default is disabled. The supplied `bag_simulation_config.yaml` and
+`figure8_imu_refined_experiment.yaml` now enable it. A valid fit needs at least five contact states over
+0.3 s inside a 0.4 s window. Fit residual, velocity change and sample-gap gates
+reject unsuitable history. See `docs/imu_coast_experiments_20261021.txt` for the
+equations, frame labels, comparisons and limits. The separate
+`figure8_imu_refined_experiment.yaml` profile is specific to its named bag.
+Both simulation profiles enable the contact velocity fit and stationary gyro-bias
+uncertainty calculation only. They retain normal-flow weight 1.0 and
+`gtsam_integration_sigma_m: 0.01`. The historical report's final combined metrics
+also included weight changes and do not describe these current profiles.
+
+`static_initialization.gyro_bias_uncertainty_from_samples` is a separate opt-in
+initialization option. It retains the stationary gyro mean and computes that
+mean's endpoint bias uncertainty from the configured gyro white-noise density,
+bias random walk and selected sample times. For N samples at times t_i, the
+white variance is sigma_w^2 * sum(1/dt_i) / N^2. The first sample uses the first
+observed period. Endpoint-minus-mean random-walk variance is
+sigma_wb^2 * sum(dt_i * (i/N)^2), i=1..N-1. The resulting standard deviation
+replaces the initial gyro-bias sigma at the last stationary sample. Startup
+preintegration then propagates it to the first contact time. Configured fixed
+biases remain constants. The code default is false; both simulation profiles
+explicitly enable this option. Calibrated noise densities and
+a stationary interval are required for this model to describe the sensor.
+
+`gtsam_integration_sigma_m` is a legacy parameter name. GTSAM adds
+`sigma**2 * dt` to position covariance. Its effective units are m/sqrt(s),
+and it is separate from accelerometer and gyroscope measurement densities.
+Changing it leaves the mean preintegration unchanged but changes its weight
+in optimization. A smaller value alone can worsen tracking; the reported
+experiments vary it together with the tactile observation weight.
 
 Set `imu_config.frontend_fix_previous_state: true` to hold the previous
 pose, world velocity, accelerometer bias, and gyro bias constant throughout
@@ -100,7 +157,6 @@ The motion factor uses the fixed previous bias. Target bias is connected
 only by the bias random-walk factor, so its optimum equals the fixed
 previous bias. This mode does not estimate new biases from tactile motion.
 Prediction, the frame quality gate, and IMU recovery remain unchanged.
-This switch is independent of `frontend_fix_bias`.
 
 Set `imu_config.gtsam_vi_height_z_enabled: true` to add a conditional height
 measurement to the contact frontend. It defaults to false; the bag simulation
@@ -183,11 +239,11 @@ normal-flow retries against the existing reference using the propagated pose as
 its initialization. A new trial is opened only when no valid IMU coast is
 available.
 
-When frontend VI is disabled, `tactile_attitude_correction` defaults to
-`gyro_propagated`: tactile normal-flow still corrects position and velocity,
-but its rotation does not hard-reset the attitude used to cancel gravity. This
-avoids double-integrating a gravity component caused by a small visual tilt
-error. Set it to `hard_reset` only for the previous behavior.
+When frontend VI is disabled, a contact gap anchors IMU propagation once at the
+last accepted tactile pose. The anchor takes the tactile rotation and position.
+Its velocity is the position difference of the last two tactile poses divided
+by their time difference, or zero when only one pose exists. The IMU then
+propagates from this anchor.
 
 With frontend VI enabled, a contact gap copies the last accepted frontend
 state. IMU-only prediction uses the same GTSAM preintegration, fixed trial
@@ -273,10 +329,63 @@ the native factor's conventions.
 
 ## Stationary IMU initialization before contact
 
+To use the first few seconds of IMU measurements, set:
+
+```yaml
+imu_config:
+  static_initialization:
+    enabled: true
+    mode: startup_duration
+    duration_s: 5.0
+```
+
+`startup_duration` starts at the first accepted IMU measurement in the selected
+IMU clock. `duration_s` is the length of that startup interval in seconds.
+The node's startup time and the first processed image do not set this origin.
+The sensor must be stationary during this interval. `real_far_config.yaml`
+uses the first 5 seconds for `far-agc-off-pilot-20261015/trial_004`.
+The tracker uses only IMU data up to the current image time to complete the
+interval. It sets zero velocity at the interval end, then predicts from that
+anchor to the first contact. It does not detect a later stationary interval
+or reset the origin when the propagation deadline expires. Missing start
+coverage requires replay from the beginning. Do not set `start_time_s` or
+`end_time_s` in this mode. Existing `fixed_time` settings remain absolute.
+
+To use the operator rest events recorded on `/geli/events`, set:
+
+```yaml
+imu_config:
+  timestamp_source: header
+  static_initialization:
+    enabled: true
+    mode: recorded_rest_event
+    events_topic: /geli/events
+    motion_check: false
+```
+
+`recorded_rest_event` averages the IMU from `recorded_rest_started` to
+`recorded_rest_completed`. This mean sets the gravity direction and the gyro
+bias. Zero velocity is set at `trial_ready` (GO), and the tracker predicts from
+GO to the first contact. The interval comes from each bag's event times, not
+from the bag start. The tracker uses the `host_wall_ns` field of each event as
+the IMU header time. This mode requires `timestamp_source: header`. In the
+GeLISLAM exports, the IMU header time differs from the event receipt time by a
+few milliseconds.
+
+With `motion_check: true`, the tracker searches the IMU from GO to the first
+contact. It finds the first sample whose acceleration differs from the rest
+mean by more than `motion_accel_threshold_mps2` (default 0.15), or whose
+angular rate differs by more than `motion_gyro_threshold_rps` (default 0.01).
+The zero-velocity anchor then moves to `motion_pre_peak_margin_s` (default
+0.1 s) before that sample. The attitude at the moved anchor comes from
+integration from GO. Without such a sample, the anchor stays at GO.
+`max_propagation_s` limits the time from the zero-velocity anchor to the first
+contact.
+
 Set `imu_config.static_initialization.enabled: true` to initialize from a
 stationary, no-contact IMU interval. The hardware and real-bag configurations
-default to `false`. The simulation configuration enables the fixed interval
-below for the figure-eight bag.
+default to `false`, except for the far preset above. The simulation
+configuration enables the fixed interval below for the figure-eight bag.
 
 For `fixture-rock-long-figure8-20261001-v1-gelslam-image/bag`, use:
 
@@ -507,6 +616,15 @@ No extra smoothing or extrapolation is applied.
 This is a simulation-only initialization check. The trial-start GT
 attitudes are not tracking factors or pose corrections.
 
+Once the first trial has a complete accepted state, the tracker spin owner
+stops callback dispatch and drains all submitted executor work. It then deletes
+only the initialization GT IMU subscription and clears its position buffer.
+A new executor resumes the same node, state, IMU buffer and marginal prior.
+Subscription deletion does not run in a timer or sensor callback. Continuous
+GT diagnostics and the separate GT velocity-evaluation subscription remain active.
+The experimental single-process adapter also places retirement after its queued
+tracking inputs and waits for that worker before resuming ROS dispatch.
+
 The backend does not require gravity. It uses relative pose edges with separate
 odometry and loop noise settings. It saves edge data and solved poses so it
 can rebuild the GTSAM graph after loading.
@@ -537,9 +655,26 @@ cover the current run and persist across trial and reference-keyframe changes.
 Loading a saved tracker starts a new set of counts. No configuration option
 is required.
 
-`initial_shared_points_lt_10` counts the VI solver's initial fewer-than-10
-shared-point rejection. Other reasons are `vi_unavailable`,
-`imu_prediction_unavailable`, and `vi_refinement_failed_other`.
+If an IMU-initialized contact solve returns `initial_shared_points_lt_10`, the
+tracker retries the same reference/target pair once. It copies the previous
+navigation State's pose, velocity, and both biases into the target's initial
+guess, sets its timestamp to the target image's IMU time, and rebuilds the
+initial visual correspondences. The reference, anchor-to-target IMU samples,
+preintegration, and physical IMU prediction used by the consistency gate stay
+the same. The retry uses the selected ordinary, fixed-keyframe, or recovery
+reference VI solver. It must pass the existing SCR/CCS and IMU consistency
+checks before the tracker accepts its State and commits its marginal prior.
+An initializer already configured to use the previous State does not repeat
+the same attempt. IMU prediction-only mode does not use this retry.
+
+`previous_state_retry_calls` counts these additional solver calls.
+`previous_state_retry_accepted` counts retries accepted by all quality checks.
+The retry log records anchor and target timestamps and both initial point
+counts. `vi_solve_calls` includes both the initial call and this retry.
+
+`initial_shared_points_lt_10` counts frontend attempts that still fail the
+initial fewer-than-10 shared-point check after any seed retry. Other reasons
+are `vi_unavailable`, `imu_prediction_unavailable`, and `vi_refinement_failed_other`.
 `frontend_failed_calls` counts these rejected frontend attempts. They raise
 `LoseTrackError` and enter the existing tracking failure / IMU recovery path.
 No GelSight-only registration runs, including when the frontend solver is
@@ -557,6 +692,32 @@ These are call counts, not distinct image counts. Reacquisition can try a
 keyframe and then the last tactile image for the same target image. Each
 attempt counts separately. A VI result rejected by SCR/CCS is not counted
 as `frontend_failed_calls`. The counters do not change pose estimation.
+
+## Image/IMU input synchronization
+
+With IMU enabled, `tracker_node` defers each image until the newest accepted
+IMU timestamp reaches its selected camera acquisition time plus
+`image_to_imu_time_offset_s`. This applies to header and recorded-source clocks,
+contact tracking, and no-contact propagation. The pending slot holds only the
+latest image; a newer image replaces an image still waiting for IMU.
+No new configuration option is required. IMU-disabled input runs immediately.
+
+Accepted IMU callbacks trigger a ROS guard in the same mutually exclusive
+callback group as image input. That guard checks readiness and then runs image
+tracking and publication. IMU reception remains in its separate callback group.
+Waiting does not block an executor thread or add a polling timer. A pending
+image cannot block shutdown when IMU stops or a bag ends before its image time.
+
+Once ready, the existing buffer interpolates the image endpoint from received
+measurements. Missing anchor coverage, excessive sample gaps, and invalid IMU
+predictions still use the existing failure handling. The synchronization does
+not change preintegration, visual factors, or quality checks. Direct calls to
+`Tracker.track()` outside this ROS node retain their existing input contract.
+
+At shutdown, `Image/IMU synchronization summary` reports `waited_images`,
+`replaced_images`, and `pending_images`. The same values are saved under
+`image_imu_sync` in `tracker_process_summary.json`. Waiting/replaced images do
+not enter frontend tracking and do not count as failed frontend attempts.
 
 ## Timestamp contract
 

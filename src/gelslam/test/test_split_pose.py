@@ -9,10 +9,9 @@ from gelslam.core.gtsam_vi import (
     _navigation_plus, navigation_factor_terms,
 )
 from gelslam.core.inertial import ImuSample
-from gelslam.core.marginal_prior import NavigationPrior
 from gelslam.core.numpy_vi import NavigationState
 from gelslam.core.split_pose import (
-    optimize_split_pose_graph, split_between_factor, split_linear_pose_factor,
+    optimize_split_pose_graph, split_between_factor,
     split_pose_coordinate_jacobian, split_pose_coordinates, split_pose_plus,
     split_prior_factor,
 )
@@ -24,23 +23,40 @@ def _pose(rotation, position):
 
 def test_fixed_pose_velocity_and_bias_are_removed_from_qr_and_remain_exact(monkeypatch):
     from gelslam.core import split_pose
-    from gelslam.core.backend_factors import (
-        state_keys, variable_type, frozen_navigation_factor,
-    )
+    from gelslam.core.backend_factors import bias_key, velocity_key, variable_type
     values = gtsam.Values()
     for index in (0, 1):
-        pose, velocity, bias = state_keys(index)
-        values.insert(pose, gtsam.Pose3(_pose((.1, -.2, .3), (.02, -.01, .03))))
-        values.insert(velocity, np.array([.1, -.2, .3]))
-        values.insert(bias, gtsam.imuBias.ConstantBias(np.ones(3) * .01, np.ones(3) * .001))
-    fixed = set(state_keys(0))
-    rhs = np.arange(15) * .001
+        values.insert(index, gtsam.Pose3(_pose((.1, -.2, .3), (.02, -.01, .03))))
+        values.insert(velocity_key(index), np.array([.1, -.2, .3]))
+        values.insert(bias_key(index), gtsam.imuBias.ConstantBias(np.ones(3) * .01, np.ones(3) * .001))
+    fixed = {0, velocity_key(0), bias_key(0)}
+    measurement = _pose((.01, .02, -.03), (.001, -.002, .003))
+    velocity_step, bias_step = np.array([.01, -.02, .03]), np.arange(6) * .001
+
+    def difference(first, second, step, read):
+        def error(_factor, current, jacobians):
+            if jacobians is not None:
+                jacobians[0], jacobians[1] = -np.eye(len(step)), np.eye(len(step))
+            return read(current, second) - read(current, first) - step
+        return gtsam.CustomFactor(gtsam.noiseModel.Unit.Create(len(step)), [first, second], error)
+
     graph = gtsam.NonlinearFactorGraph()
-    graph.add(frozen_navigation_factor(list(state_keys(0) + state_keys(1)),
-                                       np.column_stack((np.eye(15), np.eye(15))), rhs, values))
-    # A conflicting fixed-only observation must never move the fixed state.
-    graph.add(frozen_navigation_factor(list(state_keys(0)), np.eye(15) * 1e8,
-                                       np.ones(15), values))
+    graph.add(split_between_factor(0, 1, measurement, gtsam.noiseModel.Unit.Create(6)))
+    graph.add(difference(velocity_key(0), velocity_key(1), velocity_step,
+                         lambda current, key: current.atVector(key)))
+    graph.add(difference(bias_key(0), bias_key(1), bias_step,
+                         lambda current, key: current.atConstantBias(key).vector()))
+    coupling = gtsam.NonlinearFactorGraph(graph)
+    # Strong conflicting fixed-only observations must never move the fixed state.
+    strong = gtsam.noiseModel.Isotropic.Sigma
+    offset = values.atPose3(0).matrix().copy()
+    offset[:3, 3] += 1e-4
+    graph.add(split_prior_factor(0, offset, strong(6, 1e-4)))
+    graph.add(gtsam.PriorFactorVector(
+        velocity_key(0), values.atVector(velocity_key(0)) + 1e-4, strong(3, 1e-4)))
+    graph.add(gtsam.PriorFactorConstantBias(bias_key(0), gtsam.imuBias.ConstantBias(
+        values.atConstantBias(bias_key(0)).vector()[:3] + 1e-4,
+        values.atConstantBias(bias_key(0)).vector()[3:] + 1e-4), strong(6, 1e-4)))
     original_qr = split_pose.solve_gaussian_qr
     calls = []
 
@@ -54,16 +70,12 @@ def test_fixed_pose_velocity_and_bias_are_removed_from_qr_and_remain_exact(monke
         graph, values, fixed_keys=fixed,
         variable_types={key: variable_type(key) for key in values.keys()})
     assert calls
-    for index in (0,):
-        pose, velocity, bias = state_keys(index)
-        np.testing.assert_array_equal(result.atPose3(pose).matrix(), values.atPose3(pose).matrix())
-        np.testing.assert_array_equal(result.atVector(velocity), values.atVector(velocity))
-        np.testing.assert_array_equal(result.atConstantBias(bias).vector(), values.atConstantBias(bias).vector())
-    pose, velocity, bias = state_keys(1)
-    actual = np.r_[split_pose_coordinates(values.atPose3(pose).matrix(), result.atPose3(pose).matrix()),
-                   result.atVector(velocity) - values.atVector(velocity),
-                   result.atConstantBias(bias).vector() - values.atConstantBias(bias).vector()]
-    np.testing.assert_allclose(actual, rhs, atol=1e-7, rtol=1e-5)
+    np.testing.assert_array_equal(result.atPose3(0).matrix(), values.atPose3(0).matrix())
+    np.testing.assert_array_equal(result.atVector(velocity_key(0)), values.atVector(velocity_key(0)))
+    np.testing.assert_array_equal(result.atConstantBias(bias_key(0)).vector(),
+                                  values.atConstantBias(bias_key(0)).vector())
+    assert coupling.error(values) > 1e-6
+    assert coupling.error(result) < 1e-12
 
 
 def test_conditioning_supports_factors_with_more_than_three_free_keys():
@@ -181,26 +193,6 @@ def test_backend_prior_and_between_jacobians_match_split_finite_differences():
     _check_factor_derivative(split_prior_factor(3, anchor, noise), {3: target})
     _check_factor_derivative(split_between_factor(3, 5, measurement, noise),
                              {3: reference, 5: target})
-
-
-def test_backend_marginal_factor_retains_correlations_in_split_coordinates():
-    rng = np.random.default_rng(43)
-    A, rhs = rng.normal(size=(16, 12)), rng.normal(size=16)
-    linear = gtsam.JacobianFactor(
-        3, A[:, :6], 5, A[:, 6:], rhs, gtsam.noiseModel.Isotropic.Sigma(16, 1.)
-    )
-    reference = _pose((.2, -.3, .1), (.01, -.02, .04))
-    target = _pose((-.1, .2, .3), (.02, .01, -.01))
-    anchors = gtsam.Values()
-    anchors.insert(3, gtsam.Pose3(reference))
-    anchors.insert(5, gtsam.Pose3(target))
-    marginal = split_linear_pose_factor(linear, anchors)
-    current = {3: split_pose_plus(reference, rng.normal(size=6) * .1),
-               5: split_pose_plus(target, rng.normal(size=6) * .1)}
-    _check_factor_derivative(marginal, current)
-    restored_A, restored_rhs = marginal.linearize(anchors).jacobian()
-    assert np.allclose(restored_A.T @ restored_A, A.T @ A)
-    assert np.allclose(restored_A.T @ restored_rhs, A.T @ rhs)
 
 
 @pytest.mark.parametrize("factor_builder", [_imu_factor, _split_imu_factor])

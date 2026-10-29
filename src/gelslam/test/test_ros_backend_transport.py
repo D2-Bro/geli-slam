@@ -105,13 +105,12 @@ def test_invalid_feedback_does_not_replace_last_valid_snapshot(damage):
     assert receiver.snapshot() is old
 
 
-def test_topic_backend_keeps_15d_factors_and_resets_only_on_new_session_start():
+def test_topic_backend_keeps_15d_seeds_and_resets_only_on_new_session_start():
     cfg = config(coverage_graph_overlap_threshold=.8, min_sift_inliers=8, scr_threshold=.3, ccs_threshold=.7)
     cfg['device_config'] = {'ppmm': 1.}
     service = TopicBackend(cfg, Logger(print_output=False))
     assert service.process([keyframe_from_ros(roundtrip(packet(i)), CvBridge()) for i in range(2)])
-    assert service.mapper.graph.factor_kinds == ['pose_anchor', 'velocity_prior', 'bias_prior',
-                                                'imu', 'bias', 'gelsight']
+    assert service.mapper.graph.temporal_links == [(0, 1)]
     assert all(edge[2] is None for edge in service.mapper.graph.edges)
     assert not service.process([replace(packet(2), session_id='foreign')])
     assert service.mapper.db.size() == 2
@@ -124,7 +123,7 @@ def test_backend_off_keeps_raw_data_without_optimization_or_feedback_states():
     cfg['device_config'] = {'ppmm': 1.}
     service = TopicBackend(cfg, Logger(print_output=False), enabled=False)
     assert service.process([packet(i) for i in range(3)])
-    assert service.mapper.graph.graph.size() == 0 and service.search is None
+    assert service.mapper.graph.states == [None] * 3 and service.search is None
     assert not feedback_message(service.store.snapshot_for_tracking(), 'tracking-a').kids
 
 
@@ -170,7 +169,7 @@ def test_feedback_flag_preserves_backend_solve_and_map_publication(enabled):
     PoseGraphNode.loop_closure(node)
     PoseGraphNode.raise_if_failed(node)
     assert node.processed_keyframe_count == 2
-    assert node.pose_graph.factor_kinds.count('imu') == 1
+    assert node.pose_graph.temporal_links == [(0, 1)]
     assert service.store.snapshot_for_tracking().revision == 1
     assert trajectories == [True]
     assert len(published) == node.feedback_messages_published == int(enabled)

@@ -1,0 +1,33 @@
+KF 기준 상태·루프 검색 수정 준비 보고서 (2026-10-21)
+
+준비 당시 결과: 패치와 검증을 완료했다.
+현재 상태: 본 소스 적용 및 설치 경로 갱신 완료. 간격 설정을 추가했다.
+최종 결과: docs/gelslam_kf_loop_fix_applied_20261021.txt 참조.
+
+1. KF 승격 시 기준 상태 누락
+- 원인: 새 KF ID로 먼저 바꾼 뒤 이전 KF의 저장 상태를 조회했다.
+- 수정: K_k ID를 유지한 채 K_{k+1} 패킷을 만든다. 이후 ID를 갱신한다.
+- 유지: 승격 대상인 마지막 승인 영상 F_i의 시각·자세·속도·바이어스·주변화 사전정보.
+- 위치: src/gelslam/gelslam/core/tracker.py의 _promote_previous_frame.
+
+2. 배치 중간 KF의 루프 검색 누락
+- 원인: 여러 KF를 받아도 배치의 마지막 KF만 검색했다.
+- 수정: 미검색 대상 인덱스부터 새 KF 전체를 순서대로 검색한다.
+- 검색 완료 위치는 배치 성공 후 갱신한다. 동일 입력의 재검색을 막고 새 epoch/세션에서 초기화한다.
+- 위치: src/gelslam/gelslam/core/local_mapping.py의 LoopSearch.
+
+검증: 새 회귀 테스트 13개 및 기존 관련 테스트 190개 통과. 현재 코드에서는 새 테스트 10개 실패.
+원본 데이터 ROS 재생: 0.5배속. 아래 세 실행 모두 마지막 KF 처리 및 정상 종료 확인.
+- 시뮬레이션, Local VI ON / 피드백 OFF: KF 142개, 검색 141/141개, 승격 1회.
+- 시뮬레이션, Local VI ON / 피드백 ON: KF 236개, 검색 235/235개, 승격 31회.
+- real, Local VI OFF / 피드백 OFF: KF 112개, 검색 111/111개, 승격 32회.
+- 모든 실행에서 기준 상태 누락·잘못된 이전 KF ID·검색 누락·중복 검색 0건.
+- 시뮬레이션 K105(t=56.05)의 기준 상태가 K104로 전달됨을 확인했다.
+
+범위: 공통 Tracking/백엔드 경로에 적용한다. IMU 적분식과 설정값은 변경하지 않는다.
+한계: 검색량이 증가한다. 이번 0.5배속 시험은 실시간 성능을 보장하지 않는다.
+Local VI와 피드백의 궤적 불안정은 남아 있다. ON 실행의 오차는 12.37 mm / 48.75도였다.
+
+준비 파일: patches/keyframe-anchor-loop-batch.patch (코드 2개 + 회귀 테스트 1개).
+적용 점검: git apply --check 통과. 기존 미커밋 변경을 보존했다.
+증거: diagnostics/module_review_deep_20261021/fix_preparation/{manifest.json,replay_results.json,*tests.log}

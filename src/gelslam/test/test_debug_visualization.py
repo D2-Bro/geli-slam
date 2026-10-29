@@ -50,7 +50,7 @@ def test_debug_gate_skips_construction_without_skipping_tracking(monkeypatch, en
         normal_map_pub=SimpleNamespace(publish=record("normal_publish")),
         contact_surface_pub=SimpleNamespace(publish=record("cloud_publish")),
     )
-    TrackerNode.image_callback(node, SimpleNamespace(header=header))
+    TrackerNode._process_image(node, SimpleNamespace(header=header))
     assert calls[:3] == ["input_conversion", "tracking", "gravity"]
     outputs = [call for call in calls if isinstance(call, tuple)]
     assert outputs == ([("core_output", frame, [keyframe])] if accepted else [])

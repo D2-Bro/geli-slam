@@ -1,0 +1,20 @@
+GelSLAM 점검 요약 — 시뮬레이션 발생 여부 추가 확인, 2026-10-21
+결과: 로직 오류6건은 별도 재현했다. 그 전부가 원본 시뮬레이션 bag에서 발생한 것은 아니다.
+
+문제 / 원본 시뮬레이션에서의 확인 / 수정 방향
+1. IMU 공백 검사 / 미발생: 최대간격5ms. 1초 공백은 합성 시험 / 보간 전 원본 간격 검사.
+2. KF 승격 anchor 누락 / 발생: Local VI 켬·feedback 끔,56.05초 K105 / 번호 증가 전 기준 상태 확정.
+3. 재시작 대기 고착 / 미관측: 후보의 IMU 소실 조건 없음 / 소실 후보 폐기·정지 초기화.
+4. 미최적화 관측 윈도 이탈 / 미관측: 추가 실행에서 이탈0건 / 관측 최적화 후 윈도 이동.
+5. 주변화 RHS 손실 / 미실행: 모든 시뮬레이션 재생에서 주변화 끔 / Schur 행렬·RHS 함께 보존.
+6. 배치 루프 검색 누락 / 발생: Local VI+feedback 재실행에서78개 KF의 검색 생략 / 모든 새 KF 검색.
+7. Local 결과 품질·feedback 취약성 / 발생: 아래 비교 참조 / 결과 품질 검사 후 commit·feedback.
+8. Global PGO 고정 가중치 취약성 / 큰 Local 위치 drift가 있는 실행에서 큰 yaw 보정 관측 / odometry·loop 불확실성 분리.
+
+추가 전체 시뮬레이션2회, 공통867시점의 위치/회전RMSE:
+Local VI 켬·feedback 켬:24.63mm/40.24deg. Local VI 켬·feedback 끔:1.11mm/0.67deg.
+현재 기본 sim/real 소스 설정의 Local VI는 꺼져 있다. 위 추가 실행 설정과 구분해야 한다.
+검증 범위는75초 fixture bag 1개다. 원본 IMU·접촉 패턴은 변경하지 않았다.
+이전 전체 기능 테스트는750통과/9실패/12오류다. 추가2회 재생은 모두 정상 종료했다.
+변경: 보고서와 진단 자료만 작성했다. 제품 코드·설정은 수정하지 않았다.
+상세: /home/dongjae/gelslam/diagnostics/module_review_deep_20261021/simulation_verification/report_ko.txt

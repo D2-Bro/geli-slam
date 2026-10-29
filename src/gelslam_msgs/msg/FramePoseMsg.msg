@@ -3,3 +3,8 @@ std_msgs/Header header
 int32 fid
 int32 ref_kid
 float64[16] ref_t_curr
+
+# Estimation mode and actual pose time in the image clock.
+string tracking_status "contact_tracking"
+bool pose_valid true
+float64 pose_timestamp

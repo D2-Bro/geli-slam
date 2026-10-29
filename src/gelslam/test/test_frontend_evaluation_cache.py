@@ -154,15 +154,14 @@ def test_ic_rows_remain_independent_and_refresh_after_reference_edits(replace_ar
 
 
 @pytest.mark.parametrize('fixed_previous', [False, True])
-@pytest.mark.parametrize('fixed_bias', [False, True])
 def test_native_values_are_shared_per_state_and_refreshed_after_updates(
-        monkeypatch, fixed_previous, fixed_bias):
+        monkeypatch, fixed_previous):
     previous = nv.NavigationState(0., np.eye(4), np.array([.1, -.2, .3]),
                                   np.zeros(3), np.zeros(3))
     samples = [ImuSample(t, [0., 0., 9.81], [0., 0., .1])
                for t in np.linspace(0., .1, 11)]
     solver = gv.GtsamVisualInertialSolver({
-        'frontend_fix_previous_state': fixed_previous, 'frontend_fix_bias': fixed_bias,
+        'frontend_fix_previous_state': fixed_previous,
         'gtsam_vi_min_iterations': 7, 'gtsam_vi_max_iterations': 7})
     target, pim = solver.predict_current(previous, samples, np.eye(4))
     target.pose[0, 3] += .001

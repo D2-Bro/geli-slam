@@ -74,29 +74,6 @@ def match_trajectory_timestamps(estimated, ground_truth, max_delta_s):
     return matches
 
 
-def estimate_se3_alignment(estimated_poses, ground_truth_poses):
-    """Return the rigid transform mapping estimated positions into GT coordinates."""
-    estimated = np.asarray([pose[:3, 3] for pose in estimated_poses], dtype=np.float64)
-    ground_truth = np.asarray([pose[:3, 3] for pose in ground_truth_poses], dtype=np.float64)
-    if estimated.shape[0] < 3:
-        raise ValueError("at least three timestamp matches are required for SE(3) alignment")
-    estimated_center = estimated.mean(axis=0)
-    ground_truth_center = ground_truth.mean(axis=0)
-    centered_estimated = estimated - estimated_center
-    centered_ground_truth = ground_truth - ground_truth_center
-    if np.linalg.matrix_rank(centered_estimated) < 2:
-        raise ValueError("estimated positions are insufficiently diverse for SE(3) alignment")
-    left, _, right_t = np.linalg.svd(centered_estimated.T @ centered_ground_truth)
-    rotation = right_t.T @ left.T
-    if np.linalg.det(rotation) < 0.0:
-        right_t[-1, :] *= -1.0
-        rotation = right_t.T @ left.T
-    alignment = np.eye(4)
-    alignment[:3, :3] = rotation
-    alignment[:3, 3] = ground_truth_center - rotation @ estimated_center
-    return alignment
-
-
 def estimate_first_pose_alignment(estimated_pose, ground_truth_pose):
     """Map the first matched final pose to GT, then keep that transform fixed.
 

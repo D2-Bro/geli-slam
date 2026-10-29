@@ -1,0 +1,157 @@
+# Experimental profile for fixture-rock-long-figure8-20261001-v1 ONLY.
+# Fixed stationary interval: 1.0 -> 2.9 s in the native IMU header clock.
+# GT pose/velocity initialization is disabled. GT topics below are evaluation-only.
+# Existing accelerometer-bias calibration is retained. This is not a real-sensor calibration.
+# Enable changes 1 and 2 only: coast velocity and stationary gyro-bias uncertainty.
+# Keep the baseline normal weight and position-integration uncertainty.
+# The historical report includes a separate weight-tuned experiment:
+# docs/imu_coast_experiments_20261021.txt. Its combined metrics do not apply here.
+contact_mask_config:
+  color_dist_threshold: 15
+  height_threshold: 0.2
+device_config:
+  calibration_model_path: /home/dongjae/dataset/GeLISLAM/nnmodel.pth
+  device_name: GelSight Mini simulation
+  framerate: 20
+  image_topic: /image
+  imgh: 240
+  imgw: 320
+  ppmm: 0.059
+  raw_imgh: 2464
+  raw_imgw: 3280
+  torch_num_threads: 4
+gelslam_config:
+  pose_graph_config:
+    ccs_threshold: 0.7
+    coverage_graph_overlap_threshold: 50
+    imu_max_sample_gap_s: 0.05
+    initial_accel_bias_sigma_mps2: 0.1
+    initial_gyro_bias_sigma_rps: 0.01
+    initial_velocity_sigma_mps: 0.1
+    loop_pgo_rotation_sigma_rad: 0.01
+    loop_pgo_translation_sigma_m: 0.0001
+    loop_search_exclude_recent_keyframes: 10
+    loop_search_min_interval_s: 0.0
+    max_iterations: 10
+    min_sift_inliers: 8
+    scr_threshold: 0.3
+  track_config:
+    ccs_threshold: 0.5
+    contact_failure_keyframe_interval_s: 0.5
+    contact_threshold: 500
+    correspondence_max_lines: 30
+    debug_visualization_enabled: false
+    image_queue_size: 1
+    keep_imu_only_frames: true
+    keyframe_max_interval_s: 0.5
+    scr_threshold: 0.5
+imu_config:
+  accelerometer_bias_random_walk: 0.00086
+  accelerometer_noise_density: 0.002
+  buffer_max_samples: 6000
+  dense_normalflow_quality_samples: 1000
+  dense_normalflow_residual_weight: 1.0
+  dense_normalflow_samples: 1000
+  enabled: true
+  frame_id: imu_frame
+  frontend_first_trial_velocity_from_gt: false
+  frontend_fix_previous_state: false
+  frontend_gravity_initialization: static_imu
+  frontend_gt_previous_state_test:
+    enabled: false
+    previous_pose_from_gt: true
+    previous_state_time: accepted_state
+    previous_velocity_from_gt: true
+    reference_pose_from_gt: true
+    reset_marginal_prior: true
+  frontend_gt_velocity_max_age_s: 0.05
+  frontend_gt_velocity_window_s: 0.05
+  frontend_imu_prediction_only: false
+  frontend_initialize_from_imu_preintegration: true
+  frontend_optimization: true
+  frontend_state_mode: reference_marginalization
+  gelsight_T_imu:
+  - - 1.0
+    - 0.0
+    - 0.0
+    - 0.0
+  - - 0.0
+    - -1.0
+    - 0.0
+    - 0.0
+  - - 0.0
+    - 0.0
+    - -1.0
+    - -0.04
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+  gravity_initialization: measured_acceleration
+  gravity_mps2: 9.80665
+  ground_truth_gel_pose_topic: /ground_truth/gel_pose
+  ground_truth_imu_pose_topic: /ground_truth/imu_pose
+  gt_trial_attitude_max_age_s: 0.05
+  gtsam_integration_sigma_m: 0.01
+  gtsam_vi_height_z_enabled: true
+  gtsam_vi_height_z_sigma_m: 0.0001
+  gtsam_vi_marginalization: true
+  gtsam_vi_max_iterations: 10
+  gtsam_vi_min_iterations: 5
+  gtsam_vi_normal_huber_delta: 0.4
+  gtsam_vi_normal_huber_iterations: 3
+  gtsam_vi_normal_linearization: inverse_compositional
+  gtsam_vi_normal_reference_z_from_imu: false
+  gtsam_vi_prior_accel_bias_sigma_mps2: 0.1
+  gtsam_vi_prior_gyro_bias_sigma_rps: 0.01
+  gtsam_vi_prior_rotation_sigma_rad: 0.0001
+  gtsam_vi_prior_translation_sigma_m: 0.0001
+  gtsam_vi_prior_velocity_sigma_mps: 0.0001
+  gtsam_vi_rotation_stop_rad: 0.0001
+  gtsam_vi_translation_stop_m: 1.0e-05
+  gyro_max_rate_rad_s: 5.0
+  gyroscope_bias_random_walk: 2.2e-05
+  gyroscope_noise_density: 0.00016
+  image_to_imu_time_offset_s: 0.0
+  imu_residual_weight: 1.0
+  initial_accel_bias_mps2:
+  - 0.003199013336299
+  - -0.001884809410931
+  - 0.004030771482307
+  initial_gyro_bias_rps:
+  - 0.000214713140307
+  - -0.000100101604392
+  - 0.000168981825459
+  integration_method: midpoint
+  max_coast_duration_s: 1.0
+  max_sample_gap_s: 0.05
+  static_initialization:
+    enabled: true
+    gyro_bias_uncertainty_from_samples: true
+    end_time_s: 2.9
+    max_propagation_s: 5.0
+    max_sample_gap_s: 0.05
+    min_samples: 50
+    mode: fixed_time
+    start_time_s: 1.0
+    velocity_sigma_mps: 0.01
+  topic: /imu/data_raw
+  coast_velocity_fit:
+    enabled: true
+    model: inertial_quadratic
+    window_s: 0.4
+    min_samples: 5
+    min_span_s: 0.3
+    max_sample_gap_s: 0.15
+    max_fit_rmse_m: 5.0e-05
+    max_velocity_change_mps: 0.02
+trajectory_evaluation:
+  enabled: true
+  ground_truth_pose_topic: /ground_truth/gel_pose
+  state_velocity:
+    enabled: true
+    ground_truth_pose_topic: /ground_truth/imu_pose
+    time_offset_s: 1.0
+    timestamp_tolerance_s: 0.03
+    truth_path: /home/dongjae/dataset/GeLISLAM/fixture-rock-long-figure8-20261001-v1-gelslam-image/assets/trajectory_truth.npz
+  timestamp_tolerance_s: 0.03

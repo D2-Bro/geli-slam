@@ -80,3 +80,34 @@ def test_capture_uses_state_timestamp_and_never_stale_or_mutated_velocity():
     tracker._imu_timestamp = lambda header: 1.
     tracker.tracking_mode.value = 'tactile_hold'
     assert capture_state_velocity(tracker, message) is None
+
+
+def test_capture_diagnostics_use_published_coast_bias_and_world_axes():
+    from gelslam.core.inertial import ImuBuffer, ImuSample
+    rotation = Rotation.from_euler('x', 90, degrees=True).as_matrix()
+    pose = np.eye(4)
+    pose[:3, :3] = rotation
+    state = SimpleNamespace(timestamp=2., pose=pose, velocity=np.array((1., 2., 3.)),
+                            accel_bias=np.array((.1, .2, .3)), gyro_bias=np.array((.01, .02, .03)))
+    buffer = ImuBuffer()
+    buffer.add(ImuSample(1.9, (1., 2., 3.), (.2, .3, .4)))
+    buffer.add(ImuSample(2.1, (3., 4., 5.), (.4, .5, .6)))
+    gravity = np.array((0., 0., -9.81))
+    tracker = SimpleNamespace(frontend_visual_inertial=SimpleNamespace(gravity=gravity),
+        tracking_mode=SimpleNamespace(value='no_contact_coasting'),
+        _frontend_coast_state=state, _frontend_vi_state=SimpleNamespace(timestamp=1.),
+        _trial_index=2, _imu_timestamp=lambda _: 2., imu_buffer=buffer)
+    message = SimpleNamespace(fid=5, ref_kid=3, tracking_status='no_contact_coasting',
+        header=SimpleNamespace(stamp=SimpleNamespace(sec=1, nanosec=950000000)))
+    record = capture_state_velocity(tracker, message)
+    assert record['stage'] == 'no_contact_prediction'
+    assert record['imu_sample_timestamp_s'] == 2.
+    np.testing.assert_allclose(record['linear_acceleration_world_mps2'],
+                               rotation @ (np.array((2., 3., 4.)) - state.accel_bias) + gravity)
+    assert record['acceleration_sampling'] == 'measurement_at_state_timestamp'
+    state.accel_bias[:] = 9.
+    state.gyro_bias[:] = 8.
+    gravity[:] = 7.
+    assert record['accel_bias'] == [.1, .2, .3]
+    assert record['gyro_bias'] == [.01, .02, .03]
+    assert record['gravity_world_mps2'] == [0., 0., -9.81]

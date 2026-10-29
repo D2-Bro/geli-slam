@@ -143,13 +143,10 @@ def test_backend_states_are_imu_and_output_and_reload_remain_gelsight(tmp_path):
         keyframe.imu_samples = tuple(ImuSample(s.timestamp, extrinsic[:3, :3].T @ [0., 0., 9.81],
                                                [0., 0., 0.]) for s in keyframe.imu_samples)
     graph.add_keyframes(frames, 0, 2)
-    assert np.allclose(graph.graph_init.atPose3(0).matrix(), extrinsic)
-    perturbed = extrinsic.copy()
-    perturbed[:3, 3] += [.002, .001, -.003]
-    graph.graph_init.update(1, gtsam.Pose3(perturbed))
+    assert np.allclose(graph.states[1].pose, extrinsic)
     solution = graph.solve(global_optimization=True)
     assert np.allclose(solution[1], np.eye(4), atol=1e-7)
-    assert np.allclose(graph.graph_result.atPose3(1).matrix(), extrinsic, atol=1e-7)
+    assert np.allclose(graph.map_state(1).pose, extrinsic, atol=1e-7)
     graph.save(tmp_path)
     loaded = PoseGraph.load(tmp_path)
     assert np.allclose(loaded.raw_solutions()[1], np.eye(4), atol=1e-7)
@@ -162,24 +159,3 @@ def test_old_active_gelsight_tracker_state_is_not_loaded_as_imu(tmp_path):
     with pytest.raises(ValueError, match='GelSight navigation states'):
         Tracker.load(tmp_path, 'unused', SimpleNamespace())
 
-
-@pytest.mark.parametrize("marginalization", [False, True])
-def test_backend_local_window_keeps_offset_imu_variables_and_gel_output(marginalization):
-    from gelslam.core.backend_factors import velocity_key, bias_key
-    extrinsic = mount()
-    config = backend_config(marginalization_enabled=marginalization)
-    config['imu_config']['gelsight_T_imu'] = extrinsic.tolist()
-    graph, frames = PoseGraph(config), []
-    for key in range(7):
-        packet = backend_frame(key, new=key == 0)
-        packet.navigation_state.pose = extrinsic.copy()
-        packet.imu_samples = tuple(ImuSample(s.timestamp, extrinsic[:3, :3].T @ [0., 0., 9.81],
-                                             [0., 0., 0.]) for s in packet.imu_samples)
-        frames.append(packet)
-        graph.add_keyframes(frames, key, key + 1)
-        solution = graph.solve()
-        assert np.allclose(solution[key], np.eye(4), atol=1e-7)
-        assert np.allclose(graph.graph_init.atPose3(key).matrix(), extrinsic, atol=1e-7)
-        assert graph.graph_init.exists(velocity_key(key)) and graph.graph_init.exists(bias_key(key))
-    if marginalization:
-        assert graph.window_start == 4

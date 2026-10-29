@@ -16,7 +16,7 @@ from gelslam.core.marginal_prior import NavigationPrior
 def header(timestamp):
     sec = int(timestamp)
     return SimpleNamespace(
-        stamp=SimpleNamespace(sec=sec, nanosec=int((timestamp - sec) * 1e9))
+        stamp=SimpleNamespace(sec=sec, nanosec=int(round((timestamp - sec) * 1e9)))
     )
 
 
@@ -40,17 +40,13 @@ def make_coasting_tracker():
     tracker.ppmm = 1.0
     tracker.track_config = {"scr_threshold": 0.3, "ccs_threshold": 0.7}
     tracker.frontend_visual_inertial = None
-    tracker._frontend_vi_prev_pose = None
-    tracker._frontend_vi_prev_velocity = None
-    tracker._frontend_vi_prev_bias = None
-    tracker._frontend_vi_prev_timestamp = None
     return tracker
 
 
 def test_successful_tactile_anchor_can_coast_to_a_later_image_timestamp():
     tracker = make_coasting_tracker()
 
-    assert tracker._anchor_inertial_state(np.eye(4), header(1.0), reset_reference=True)
+    assert tracker._anchor_inertial_state(np.eye(4), header(1.0))
     assert tracker._coast_to_header(header(2.0), TrackingMode.IMU_COASTING)
 
     assert tracker.tracking_mode is TrackingMode.IMU_COASTING
@@ -59,27 +55,6 @@ def test_successful_tactile_anchor_can_coast_to_a_later_image_timestamp():
         np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
         atol=1e-6,
     )
-
-
-def test_no_contact_coast_uses_fixed_configured_bias():
-    tracker = make_coasting_tracker()
-    accel_bias = np.array([.003, -.002, .004])
-    gyro_bias = np.array([.0002, -.0001, .00015])
-    tracker.frontend_visual_inertial = GtsamVisualInertialSolver({
-        'frontend_fix_bias': True,
-        'initial_accel_bias_mps2': accel_bias.tolist(),
-        'initial_gyro_bias_rps': gyro_bias.tolist(),
-    })
-    accepted = NavigationState(1., np.eye(4), np.zeros(3), np.ones(3), np.ones(3))
-    tracker._frontend_vi_state = accepted
-    assert tracker._initialize_no_contact_coast()
-    assert np.array_equal(tracker._frontend_coast_state.accel_bias, accel_bias)
-    assert np.array_equal(tracker._frontend_coast_state.gyro_bias, gyro_bias)
-    assert tracker._coast_to_header(header(2.), TrackingMode.IMU_COASTING)
-    assert np.array_equal(tracker._frontend_coast_state.accel_bias, accel_bias)
-    assert np.array_equal(tracker._frontend_coast_state.gyro_bias, gyro_bias)
-    assert tracker._frontend_vi_state is accepted
-    assert np.array_equal(accepted.accel_bias, np.ones(3))
 
 
 def test_no_contact_coast_retains_imu_from_last_accepted_vi_state():
@@ -92,7 +67,7 @@ def test_no_contact_coast_retains_imu_from_last_accepted_vi_state():
         ImuSample(3.0, (0.0, 0.0, 9.81), (0.0, 0.0, 0.0))
     )
 
-    assert tracker._anchor_inertial_state(np.eye(4), header(1.0), reset_reference=True)
+    assert tracker._anchor_inertial_state(np.eye(4), header(1.0))
     assert tracker._coast_to_header(header(2.0), TrackingMode.NO_CONTACT_COASTING)
     assert tracker._coast_to_header(header(3.0), TrackingMode.NO_CONTACT_COASTING)
 
@@ -171,9 +146,6 @@ def test_first_trial_velocity_uses_gt_imu_positions_in_trial_axes():
         tracker._frontend_vi_state.velocity,
         world_velocity,
         atol=1e-10,
-    )
-    assert np.allclose(
-        tracker._frontend_vi_prev_velocity, tracker._frontend_vi_state.velocity
     )
 
 
@@ -596,7 +568,7 @@ def test_simulation_biases_and_static_gravity_window_initialize_state():
         ImuSample(1.0, (0.003, -0.002, 9.81065), (0.0, 0.0, 0.0))
     )
 
-    assert tracker._anchor_inertial_state(np.eye(4), header(1.0), reset_reference=True)
+    assert tracker._anchor_inertial_state(np.eye(4), header(1.0))
     assert np.allclose(tracker.inertial_state.accel_bias, [0.003, -0.002, 0.004])
     assert np.allclose(tracker.inertial_state.gyro_bias, [0.0002, -0.0001, 0.00015])
     assert np.allclose(tracker.inertial_propagator.gravity, [0.0, 0.0, -9.80665])
@@ -611,7 +583,7 @@ def test_fixed_world_z_gravity_does_not_depend_on_raw_acceleration_direction():
         }
     )
 
-    assert tracker._anchor_inertial_state(np.eye(4), header(1.0), reset_reference=True)
+    assert tracker._anchor_inertial_state(np.eye(4), header(1.0))
 
     assert np.allclose(tracker.inertial_propagator.gravity, [0.0, 0.0, -9.80665])
 
@@ -624,7 +596,7 @@ def test_fixed_world_z_gravity_transforms_with_reference_keyframe():
     )
 
     assert tracker._anchor_inertial_state(
-        np.eye(4), header(1.0), reset_reference=True
+        np.eye(4), header(1.0)
     )
     assert np.allclose(
         tracker.inertial_propagator.gravity,
@@ -647,7 +619,7 @@ def test_initial_ground_truth_pose_initializes_gravity_in_tracker_reference():
     # must not replace that locked convention.
     assert tracker.add_ground_truth_gel_rotation(2.0, np.eye(3))
 
-    assert tracker._anchor_inertial_state(np.eye(4), header(1.0), reset_reference=True)
+    assert tracker._anchor_inertial_state(np.eye(4), header(1.0))
 
     assert np.allclose(tracker.inertial_propagator.gravity, [0.0, -9.80665, 0.0])
     assert np.allclose(tracker.initial_ground_truth_world_R_gel, world_R_gel)
@@ -679,50 +651,16 @@ def test_later_trial_no_contact_gravity_uses_its_reference_keyframe():
         )
 
     assert not tracker._anchor_inertial_state(
-        np.eye(4), header(2.0), reset_reference=True
+        np.eye(4), header(2.0)
     )
     tracker.add_ground_truth_gel_rotation(2.0, world_R_gel)
     assert tracker._anchor_inertial_state(
-        np.eye(4), header(2.0), reset_reference=True
+        np.eye(4), header(2.0)
     )
     assert np.allclose(tracker.inertial_propagator.gravity, gravity_reference)
     assert tracker._coast_to_header(header(3.0), TrackingMode.IMU_COASTING)
     assert np.allclose(tracker.inertial_state.position, 0.0, atol=1e-9)
     assert np.allclose(tracker.inertial_state.velocity, 0.0, atol=1e-9)
-
-
-def test_later_tactile_anchor_keeps_gyro_propagated_attitude_by_default():
-    """Tactile translation correction must not reset gravity-compensating attitude."""
-    tracker = make_coasting_tracker()
-    assert tracker._anchor_inertial_state(np.eye(4), header(1.0), reset_reference=True)
-
-    deliberately_wrong_tactile_pose = np.eye(4)
-    deliberately_wrong_tactile_pose[0, 0] = -1.0
-    deliberately_wrong_tactile_pose[1, 1] = -1.0
-    deliberately_wrong_tactile_pose[0, 3] = 1.0
-    assert tracker._anchor_inertial_state(
-        deliberately_wrong_tactile_pose, header(2.0)
-    )
-
-    assert np.allclose(
-        tracker.inertial_state.rotation,
-        np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
-        atol=1e-6,
-    )
-    assert np.allclose(tracker.inertial_state.position, [1.0, 0.0, 0.0])
-
-
-def test_hard_reset_attitude_option_preserves_legacy_tactile_rotation_anchor():
-    tracker = make_coasting_tracker()
-    tracker.imu_config["tactile_attitude_correction"] = "hard_reset"
-    assert tracker._anchor_inertial_state(np.eye(4), header(1.0), reset_reference=True)
-
-    tactile_pose = np.eye(4)
-    tactile_pose[0, 0] = -1.0
-    tactile_pose[1, 1] = -1.0
-    assert tracker._anchor_inertial_state(tactile_pose, header(2.0))
-
-    assert np.allclose(tracker.inertial_state.rotation, tactile_pose[:3, :3])
 
 
 def test_contact_poses_defer_imu_initialization_until_contact_is_lost():
@@ -763,7 +701,7 @@ def test_contact_failure_is_not_published_or_imu_propagated(
     monkeypatch,
 ):
     tracker = make_coasting_tracker()
-    assert tracker._anchor_inertial_state(np.eye(4), header(1.0), reset_reference=True)
+    assert tracker._anchor_inertial_state(np.eye(4), header(1.0))
 
     class FakeFrame:
         def __init__(self, *_, **__):
@@ -822,7 +760,7 @@ def test_contact_failure_is_not_published_or_imu_propagated(
 
 def test_contact_failure_does_not_propagate_even_with_contact_history(monkeypatch):
     tracker = make_coasting_tracker()
-    assert tracker._anchor_inertial_state(np.eye(4), header(1.0), reset_reference=True)
+    assert tracker._anchor_inertial_state(np.eye(4), header(1.0))
 
     class FakeFrame:
         def __init__(self, *_, **__):
@@ -881,7 +819,7 @@ def test_contact_failure_does_not_propagate_even_with_contact_history(monkeypatc
 def test_reacquire_does_not_propagate_to_contact_time_before_normal_flow(monkeypatch):
     """Recontact registration must use the last trusted pose, not IMU coasting."""
     tracker = make_coasting_tracker()
-    assert tracker._anchor_inertial_state(np.eye(4), header(1.0), reset_reference=True)
+    assert tracker._anchor_inertial_state(np.eye(4), header(1.0))
 
     class FakeFrame:
         def __init__(self, *_, **__):
@@ -943,7 +881,7 @@ def test_reacquire_does_not_propagate_to_contact_time_before_normal_flow(monkeyp
 def test_reacquire_falls_back_to_the_last_contact_surface(monkeypatch):
     """A failed keyframe match retries without splitting the trial."""
     tracker = make_coasting_tracker()
-    assert tracker._anchor_inertial_state(np.eye(4), header(1.0), reset_reference=True)
+    assert tracker._anchor_inertial_state(np.eye(4), header(1.0))
 
     class FakeFrame:
         def __init__(self, label="new", *_, **__):
@@ -1017,7 +955,7 @@ def test_reacquire_failure_does_not_start_a_new_trial(
 ):
     """A rejected recontact frame must not reset the tactile trial."""
     tracker = make_coasting_tracker()
-    assert tracker._anchor_inertial_state(np.eye(4), header(1.0), reset_reference=True)
+    assert tracker._anchor_inertial_state(np.eye(4), header(1.0))
 
     class FakeFrame:
         def __init__(self, *_, **__):
@@ -1235,7 +1173,8 @@ def test_scr_failure_promotes_previous_accepted_frame(monkeypatch):
         get_surface_info=lambda *_args, **_kwargs: (None, None, None)
     )
     tracker.contact_mask_config = {"color_dist_threshold": 1, "height_threshold": 1}
-    tracker.track_config.update(contact_threshold=1)
+    # Short fixture interval; production/default 0.5 s is tested separately.
+    tracker.track_config.update(contact_threshold=1, contact_failure_keyframe_interval_s=0.04)
     tracker.prev_in_contact_flag = True
     tracker.prev_is_keyframe_flag = False
     previous_frame = FakeFrame()
@@ -1362,7 +1301,8 @@ def test_ccs_failure_promotes_previous_and_keeps_imu_interval(monkeypatch):
         get_surface_info=lambda *_args, **_kwargs: (None, None, None)
     )
     tracker.contact_mask_config = {"color_dist_threshold": 1, "height_threshold": 1}
-    tracker.track_config.update(contact_threshold=1)
+    # Short fixture interval; production/default 0.5 s is tested separately.
+    tracker.track_config.update(contact_threshold=1, contact_failure_keyframe_interval_s=0.04)
     tracker.prev_in_contact_flag = True
     tracker.prev_is_keyframe_flag = False
     previous_frame = FakeFrame()
@@ -1381,7 +1321,6 @@ def test_ccs_failure_promotes_previous_and_keeps_imu_interval(monkeypatch):
         1.0, accepted_pose, np.array([0.01, 0, 0]), np.zeros(3), np.zeros(3)
     )
     tracker._frontend_vi_state = accepted
-    tracker._frontend_vi_prev_timestamp = 1.0
     refined_pose = np.eye(4)
     refined_pose[0, 3] = 0.14
     refined = NavigationState(
@@ -1435,7 +1374,6 @@ def test_ccs_failure_promotes_previous_and_keeps_imu_interval(monkeypatch):
     assert np.isclose(keyframes[0]["trial_T_curr"][0, 3], 0.03)
     assert tracker._frontend_vi_state is accepted
     assert tracker._frontend_vi_state.timestamp == 1.0
-    assert tracker._frontend_vi_prev_timestamp == 1.0
     assert np.allclose(tracker._frontend_vi_state.velocity, [0.01, 0, 0])
     assert tracker.ref_frame is previous_frame
     assert tracker.curr_fid == 4
@@ -1454,7 +1392,7 @@ def test_ccs_failure_promotes_previous_and_keeps_imu_interval(monkeypatch):
     assert intervals == [(1.0, [1.0, 2.0]), (1.0, [1.0, 2.0, 3.0])]
 
 
-def test_contact_failure_promotes_previous_then_tracks_next_frame(monkeypatch):
+def test_quality_failure_promotes_previous_then_tracks_next_frame(monkeypatch):
     tracker = make_coasting_tracker()
     tracker.gelsight_T_imu = None
 
@@ -1503,7 +1441,9 @@ def test_contact_failure_promotes_previous_then_tracks_next_frame(monkeypatch):
 
     def refine(*args, **kwargs):
         refine_calls.append((args, kwargs))
-        if len(refine_calls) in (1, 3):
+        if len(refine_calls) == 1:
+            raise tracker_module.QualityGateError(np.eye(4))
+        if len(refine_calls) == 3:
             raise tracker_module.LoseTrackError()
         return retracked_pose
 
@@ -1563,14 +1503,15 @@ def test_contact_failure_promotes_previous_then_tracks_next_frame(monkeypatch):
     assert refine_calls[1][0][3] is not refine_calls[0][0][3]
     assert "reference_pose" not in refine_calls[1][1]
 
+    # The next failed reference registration retries the last accepted surface
+    # for this same target image, rather than dropping it and promoting history.
     ret, (frame_msg, keyframe_msgs) = tracker.track(
-        np.zeros((1, 1, 3), dtype=np.uint8), header(4.0)
-    )
-    assert ret
-    assert frame_msg is None
-    assert len(keyframe_msgs) == 1
-    assert np.allclose(keyframe_msgs[0]["trial_T_curr"][:3, 3], [0.1, 0.02, 0.0])
-    assert np.allclose(tracker.trial_T_ref, keyframe_msgs[0]["trial_T_curr"])
+        np.zeros((1, 1, 3), dtype=np.uint8), header(4.0))
+    assert ret and frame_msg is not None and keyframe_msgs == []
+    assert len(refine_calls) == 4
+    assert refine_calls[2][0][3] is refine_calls[3][0][3]
+    assert "reference_pose" in refine_calls[3][1]
+
 
 
 def test_promoted_keyframe_preserves_trial_frame_vi_state():
@@ -1584,8 +1525,6 @@ def test_promoted_keyframe_preserves_trial_frame_vi_state():
         1.0, old_ref_T_new_ref.copy(), np.array([1.0, 0.0, 0.0]),
         np.array([0.01, 0.02, 0.03]), np.array([0.001, 0.002, 0.003]),
     )
-    tracker._frontend_vi_prev_pose = old_ref_T_new_ref.copy()
-    tracker._frontend_vi_prev_velocity = np.array([1.0, 0.0, 0.0])
     tracker.frontend_visual_inertial = SimpleNamespace(
         gravity=np.array([0.0, -9.81, 0.0])
     )
@@ -1629,7 +1568,7 @@ def test_failure_after_keyframe_promotion_keeps_committed_navigation_prior(monke
             return np.zeros(30), np.zeros((30, 6)), np.zeros((30, 6))
 
     monkeypatch.setattr(tracker_module, "DenseNormalResidual", lambda *a, **k: FlatVisual())
-    qualities = iter(((0.2, 0.9), (0.9, 0.2), (0.9, 0.9)))
+    qualities = iter(((0.2, 0.2), (0.9, 0.2), (0.9, 0.9)))
     monkeypatch.setattr(tracker_module, "normalflow_quality", lambda *a: next(qualities))
     monkeypatch.setattr(tracker_module, "create_keyframe_msg", lambda *a, **k: k)
 
@@ -1673,7 +1612,8 @@ def make_failing_contact_tracker(monkeypatch, already_keyframe=False,
     tracker.bg_images = [object()] * 10
     tracker.recon = SimpleNamespace(get_surface_info=lambda *a, **k: (None, None, None))
     tracker.contact_mask_config = {"color_dist_threshold": 1, "height_threshold": 1}
-    tracker.track_config.update(contact_threshold=1)
+    # Short fixture interval; production/default 0.5 s is tested separately.
+    tracker.track_config.update(contact_threshold=1, contact_failure_keyframe_interval_s=0.04)
     tracker.prev_in_contact_flag = True
     tracker.prev_is_keyframe_flag = already_keyframe
     tracker.prev_frame = ContactFrame()
@@ -1693,7 +1633,6 @@ def make_failing_contact_tracker(monkeypatch, already_keyframe=False,
         np.array([0.02, 0.03, 0.04]), np.array([0.01, 0.02, 0.03]),
     )
     tracker._frontend_vi_state = accepted
-    tracker._frontend_vi_prev_timestamp = 1.0
     solver = GtsamVisualInertialSolver({
         "frontend_initialize_from_imu_preintegration": initialize_from_imu,
     })
@@ -1711,7 +1650,7 @@ def make_failing_contact_tracker(monkeypatch, already_keyframe=False,
 @pytest.mark.parametrize("failure", ["quality", "registration"])
 @pytest.mark.parametrize("already_keyframe", [False, True])
 @pytest.mark.parametrize("initialize_from_imu", [False, True])
-def test_second_contact_failure_recovers_current_with_imu(
+def test_quality_failure_waits_but_registration_failure_recovers_immediately(
         monkeypatch, failure, already_keyframe, initialize_from_imu):
     tracker, accepted = make_failing_contact_tracker(
         monkeypatch, already_keyframe, initialize_from_imu,
@@ -1731,57 +1670,66 @@ def test_second_contact_failure_recovers_current_with_imu(
     monkeypatch.setattr(tracker, "_refine_normalflow_with_imu", reject)
     image = np.zeros((1, 1, 3), dtype=np.uint8)
     first_ret, first_result = tracker.track(image, header(1.04))
-    assert first_ret is (not already_keyframe)
-    if first_ret:
-        assert first_result[0] is None
-        assert first_result[1][0]["fid"] == 4
-    assert tracker._frontend_vi_state is accepted
-    assert solver.marginal_prior is prior
-
-    ret, result = tracker.track(image, header(1.08))
-    assert ret, "the second failure must publish the current IMU keyframe"
+    if failure == "quality":
+        assert first_ret is (not already_keyframe)
+        if first_ret:
+            assert first_result[0] is None
+            assert first_result[1][0]["fid"] == 4
+        assert tracker._frontend_vi_state is accepted
+        assert solver.marginal_prior is prior
+        ret, result = tracker.track(image, header(1.08))
+        recovery_time = 1.08
+        expected_kid = 3 if already_keyframe else 4
+    else:
+        ret, result = first_ret, first_result
+        recovery_time = 1.04
+        expected_kid = 3
+        assert tracker._contact_failure_since is None
+    assert ret
     frame_msg, keyframes = result
     assert len(keyframes) == 1
     keyframe = keyframes[0]
     assert keyframe["fid"] == frame_msg["fid"] == 5
-    assert keyframe["kid"] == frame_msg["ref_kid"] == (3 if already_keyframe else 4)
+    assert keyframe["kid"] == frame_msg["ref_kid"] == expected_kid
     assert keyframe["is_new_trial"] is False
     assert keyframe["header"] is frame_msg["header"]
-    assert tracker._imu_timestamp(keyframe["header"]) == pytest.approx(1.08)
-    # Constant gyro rotates by 0.4 * 0.08 rad. Bias-corrected acceleration
+    assert tracker._imu_timestamp(keyframe["header"]) == pytest.approx(recovery_time)
+    # Constant gyro rotates by 0.4 * duration rad. Bias-corrected acceleration
     # cancels gravity. Translation therefore follows the accepted velocity.
-    angle = 0.4 * 0.08
+    duration = recovery_time - accepted.timestamp
+    angle = 0.4 * duration
     delta_rotation = np.array([
         [np.cos(angle), -np.sin(angle), 0],
         [np.sin(angle), np.cos(angle), 0], [0, 0, 1],
     ])
     expected = accepted.pose.copy()
     expected[:3, :3] = accepted.pose[:3, :3] @ delta_rotation
-    expected[:3, 3] += accepted.velocity * 0.08
+    expected[:3, 3] += accepted.velocity * duration
     assert np.allclose(keyframe["trial_T_curr"], expected, atol=1e-8)
     assert np.allclose(frame_msg["ref_T_curr"], np.eye(4))
     assert np.allclose(tracker.trial_T_ref, expected)
-    assert tracker.prev_frame is tracker.ref_frame is calls[1]
+    assert tracker.prev_frame is tracker.ref_frame is calls[-1]
     assert tracker.prev_fid == tracker.curr_fid == 5
     assert tracker.prev_header is tracker.ref_header is frame_msg["header"]
     assert tracker.prev_is_keyframe_flag and tracker.prev_in_contact_flag
-    assert tracker.tracking_mode is TrackingMode.CONTACT_TRACKING
+    assert tracker.tracking_mode is TrackingMode.IMU_ONLY
     current = tracker._frontend_vi_state
-    assert current.timestamp == pytest.approx(1.08)
+    assert current.timestamp == pytest.approx(recovery_time)
     assert np.allclose(current.pose, expected)
     assert np.allclose(current.velocity, accepted.velocity)
     assert np.array_equal(current.accel_bias, accepted.accel_bias)
     assert np.array_equal(current.gyro_bias, accepted.gyro_bias)
     assert solver.initialize_from_imu_preintegration is initialize_from_imu
-    assert solver.marginal_prior is None
+    assert solver.marginal_prior is not prior
+    assert solver.marginal_prior.matches(current)
     assert solver.pending_marginal_prior is None
 
 
-def test_repeated_contact_failures_never_drop_three_frames(monkeypatch):
+def test_repeated_quality_failures_refresh_at_each_elapsed_interval(monkeypatch):
     tracker, _ = make_failing_contact_tracker(monkeypatch)
     monkeypatch.setattr(
         tracker, "_refine_normalflow_with_imu",
-        lambda *a, **k: (_ for _ in ()).throw(tracker_module.LoseTrackError()),
+        lambda *a, **k: (_ for _ in ()).throw(tracker_module.QualityGateError(np.eye(4))),
     )
     dropped = 0
     recoveries = 0
@@ -1794,11 +1742,11 @@ def test_repeated_contact_failures_never_drop_three_frames(monkeypatch):
         else:
             dropped += 1
         assert dropped < 3, "three successive inputs were rejected"
-    assert recoveries == 5
+    assert recoveries == 9
 
 
 def test_imu_recovery_rejects_stale_tail_samples(monkeypatch):
-    tracker, accepted = make_failing_contact_tracker(monkeypatch)
+    tracker, accepted = make_failing_contact_tracker(monkeypatch, already_keyframe=True)
     prior = tracker.frontend_visual_inertial.marginal_prior
     tracker.imu_buffer = ImuBuffer()
     for time in (1.0, 1.02, 1.04):
@@ -1808,7 +1756,6 @@ def test_imu_recovery_rejects_stale_tail_samples(monkeypatch):
         lambda *a, **k: (_ for _ in ()).throw(tracker_module.LoseTrackError()),
     )
     image = np.zeros((1, 1, 3), dtype=np.uint8)
-    tracker.track(image, header(1.04))
     assert tracker.track(image, header(1.08)) == (False, None)
     assert tracker._frontend_vi_state is accepted
     assert tracker.frontend_visual_inertial.marginal_prior is prior
@@ -1852,11 +1799,11 @@ def test_imu_recovery_before_next_imu_callback_holds_one_sample_period(monkeypat
 
 def test_tactile_success_resets_failure_sequence(monkeypatch):
     tracker, _ = make_failing_contact_tracker(monkeypatch)
-    outcomes = iter((False, True, False))
+    outcomes = iter((False, True, False, False))
 
     def refine(*args, **kwargs):
         if not next(outcomes):
-            raise tracker_module.LoseTrackError()
+            raise tracker_module.QualityGateError(np.eye(4))
         return np.eye(4, dtype=np.float32)
 
     monkeypatch.setattr(tracker, "_refine_normalflow_with_imu", refine)
@@ -1873,6 +1820,7 @@ def test_quality_recovery_then_visual_solve_uses_predicted_navigation_anchor(mon
     tracker, accepted = make_failing_contact_tracker(monkeypatch)
     solver = tracker.frontend_visual_inertial
     original_refine = solver.refine_current
+    recovery_refine = solver.refine_recovery_reference
     anchors = []
 
     class FlatVisual:
@@ -1895,6 +1843,10 @@ def test_quality_recovery_then_visual_solve_uses_predicted_navigation_anchor(mon
         )
 
     monkeypatch.setattr(solver, "refine_current", refine)
+    def recovery(*args, **kwargs):
+        anchors.append(args[2].timestamp)
+        return recovery_refine(*args, **kwargs)
+    monkeypatch.setattr(solver, "refine_recovery_reference", recovery)
     monkeypatch.setattr(tracker_module, "DenseNormalResidual", lambda *a, **k: FlatVisual())
     qualities = iter(((0.1, 0.9), (0.9, 0.1), (0.9, 0.9)))
     monkeypatch.setattr(tracker_module, "normalflow_quality", lambda *a: next(qualities))
@@ -1903,6 +1855,7 @@ def test_quality_recovery_then_visual_solve_uses_predicted_navigation_anchor(mon
     assert tracker._frontend_vi_state is accepted
     ret, (frame_msg, keyframes) = tracker.track(image, header(1.08))
     assert ret and frame_msg is not None and len(keyframes) == 1
+    recovery_kid = tracker.curr_kid
     recovery_pose = tracker.trial_T_ref.copy()
     assert recovery_pose[0, 3] < 1.0
     assert tracker.latest_normal_correspondences["status"] == (
@@ -1910,17 +1863,18 @@ def test_quality_recovery_then_visual_solve_uses_predicted_navigation_anchor(mon
     )
     assert tracker.latest_normal_correspondences["current_xy"].shape == (0, 2)
     ret, (frame_msg, keyframes) = tracker.track(image, header(1.12))
-    assert ret and keyframes == []
+    assert ret and not keyframes
+    assert frame_msg["ref_kid"] == tracker.curr_kid == recovery_kid
     assert anchors == pytest.approx([1.0, 1.0, 1.08])
     assert frame_msg["fid"] == 6
     assert solver.marginal_prior.matches(tracker._frontend_vi_state)
     assert solver.marginal_prior.anchor.timestamp == pytest.approx(1.12)
     assert np.allclose(
-        recovery_pose @ frame_msg["ref_T_curr"], tracker._frontend_vi_state.pose,
+        tracker.trial_T_ref @ frame_msg["ref_T_curr"], tracker._frontend_vi_state.pose,
     )
 
 
-def test_reacquire_counts_rejected_images_not_registration_attempts(monkeypatch):
+def test_reacquire_exhausts_references_before_immediate_imu_recovery(monkeypatch):
     tracker, _ = make_failing_contact_tracker(monkeypatch)
     tracker.prev_in_contact_flag = False
     tracker.inertial_state = SimpleNamespace(timestamp=1.0)
@@ -1933,13 +1887,16 @@ def test_reacquire_counts_rejected_images_not_registration_attempts(monkeypatch)
 
     monkeypatch.setattr(tracker, "_refine_normalflow_with_imu", reject)
     image = np.zeros((1, 1, 3), dtype=np.uint8)
-    assert tracker.track(image, header(1.04)) == (False, None)
+    ret, (frame_msg, keyframes) = tracker.track(image, header(1.04))
+    assert ret and frame_msg["tracking_status"] == "imu_only"
+    assert len(keyframes) == 1 and not keyframes[0]["tactile_valid"]
     assert len(calls) == 2  # Keyframe and previous tactile frame, same input image.
-    assert tracker._consecutive_tracking_failures == 1
-    assert tracker.curr_kid == 2
+    assert tracker._consecutive_tracking_failures == 0
+    assert tracker._contact_failure_since is None
+    assert tracker.curr_kid == 3
     ret, (frame_msg, keyframes) = tracker.track(image, header(1.08))
     assert ret and frame_msg is not None and len(keyframes) == 1
-    assert len(calls) == 4
+    assert len(calls) == 3
     assert keyframes[0]["is_new_trial"] is False
     assert tracker.ref_frame is calls[-1]
     assert tracker._consecutive_tracking_failures == 0
@@ -1949,7 +1906,7 @@ def test_no_contact_resets_contact_failure_sequence(monkeypatch):
     tracker, _ = make_failing_contact_tracker(monkeypatch)
     monkeypatch.setattr(
         tracker, "_refine_normalflow_with_imu",
-        lambda *a, **k: (_ for _ in ()).throw(tracker_module.LoseTrackError()),
+        lambda *a, **k: (_ for _ in ()).throw(tracker_module.QualityGateError(np.eye(4))),
     )
     image = np.zeros((1, 1, 3), dtype=np.uint8)
     tracker.track(image, header(1.04))
@@ -2011,19 +1968,20 @@ def test_recontact_after_backend_feedback_retains_initialized_trial(
     image = np.zeros((1, 1, 3), dtype=np.uint8)
     ok, result = tracker.track(image, header(1.08))
     if registration_fails:
-        assert not ok and result is None
-        assert tracker._frontend_vi_state is retained
-        assert tracker._consecutive_tracking_failures == 1
-        # No new no-contact image recreates the temporary coast state here.
-        ok, (frame_msg, keyframes) = tracker.track(image, header(1.12))
+        frame_msg, keyframes = result
         assert ok and len(keyframes) == 1
         assert not keyframes[0]["is_new_trial"]
-        assert tracker._frontend_vi_state.timestamp == pytest.approx(1.12)
+        assert not keyframes[0]["tactile_valid"]
+        assert frame_msg["tracking_status"] == "imu_only"
+        assert tracker._frontend_vi_state.timestamp == pytest.approx(1.08)
+        assert tracker._consecutive_tracking_failures == 0
+        assert tracker._contact_failure_since is None
     else:
         assert ok and result[1] == []
         assert tracker.curr_kid == 2
         assert tracker._frontend_vi_state.timestamp == pytest.approx(1.08)
-        assert tracker.frontend_visual_inertial.last_prior_source == "backend_keyframe"
+        # A rigid PGO frame correction re-frames and retains the frontend prior.
+        assert tracker.frontend_visual_inertial.last_prior_source == "retained"
     assert tracker._trial_index == 0
     assert tracker.prev_in_contact_flag
 
@@ -2110,6 +2068,8 @@ def test_contact_gap_reuses_preintegration_through_rejection_and_acceptance(
         monkeypatch, initialize_from_imu=initialize_from_imu,
     )
     solver = tracker.frontend_visual_inertial
+    solver.config["integration_method"] = "midpoint"
+    tracker.imu_config["integration_method"] = "midpoint"
     prior = solver.marginal_prior
     tracker.imu_buffer = ImuBuffer()
     for time in np.linspace(1., 1.6, 31):
@@ -2235,6 +2195,7 @@ def test_frontend_recovery_coast_reacquire_keeps_accepted_optimization_anchor(
         ))
     solver = tracker.frontend_visual_inertial
     original_refine = solver.refine_current
+    recovery_refine = solver.refine_recovery_reference
     anchors = []
 
     class FlatVisual:
@@ -2253,6 +2214,10 @@ def test_frontend_recovery_coast_reacquire_keeps_accepted_optimization_anchor(
         )
 
     monkeypatch.setattr(solver, "refine_current", refine)
+    def recovery(*args, **kwargs):
+        anchors.append((args[2].timestamp, [sample.timestamp for sample in args[4]]))
+        return recovery_refine(*args, **kwargs)
+    monkeypatch.setattr(solver, "refine_recovery_reference", recovery)
     monkeypatch.setattr(tracker_module, "DenseNormalResidual", lambda *a, **k: FlatVisual())
     qualities = iter(((0., 0.), (0., 0.), (1., 1.), (1., 1.)))
     monkeypatch.setattr(tracker_module, "normalflow_quality", lambda *a: next(qualities))
@@ -2261,7 +2226,7 @@ def test_frontend_recovery_coast_reacquire_keeps_accepted_optimization_anchor(
     ret, (_, keyframes) = tracker.track(image, header(1.125))
     assert ret and len(keyframes) == 1
     recovered = tracker._frontend_vi_state
-    assert tracker.previous_tactile_ref_T is None
+    assert getattr(tracker, "previous_tactile_ref_T", None) is None
     monkeypatch.setattr(
         tracker_module, "Frame", lambda *a, **k: SimpleNamespace(is_contacted=False),
     )
@@ -2279,9 +2244,9 @@ def test_frontend_recovery_coast_reacquire_keeps_accepted_optimization_anchor(
     monkeypatch.setattr(
         tracker_module, "Frame", lambda *a, **k: tracker.prev_frame,
     )
-    ret, (_, keyframes) = tracker.track(image, header(1.375))
-    assert ret and keyframes == []
-    assert tracker.curr_kid == 4  # No new trial/keyframe on reacquisition.
+    ret, (frame_msg, keyframes) = tracker.track(image, header(1.375))
+    assert ret and not keyframes
+    assert frame_msg["ref_kid"] == tracker.curr_kid == 4  # Keep the IMU recovery keyframe.
     assert anchors[-1] == (1.125, [1.125, 1.1875, 1.25, 1.3125, 1.375])
     assert tracker._frontend_vi_state.timestamp == 1.375
     assert solver.marginal_prior.matches(tracker._frontend_vi_state)

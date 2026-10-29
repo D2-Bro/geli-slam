@@ -48,6 +48,40 @@ def gelsight_z_pose_jacobian(gel_from_state_increment, sigma):
     return row @ gel_from_state_increment
 
 
+def _frame_memo(frame, key, sources, compute):
+    """Memoize reference-only quantities on a frame.
+
+    One reference keyframe serves many target images. An entry is reused only
+    while the frame still holds the same source array objects; replacing a map
+    attribute invalidates it. Frames are not edited in place.
+    """
+    try:
+        cache = frame.__dict__.setdefault("_reference_selection_cache", {})
+    except AttributeError:
+        return compute()
+    entry = cache.get(key)
+    if entry is not None and all(a is b for a, b in zip(entry[0], sources)):
+        return entry[1]
+    value = compute()
+    cache[key] = (sources, value)
+    return value
+
+
+def curvature_selection(ref, count, ppmm):
+    """Original NormalFlow strongest-curvature mask and its float32 points."""
+    def compute():
+        # Match normalflow.registration: its threshold is strict by 1e-6.
+        threshold = np.partition(np.abs(ref.L).ravel(), -count)[-count] + 1e-6
+        mask = np.abs(ref.L) >= threshold
+        # Keep pixel indices, not a full-image mask, on long-lived keyframes.
+        return np.flatnonzero(mask), height2pointcloud(ref.H, mask, ppmm)
+    indices, points = _frame_memo(
+        ref, ("selection", int(count), float(ppmm)), (ref.L, ref.H), compute)
+    mask = np.zeros(np.shape(ref.L), dtype=bool)
+    mask.flat[indices] = True
+    return mask, points
+
+
 @dataclass
 class NavigationState:
     """Navigation pose, world velocity, and sensor-frame additive IMU biases.
@@ -85,7 +119,13 @@ class DenseNormalResidual:
     """
 
     def __init__(self, ref, tar, ppmm, initial_reference_pose,
-                 initial_target_pose, max_samples=3000):
+                 initial_target_pose, max_samples=3000, dtype=np.float64):
+        # Precision of the normal residual and stored reference IC rows.
+        # float32 (original NormalFlow) measured no faster here: projection,
+        # contact selection, height and the IC pose mapping must stay float64
+        # because the joint solve relies on an exact common-motion nullspace
+        # and rank tolerance 1e-12, so the rows are converted back each pass.
+        self.dtype = np.dtype(dtype)
         if get_J is None:
             raise ImportError(
                 "normalflow is required for DenseNormalResidual; "
@@ -108,18 +148,22 @@ class DenseNormalResidual:
         count = min(int(max_samples), ref.L.size)
         if count < 10 or self.ppmm <= 0.0:
             self.candidate_points = np.empty((0, 3))
-            self.candidate_normals = np.empty((0, 3))
-            self.candidate_normal_jacobian = np.empty((3, 5, 0))
+            self.candidate_normals = np.empty((0, 3), dtype=self.dtype)
+            self.candidate_normal_jacobian = np.empty((3, 5, 0), dtype=self.dtype)
             self.active_count = 0
             return
-        # Match normalflow.registration: its threshold is strict by 1e-6.
-        threshold = np.partition(np.abs(ref.L).ravel(), -count)[-count] + 1e-6
-        mask = np.abs(ref.L) >= threshold
-        points = height2pointcloud(ref.H, mask, self.ppmm).astype(np.float64)
-        normals = ref.N[mask].astype(np.float64)
-        normal_jacobian = get_J(
-            ref.N, mask, points.astype(np.float32), self.ppmm
-        ).astype(np.float64)
+        def compute():
+            mask, points32 = curvature_selection(ref, count, self.ppmm)
+            points = points32.astype(np.float64)
+            return (
+                points,
+                ref.N[mask].astype(self.dtype),
+                get_J(ref.N, mask, points.astype(np.float32), self.ppmm).astype(self.dtype),
+            )
+        candidates = _frame_memo(ref, ("candidates", count, self.ppmm, self.dtype),
+                                 (ref.L, ref.H, ref.N), compute)
+        # Own copies: callers may edit or replace an instance's candidates.
+        points, normals, normal_jacobian = (array.copy() for array in candidates)
         self.candidate_points = points
         self.candidate_normals = normals
         self.candidate_normal_jacobian = normal_jacobian
@@ -295,15 +339,16 @@ class DenseNormalResidual:
             return None
         relative, rotation, _, normal_tar, _, shared = projected
         self.last_active_rows = shared.copy()
+        dtype = self.candidate_normal_jacobian.dtype
         normal_error = (
-            normal_tar[shared] @ np.linalg.inv(rotation).T
+            normal_tar[shared] @ np.linalg.inv(rotation).T.astype(self.candidate_normals.dtype)
             - self.candidate_normals[shared]
         )
 
         if self._projection_cache is not None:
             if self._ic_reference_blocks is None:
                 source = np.transpose(self.candidate_normal_jacobian, (2, 0, 1))
-                blocks = np.zeros((len(source), 3, 6), dtype=np.float64)
+                blocks = np.zeros((len(source), 3, 6), dtype=dtype)
                 blocks[:, :, :5] = source
                 self._ic_reference_blocks = blocks
             # Only the fixed reference layout is shared. Select current rows
@@ -311,9 +356,9 @@ class DenseNormalResidual:
             normal_blocks = self._ic_reference_blocks[shared]
         else:
             source = np.transpose(self.candidate_normal_jacobian, (2, 0, 1))[shared]
-            normal_blocks = np.zeros((len(source), 3, 6), dtype=np.float64)
+            normal_blocks = np.zeros((len(source), 3, 6), dtype=dtype)
             normal_blocks[:, :, :5] = source
-        normal_relative = normal_blocks.reshape(-1, 6)
+        normal_relative = normal_blocks.reshape(-1, 6).astype(np.float64, copy=False)
 
         reference_jacobian, target_jacobian = normal_ic_pose_jacobians(normal_relative, relative)
         if self.fixed_reference_z_m is not None:
@@ -419,9 +464,7 @@ def normalflow_quality(ref, tar, tar_T_ref, ppmm, n_samples=3000):
     count = min(int(n_samples), ref.L.size)
     if count < 10:
         return 0.0, 0.0
-    threshold = np.partition(np.abs(ref.L).ravel(), -count)[-count] + 1e-6
-    mask = np.abs(ref.L) >= threshold
-    points = height2pointcloud(ref.H, mask, ppmm)
+    mask, points = curvature_selection(ref, count, ppmm)
     ref_laplacian = ref.L[mask]
     ref_contact = ref.C[mask]
     if len(points) < 10 or not np.any(ref_contact):

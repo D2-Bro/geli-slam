@@ -1,0 +1,23 @@
+KF 전달·루프 검색 수정 적용 보고서 (2026-10-21)
+
+결과: 두 결함 수정 및 루프 검색 간격 설정을 적용했다. gelslam 빌드 완료.
+- KF 승격: 이전 KF 기준 상태로 패킷을 만든 뒤 새 KF ID로 갱신한다.
+- 루프 검색: 배치 전체를 순서대로 처리한다. 같은 KF를 다시 검색하지 않는다.
+
+설정: gelslam_config.pose_graph_config.loop_search_min_interval_s
+- config.yaml, bag_simulation_config.yaml, real_config.yaml의 기본값은 0.0초다.
+- 0.0: 이전 참조가 있는 모든 새 KF를 검색한다.
+- 0.5 예시: 마지막 검색 KF와 데이터 시각 차이가 0.5초 이상인 KF를 검색한다.
+- navigation 상태 시각을 우선 사용한다. 상태가 없으면 영상 헤더 시각을 사용한다.
+- 간격 미만인 KF의 검색은 건너뛴다. 해당 KF는 이후 검색의 참조로 DB에 유지한다.
+- 새 epoch/세션에서 검색 상태를 초기화한다. 설정 변경 후 노드를 재시작한다.
+
+검증: 관련 테스트 227개 통과. 설치 경로의 코드 및 config 적용을 확인했다.
+원본 데이터 ROS 재생(0.5배속):
+- 시뮬레이션, 간격 0.0초 / Local VI ON / 피드백 OFF: KF 142개, 검색 141회.
+- 시뮬레이션, 간격 0.5초 / Local VI ON / 피드백 ON: KF 177개, 검색 127회, 설정에 따른 제외 49개.
+- real, 간격 0.5초 / Local VI OFF / 피드백 OFF: KF 112개, 검색 31회, 설정에 따른 제외 80개.
+- 세 실행 모두 기준 상태 누락·오류, 의도하지 않은 검색 누락, 중복 검색 0건. 마지막 KF 처리 및 정상 종료 확인.
+
+변경 파일: tracker.py, local_mapping.py, config 3개, README.md, 회귀 테스트 2개.
+증거: diagnostics/kf_loop_interval_20261021/{tests.log,build.log,runtime_manifest.json,runtime_results.json}

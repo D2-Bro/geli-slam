@@ -18,7 +18,9 @@ setup(
             [
                 "config/config.yaml",
                 "config/bag_simulation_config.yaml",
+                "config/figure8_imu_refined_experiment.yaml",
                 "config/real_config.yaml",
+                "config/real_far_config.yaml",
                 "config/gelslam_rviz.rviz",
             ],
         ),

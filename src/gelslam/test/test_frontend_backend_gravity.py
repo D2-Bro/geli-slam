@@ -86,7 +86,7 @@ def test_gt_imu_pose_callback_forwards_imu_position_for_velocity_initialization(
 
 
 def test_initialization_gt_subscription_waits_for_completed_anchor():
-    removed, cancelled = [], []
+    removed = []
     tracker = SimpleNamespace(
         imu_config={}, _frontend_vi_state=None, _trial_index=0,
         _pending_frontend_initialization=object(), _pending_trial_contact=object(),
@@ -96,9 +96,10 @@ def test_initialization_gt_subscription_waits_for_completed_anchor():
     node = SimpleNamespace(
         tracker=tracker, ground_truth_imu_pose_sub=subscription,
         destroy_subscription=lambda sub: removed.append(sub) or True,
-        _gt_imu_cleanup_timer=SimpleNamespace(cancel=lambda: cancelled.append(True)),
         get_logger=lambda: SimpleNamespace(info=lambda _: None),
     )
+    node._initialization_imu_gt_release_ready = lambda: (
+        TrackerNode._initialization_imu_gt_release_ready(node))
     TrackerNode._release_initialization_imu_gt(node)
     assert removed == []
     tracker._frontend_vi_state = object()
@@ -110,7 +111,6 @@ def test_initialization_gt_subscription_waits_for_completed_anchor():
     tracker._pending_trial_contact = None
     TrackerNode._release_initialization_imu_gt(node)
     assert removed == [subscription]
-    assert cancelled == [True]
     assert node.ground_truth_imu_pose_sub is None
     assert tracker._ground_truth_imu_positions == []
     TrackerNode._release_initialization_imu_gt(node)
@@ -127,6 +127,8 @@ def test_gt_state_diagnostic_keeps_its_continuous_imu_gt_subscription():
     subscription = object()
     node = SimpleNamespace(tracker=tracker, ground_truth_imu_pose_sub=subscription,
                            destroy_subscription=removed.append)
+    node._initialization_imu_gt_release_ready = lambda: (
+        TrackerNode._initialization_imu_gt_release_ready(node))
     TrackerNode._release_initialization_imu_gt(node)
     assert removed == []
     assert node.ground_truth_imu_pose_sub is subscription

@@ -18,3 +18,8 @@ int32 fid
 int32 ref_kid
 # Transformation matrix (4, 4) as a flattened array
 float32[] ref_t_curr
+
+# Estimation mode and actual pose time in the image clock.
+string tracking_status "contact_tracking"
+bool pose_valid true
+float64 pose_timestamp

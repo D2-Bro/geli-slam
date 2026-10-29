@@ -31,10 +31,9 @@ def make_sample(timestamp, acceleration=(0.0, 0.0, 9.81), angular_velocity=(0, 0
     return ImuSample(timestamp, np.array(acceleration), np.array(angular_velocity))
 
 
-def test_gyro_unit_guard_converts_explicit_degree_per_second_input():
-    gyro = gyro_to_rad_per_sec((0.0, 0.0, 90.0), "deg_s", max_rate_rad_s=2.0)
-
-    assert np.allclose(gyro, (0.0, 0.0, np.pi / 2.0))
+def test_gyro_unit_guard_rejects_non_rad_per_second_declaration():
+    with pytest.raises(ValueError, match="gyro_input_unit must be 'rad_s'"):
+        gyro_to_rad_per_sec((0.0, 0.0, 1.0), "deg_s", max_rate_rad_s=2.0)
 
 
 def test_gyro_unit_guard_rejects_rate_that_is_implausible_in_rad_per_second():
@@ -134,6 +133,22 @@ def test_buffer_interpolates_image_timestamp_boundaries_without_extrapolation():
     assert buffer.latest_at_or_before(0.75).timestamp == 0.0
     assert buffer.sample_at(-0.1) is None
     assert buffer.sample_at(1.1) is None
+
+
+def test_bisected_interval_queries_keep_closed_open_and_exact_endpoints():
+    buffer = ImuBuffer(max_samples=4)
+    for timestamp in (0.0, 0.1, 0.2, 0.3, 0.4, 0.5):  # 0.0 and 0.1 are evicted
+        buffer.add(make_sample(timestamp, acceleration=(timestamp, 0.0, 9.81)))
+
+    assert [s.timestamp for s in buffer.samples_between(0.2, 0.4)] == [0.2, 0.3, 0.4]
+    assert [s.timestamp for s in buffer.samples_between(0.0, 0.25)] == [0.2]
+    # Exact interior samples are endpoints, not duplicated interior samples.
+    assert [s.timestamp for s in buffer.samples_covering(0.3, 0.5)] == [0.3, 0.4, 0.5]
+    assert [s.timestamp for s in buffer.samples_covering(0.25, 0.45)] == [0.25, 0.3, 0.4, 0.45]
+    assert buffer.samples_covering(0.1, 0.3) == ()
+    # A query just before a sample snaps to it (bisect_left, 1 ns tolerance).
+    assert buffer.sample_at(0.3 - 5e-10).acceleration[0] == 0.3
+    assert np.isclose(buffer.sample_at(0.35).acceleration[0], 0.35)
 
 
 def test_propagator_returns_none_without_an_integration_interval():

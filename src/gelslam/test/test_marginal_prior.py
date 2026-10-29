@@ -1,12 +1,9 @@
-"""Information, gradient, lifecycle, and window checks for active GTSAM priors."""
-
-from types import SimpleNamespace
+"""Information, gradient and lifecycle checks for frontend GTSAM priors."""
 
 import gtsam
 import numpy as np
 import pytest
 
-from gelslam.core.gtsam_pose_graph import PoseGraph
 from gelslam.core.gtsam_vi import GtsamVisualInertialSolver
 from gelslam.core.inertial import ImuSample
 from gelslam.core.marginal_prior import NavigationPrior, marginalize_rows, marginalize_rows_system
@@ -210,100 +207,6 @@ def test_frontend_discontinuity_initializes_at_the_new_accepted_time():
 def test_frontend_rejects_invalid_initial_prior_sigma(sigma):
     with pytest.raises(ValueError, match="prior sigmas"):
         GtsamVisualInertialSolver({"gtsam_vi_prior_velocity_sigma_mps": sigma})
-
-
-# Backend state/window tests use the 15D graph; frontend prior tests above
-# and below retain their original independent navigation-state coverage.
-from backend_test_support import config as backend_config, frame as backend_frame
-from gelslam.core.backend_factors import state_keys
-
-
-def test_backend_marginal_prior_keeps_full_navigation_covariance():
-    instance = PoseGraph(backend_config())
-    frames = [backend_frame(i, new=i == 0) for i in range(6)]
-    instance.add_keyframes(frames, 0, len(frames))
-    window, values, _ = instance._window_graph(3)
-    full, local = gtsam.Marginals(instance.graph, instance.graph_init), gtsam.Marginals(window, values)
-    for key in state_keys(3):
-        assert np.allclose(local.marginalCovariance(key), full.marginalCovariance(key), rtol=1e-4, atol=1e-9)
-    A, _ = instance.marginal_prior.linearize(values).jacobian()
-    instance._window_graph(3)
-    again, _ = instance.marginal_prior.linearize(values).jacobian()
-    assert np.allclose(A.T @ A, again.T @ again)
-
-
-def test_separate_loop_pgo_preserves_local_prior_and_reload(tmp_path):
-    instance = PoseGraph(backend_config())
-    frames = [backend_frame(i, new=i == 0) for i in range(6)]
-    instance.add_keyframes(frames, 0, len(frames))
-    instance.solve()
-    assert instance._add_loop_pair(0, 5, np.eye(4))
-    instance.solve(global_optimization=True)
-    assert instance.marginal_prior.size() > 0 and instance.window_start == 3
-    assert instance.loop_pgo.factor_kinds.count('loop') == 1
-    instance.solve()
-    assert instance.marginal_prior.size() > 0
-    instance.save(tmp_path)
-    restored = PoseGraph.load(tmp_path)
-    assert np.allclose(restored.poses, instance.poses)
-    assert np.all(np.isfinite(restored.solve()[5]))
-
-
-def test_backend_trial_merge_removes_pgo_anchor_but_retains_local_priors():
-    instance = PoseGraph(backend_config())
-    frames = [backend_frame(0, new=True), backend_frame(1),
-              backend_frame(2, new=True, group=1), backend_frame(3, group=1), backend_frame(4, group=1)]
-    instance.add_keyframes(frames, 0, 5)
-    instance.solve()
-    assert instance._add_loop_pair(1, 3, np.eye(4))
-    instance.remove_prior_factors([1])
-    assert instance.prior_keys == [0, 2]
-    assert instance.loop_pgo.removed_groups == {1}
-    assert all(instance.graph.at(index) is not None for index in instance.navigation_prior_idxs[2])
-    instance.solve(global_optimization=True)
-    assert np.allclose(instance.poses, np.tile(np.eye(4), (5, 1, 1)), atol=1e-7)
-
-
-def test_disabled_marginalization_fixes_predecessor_and_optimizes_first_window_state():
-    instance = PoseGraph(backend_config(marginalization_enabled=False))
-    frames = [backend_frame(i, new=i == 0) for i in range(5)]
-    instance.add_keyframes(frames, 0, 5)
-    pose = instance.states[2].pose.copy()
-    pose[2, 3] = .004
-    instance.graph_init.update(2, gtsam.Pose3(pose))
-    predecessor = instance.states[1].pose.copy()
-    instance.solve()
-    np.testing.assert_array_equal(instance.states[1].pose, predecessor)
-    assert abs(instance.poses[2][2, 3]) < 1e-7
-    assert instance.marginal_prior.size() == 0
-
-
-def test_backend_local_prior_does_not_absorb_loop_pose_constraints():
-    instance = PoseGraph(backend_config())
-    frames = [backend_frame(i, new=i == 0) for i in range(6)]
-    instance.add_keyframes(frames, 0, 6)
-    assert instance._add_loop_pair(0, 5, np.eye(4))
-    window, values, _ = instance._window_graph(3)
-    prior_keys = {key for i in range(instance.marginal_prior.size()) for key in instance.marginal_prior.at(i).keys()}
-    assert set(state_keys(3)) == prior_keys
-    assert instance.loop_pgo.loops[0][:2] == (0, 5)
-    ordering = gtsam.Ordering()
-    for key in sorted(prior_keys):
-        ordering.push_back(key)
-    H, g = instance.marginal_prior.linearize(values).hessian(ordering)
-    assert np.linalg.norm(H - np.diag(np.diag(H))) > 1.
-    assert np.allclose(g, 0., atol=1e-12)
-
-
-def test_backend_discards_expired_component_without_separator():
-    instance = PoseGraph(backend_config())
-    frames = [backend_frame(0, new=True), backend_frame(1, new=True, group=1)]
-    instance.add_keyframes(frames, 0, 2)
-    window, values, _ = instance._window_graph(1)
-    assert instance.marginal_prior.size() == 0
-    assert instance._marginalized_factor_idxs == {0, 1, 2}
-    assert window.size() == 3 and instance.graph.size() == 6
-    assert window.error(values) == 0.
 
 
 def test_frontend_option_can_retain_fixed_previous_state_mode():

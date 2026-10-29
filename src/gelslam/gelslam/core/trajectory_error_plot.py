@@ -21,12 +21,17 @@ def write_trajectory_error_colormaps(output_dir, estimated, ground_truth,
             (OUTPUT_FILES[0], np.asarray(translation_errors_m) * 1000, "Translation error", "mm"),
             (OUTPUT_FILES[1], np.asarray(rotation_errors_deg), "Rotation error", "deg")):
         write_error_colormap(output_dir, estimated, ground_truth, values, filename,
-                             label + ": " + alignment_label + " final backend trajectory", title, unit)
+                             label + ": " + alignment_label + " final backend GelSight-origin trajectory",
+                             title, unit)
 
 
 def write_error_colormap(output_dir, estimated, ground_truth, values, filename,
                          label, title, unit, groups=None):
-    """Colour instantaneous sample errors; separate discontinuous trials."""
+    """Colour sample errors and connect every adjacent stored pose.
+
+    ``groups`` is retained for callers; time gaps and trial changes do not
+    interrupt the displayed estimate or matched GT lines.
+    """
     values = np.asarray(values, dtype=float)
     os.makedirs(output_dir, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", os.path.join(output_dir, ".matplotlib"))
@@ -46,17 +51,7 @@ def write_error_colormap(output_dir, estimated, ground_truth, values, filename,
         raise ValueError("At least two matched aligned poses are required")
     if not np.allclose(times, [sample[0] for sample in ground_truth], atol=1e-9, rtol=0):
         raise ValueError("Estimate and GT image timestamps must match")
-    intervals = np.diff(times)
-    positive_intervals = intervals[intervals > 0]
-    gap_limit = 3 * np.median(positive_intervals) if len(positive_intervals) else np.inf
-    connected = (intervals > 0) & (intervals <= gap_limit)
-    if groups is not None:
-        connected &= np.asarray(groups[:-1]) == np.asarray(groups[1:])
-    segments = np.stack((positions[:-1], positions[1:]), axis=1)[connected]
-    # The matched GT has the same sample times and the same display gaps.
-    truth_display = truth.copy()
-    breaks = np.flatnonzero(~connected) + 1
-    truth_display = np.insert(truth_display, breaks, np.nan, axis=0)
+    segments = np.stack((positions[:-1], positions[1:]), axis=1)
     bounds = np.vstack((positions, truth))
     centers = (bounds.min(axis=0) + bounds.max(axis=0)) / 2
     radius = max(float(np.ptp(bounds, axis=0).max()) * 0.55, 1e-6)
@@ -64,7 +59,7 @@ def write_error_colormap(output_dir, estimated, ground_truth, values, filename,
     if values.shape != times.shape or not np.all(np.isfinite(values)) or np.any(values < 0):
         raise ValueError("Each matched pose needs one finite non-negative error")
     norm = Normalize(vmin=0, vmax=max(float(values.max()), 1e-9))
-    segment_values = ((values[:-1] + values[1:]) / 2)[connected]
+    segment_values = (values[:-1] + values[1:]) / 2
     figure = plt.figure(figsize=(15, 7))
     grid = figure.add_gridspec(1, 3, width_ratios=(1, 1, 0.035),
                               left=0.03, right=0.95, bottom=0.13,
@@ -78,7 +73,7 @@ def write_error_colormap(output_dir, estimated, ground_truth, values, filename,
                                      cmap="turbo", norm=norm, linewidths=1.5)
         collection.set_array(segment_values)
         axis.add_collection(collection)
-        axis.plot(*truth_display[:, :dimensions].T, color="0.35",
+        axis.plot(*truth[:, :dimensions].T, color="0.35",
                   linestyle="--", linewidth=1, alpha=0.7)
         scatter_options = {"depthshade": False} if dimensions == 3 else {"zorder": 3}
         axis.scatter(*positions[:, :dimensions].T, c=values, cmap="turbo",
@@ -97,7 +92,7 @@ def write_error_colormap(output_dir, estimated, ground_truth, values, filename,
     spatial.set_title("3D trajectory")
     planar.set_aspect("equal", adjustable="box")
     planar.autoscale_view()
-    planar.set_title("XY projection")
+    planar.set_title("XY position projection")
     planar.legend(handles=[
         Line2D([], [], color=plt.get_cmap("turbo")(0.6), label="Estimate (error colour)"),
         Line2D([], [], color="0.35", linestyle="--", label="Matched GT"),
@@ -117,6 +112,7 @@ def write_velocity_component_colormaps(output_dir, estimated, ground_truth, erro
 
     Components are in the aligned GT world axes. All six panels share a
     symmetric colour scale; positive means estimate exceeds GT on that axis.
+    All stored poses are connected, including time gaps and trial changes.
     """
     os.makedirs(output_dir, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", os.path.join(output_dir, ".matplotlib"))
@@ -137,14 +133,7 @@ def write_velocity_component_colormaps(output_dir, estimated, ground_truth, erro
             or not np.isfinite(errors).all() or not np.allclose(
                 times, [sample[0] for sample in ground_truth], atol=1e-9, rtol=0)):
         raise ValueError("Component maps require matched poses and finite Nx3 velocity errors")
-    intervals = np.diff(times)
-    positive = intervals[intervals > 0]
-    limit = 3 * np.median(positive) if len(positive) else np.inf
-    connected = (intervals > 0) & (intervals <= limit)
-    if groups is not None:
-        connected &= np.asarray(groups[:-1]) == np.asarray(groups[1:])
-    segments = np.stack((positions[:-1], positions[1:]), axis=1)[connected]
-    truth_display = np.insert(truth, np.flatnonzero(~connected) + 1, np.nan, axis=0)
+    segments = np.stack((positions[:-1], positions[1:]), axis=1)
     bounds = np.vstack((positions, truth))
     center = (bounds.max(axis=0) + bounds.min(axis=0)) / 2
     radius = max(float(np.ptp(bounds, axis=0).max()) * 0.55, 1e-6)
@@ -156,7 +145,7 @@ def write_velocity_component_colormaps(output_dir, estimated, ground_truth, erro
                               wspace=0.32, hspace=0.25)
     for index, component in enumerate("XYZ"):
         values = errors[:, index]
-        segment_values = ((values[:-1] + values[1:]) / 2)[connected]
+        segment_values = (values[:-1] + values[1:]) / 2
         rmse = np.sqrt(np.mean(values**2))
         for row, dimensions, collection_type in ((0, 3, Line3DCollection), (1, 2, LineCollection)):
             axis = figure.add_subplot(grid[row, index], projection="3d" if row == 0 else None)
@@ -164,7 +153,7 @@ def write_velocity_component_colormaps(output_dir, estimated, ground_truth, erro
                                          linewidths=1.5)
             collection.set_array(segment_values)
             axis.add_collection(collection)
-            axis.plot(*truth_display[:, :dimensions].T, color="0.4", linestyle="--", linewidth=1)
+            axis.plot(*truth[:, :dimensions].T, color="0.4", linestyle="--", linewidth=1)
             scatter_options = {"depthshade": False} if row == 0 else {"zorder": 3}
             axis.scatter(*positions[:, :dimensions].T, c=values, cmap="coolwarm", norm=norm,
                          s=7, **scatter_options)
@@ -184,11 +173,12 @@ def write_velocity_component_colormaps(output_dir, estimated, ground_truth, erro
             else:
                 axis.set_aspect("equal", adjustable="box")
                 axis.autoscale_view()
-                axis.set_title(f"{component} error: XY trajectory")
+                axis.set_title(f"{component} error: IMU-origin XY trajectory")
     colorbar = figure.colorbar(plt.cm.ScalarMappable(norm=norm, cmap="coolwarm"),
                               cax=figure.add_subplot(grid[:, 3]))
     colorbar.set_label("Signed component error: estimate - GT [mm/s]")
-    figure.suptitle("GelSLAM: frontend State.velocity component errors in GT world axes\n"
+    figure.suptitle("GelSLAM: frontend State.velocity component errors on the IMU-origin trajectory\n"
+                   "Components in GT world axes | "
                    "Blue: negative | White: zero | Red: positive | Shared colour scale", y=0.97)
     figure.legend(handles=[Line2D([], [], color="tab:red", label="State trajectory (component error colour)"),
                            Line2D([], [], color="0.4", linestyle="--", label="Matched GT IMU trajectory")],

@@ -191,7 +191,7 @@ def test_tracker_publishes_normal_map_when_contact_tracking_is_rejected():
         contact_surface_pub=SimpleNamespace(publish=contact_clouds.append),
     )
 
-    TrackerNode.image_callback(node, SimpleNamespace(header=header))
+    TrackerNode._process_image(node, SimpleNamespace(header=header))
 
     assert len(normal_images) == len(contact_clouds) == 1
     assert normal_images[0].encoding == "rgb8"

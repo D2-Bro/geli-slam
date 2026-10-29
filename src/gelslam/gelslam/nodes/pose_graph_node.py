@@ -23,9 +23,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 
 from gelslam.core.coverage_graph import CoverageGraph, create_visible_coverage_graph_msg
-from gelslam.core.keyframe import KeyFrameDB, compute_adjusted_pointcloud
-from gelslam.core.parent_groups_info import ParentGroupsInfo
-from gelslam.core.gtsam_pose_graph import PoseGraph, PoseGraphSolutions
+from gelslam.core.keyframe import compute_adjusted_pointcloud
 from gelslam.core.topic_backend import TopicBackend
 from gelslam.core.backend_feedback import feedback_message
 from gelslam.core.slam_packets import keyframe_from_ros
@@ -34,7 +32,7 @@ from gelslam.core.trajectory_evaluation import (
     trajectory_output_dir,
 )
 from gelslam.utils import Logger, pointcloud2mesh
-from gelslam_msgs.msg import FrameMsg, KeyFrameMsg, VisibleCoverageGraphMsg, BackendFeedbackMsg, FramePoseMsg
+from gelslam_msgs.msg import KeyFrameMsg, VisibleCoverageGraphMsg, BackendFeedbackMsg, FramePoseMsg
 
 """
 ROS callbacks enqueue keyframes and record lightweight frame poses.
@@ -113,10 +111,7 @@ class PoseGraphNode(Node):
         self.feedback_pub = self.create_publisher(BackendFeedbackMsg, "backend_feedback", 1)
         self.create_subscription(String, "backend_stream_end", self.stream_end_callback, 10)
         if self.backend_optimization_enabled:
-            if self.pose_graph.local_vi_enabled:
-                self.logger.info("ROS process: backend; local 15D GelSight/IMU/bias graph; separate 4DoF yaw/XYZ loop PGO")
-            else:
-                self.logger.info("ROS process: backend; local VI disabled; 4DoF yaw/XYZ loop PGO with frontend seed odometry")
+            self.logger.info("ROS process: backend; global 15D pose/velocity/bias PGO with contact odometry and IMU")
         else:
             self.logger.info("ROS process: backend raw storage; optimization and feedback disabled")
         self.logger.info("Backend feedback publication %s" % (
@@ -251,7 +246,10 @@ class PoseGraphNode(Node):
         return pose if np.all(np.isfinite(pose)) else None
 
     def trajectory_frame_callback(self, frame_msg):
-        timestamp = self._header_timestamp(frame_msg.header)
+        if not getattr(frame_msg, "pose_valid", True):
+            return
+        timestamp = (getattr(frame_msg, "pose_timestamp", 0.0)
+                     or self._header_timestamp(frame_msg.header))
         pose_values = np.asarray(frame_msg.ref_t_curr, dtype=np.float64)
         if timestamp is None or pose_values.size != 16 or not np.all(np.isfinite(pose_values)):
             return
@@ -425,12 +423,11 @@ class PoseGraphNode(Node):
                 map_revision=self._backend.store.snapshot_for_tracking().revision,
                 backend_feedback=self.backend_feedback_enabled,
                 feedback_messages_published=self.feedback_messages_published,
-                local_vi_enabled=self.backend_optimization_enabled and self.pose_graph.local_vi_enabled,
-                factor_kinds={kind: self.pose_graph.factor_kinds.count(kind)
-                              for kind in set(self.pose_graph.factor_kinds)},
                 loop_pgo_factor_kinds={kind: self.pose_graph.loop_pgo.factor_kinds.count(kind)
                                       for kind in set(self.pose_graph.loop_pgo.factor_kinds)},
                 loop_pgo_degrees_of_freedom=self.pose_graph.loop_pgo.degrees_of_freedom,
+                loop_pgo_optimized_state_dimension=(self.pose_graph.loop_pgo.graph_result.dim()
+                    if self.pose_graph.loop_pgo.graph_result is not None else 0),
                 loop_pairs=len(self._backend.mapper.accepted_pairs),
                 loop_pgo_initial_cost=self.pose_graph.loop_pgo.last_initial_cost,
                 loop_pgo_final_cost=self.pose_graph.loop_pgo.last_final_cost), handle, indent=2)

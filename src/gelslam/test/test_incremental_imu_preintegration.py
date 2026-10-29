@@ -22,7 +22,7 @@ def interval():
         1.025, np.eye(4), np.array([.02, -.01, .03]),
         np.array([.003, -.002, .004]), np.array([.0002, -.0001, .00015]),
     )
-    solver = GtsamVisualInertialSolver({})
+    solver = GtsamVisualInertialSolver({'integration_method': 'midpoint'})
     cache = ImuPreintegrationAccumulator(
         anchor, buffer.sample_at(anchor.timestamp), solver.config, solver.gravity,
     )

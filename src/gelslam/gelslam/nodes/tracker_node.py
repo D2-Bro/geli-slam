@@ -11,24 +11,25 @@ import yaml
 import numpy as np
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.clock import Clock, ClockType
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.signals import SignalHandlerOptions
 from cv_bridge import CvBridge
 from rclpy.node import Node
 from sensor_msgs.msg import Image, Imu, PointCloud2, PointField
-from std_msgs.msg import String
+from std_msgs.msg import String, UInt32
 from normalflow.utils import height2pointcloud
 
 from gelslam.core.inertial import ImuSample, gyro_to_rad_per_sec
 from gelslam.core.recorded_source_clock import RecordedSourceClock
+from gelslam.core.static_imu_initialization import REST_EVENTS
+from gelslam.core.streaming_source_clock import StreamingSourceClock
 from gelslam.core.tracker import Tracker, TrackingMode
 from gelslam.core.backend_feedback import FeedbackReceiver
 from gelslam.core.slam_packets import ArrayBridge, FramePacket, KeyFramePacket, to_ros
 from gelslam.core.gt_state_diagnostic import gt_state_test_needs_gt, resolve_gt_state_test
 from gelslam.core.state_velocity_evaluation import StateVelocityEvaluation, capture_state_velocity
 from gelslam.core.trajectory_evaluation import trajectory_output_dir
+from gelslam.nodes.tracker_executor import TrackerExecutor
 from gelslam.utils import Logger
 from gelslam.visualization.normal_correspondences import (
     DEFAULT_CORRESPONDENCE_MAX_LINES,
@@ -38,11 +39,7 @@ from gelslam.visualization.normal_correspondences import (
 from gelslam_msgs.msg import FrameMsg, KeyFrameMsg, BackendFeedbackMsg, FramePoseMsg
 
 
-"""
-Single thread:
-1. Track thread:
-    - Image callback: Tracks the frame and publishes keyframes/frames.
-"""
+"""Serialize image tracking while receiving IMU in a separate callback group."""
 
 
 class TrackerNode(Node):
@@ -144,39 +141,45 @@ class TrackerNode(Node):
                     yaml.safe_dump(config, handle, sort_keys=False)
                 self.get_logger().info("Recording actual State.velocity; native IMU-origin GT, evaluation only: %s" % output_dir)
         self.recorded_source_clock = None
+        self.streaming_source_clock = None
+        self._source_clock_ready_logged = False
+        self._source_clock_error_logged = False
         self._unmatched_source_images = 0
         self._unmatched_source_imus = 0
         if self.tracker.imu_enabled and self.tracker.timestamp_source == "recorded_source":
             bag_path = config["imu_config"].get("recorded_source_bag_path")
             if not bag_path:
-                raise ValueError("imu_config.recorded_source_bag_path is required")
-            if not os.path.isabs(bag_path):
+                self.streaming_source_clock = StreamingSourceClock(
+                    warmup_s=float(config['imu_config'].get('recorded_source_warmup_s', 1.0)))
+                self.get_logger().info(
+                    "Using source timing topics; waiting for camera/IMU clock warmup; "
+                    "no bag path required")
+            elif not os.path.isabs(bag_path):
                 bag_path = os.path.join(os.path.dirname(config_path), bag_path)
-            if not os.path.isfile(bag_path):
+            if bag_path and not os.path.isfile(bag_path):
                 raise ValueError("recorded source bag database does not exist: %s" % bag_path)
-            self.recorded_source_clock = RecordedSourceClock(
-                bag_path,
-                image_topic=config["device_config"].get("image_topic", "image"),
-                camera_timing_topic=config["imu_config"].get(
-                    "camera_timing_topic", "/gelsight/timing"
-                ),
-                imu_topic=config["imu_config"].get("topic", "/imu/data"),
-                imu_device_time_topic=config["imu_config"].get(
-                    "imu_device_time_topic", "/imu/device_time_ms"
-                ),
-            )
-            self.get_logger().info(
-                "Using recorded source clocks from %s: %d images, %d IMU samples; "
-                "camera/IMU host-fit median residuals %.3f/%.3f ms; "
-                "image_to_imu_time_offset_s=%.6f"
-                % (
-                    bag_path, self.recorded_source_clock.image_count,
-                    self.recorded_source_clock.imu_count,
-                    self.recorded_source_clock.camera_fit[3] * 1000,
-                    self.recorded_source_clock.imu_fit[3] * 1000,
-                    self.tracker.image_to_imu_time_offset_s,
+            if bag_path:
+                self.recorded_source_clock = RecordedSourceClock(
+                    bag_path,
+                    image_topic=config["device_config"].get("image_topic", "image"),
+                    camera_timing_topic=config["imu_config"].get(
+                        "camera_timing_topic", "/gelsight/timing"),
+                    imu_topic=config["imu_config"].get("topic", "/imu/data"),
+                    imu_device_time_topic=config["imu_config"].get(
+                        "imu_device_time_topic", "/imu/device_time_ms"),
                 )
-            )
+                self.get_logger().info(
+                    "Using recorded source clocks from %s: %d images, %d IMU samples; "
+                    "camera/IMU host-fit median residuals %.3f/%.3f ms; "
+                    "image_to_imu_time_offset_s=%.6f"
+                    % (
+                        bag_path, self.recorded_source_clock.image_count,
+                        self.recorded_source_clock.imu_count,
+                        self.recorded_source_clock.camera_fit[3] * 1000,
+                        self.recorded_source_clock.imu_fit[3] * 1000,
+                        self.tracker.image_to_imu_time_offset_s,
+                    )
+                )
 
         # Initialize subscribers
         # Normal-flow image processing can take longer than one IMU period.
@@ -185,6 +188,21 @@ class TrackerNode(Node):
         # buffer is a single ordered producer.
         self.image_callback_group = MutuallyExclusiveCallbackGroup()
         self.imu_callback_group = MutuallyExclusiveCallbackGroup()
+        self._initialize_image_imu_sync()
+        if self.streaming_source_clock is not None:
+            self._source_clock_imu_guard = self.create_guard_condition(
+                self._resume_source_imu, callback_group=self.imu_callback_group)
+            for message_type, topic, callback, group in (
+                (String, config['imu_config'].get('camera_timing_topic', '/gelsight/timing'),
+                 self.source_camera_timing_callback, self.image_callback_group),
+                (UInt32, config['imu_config'].get('imu_device_time_topic', '/imu/device_time_ms'),
+                 self.source_imu_timing_callback, self.imu_callback_group),
+            ):
+                self.create_subscription(
+                    message_type, topic, callback,
+                    QoSProfile(depth=1000, reliability=ReliabilityPolicy.RELIABLE),
+                    callback_group=group)
+                self.get_logger().info("Subscribing to source timing from %s" % topic)
         image_queue_size = int(
             config.get("gelslam_config", {})
             .get("track_config", {})
@@ -205,9 +223,9 @@ class TrackerNode(Node):
             % (image_topic, image_queue_size)
         )
         self.imu_sub = None
+        self.rest_event_sub = None
         self.ground_truth_gel_pose_sub = None
         self.ground_truth_imu_pose_sub = None
-        self._gt_imu_cleanup_timer = None
         self._imu_dropped_samples = 0
         self._imu_invalid_gyro_samples = 0
         if self.tracker.imu_enabled:
@@ -238,6 +256,16 @@ class TrackerNode(Node):
                 "IMU gyro unit=%s; rejecting rates above %s rad/s after conversion"
                 % (self.gyro_input_unit, self.gyro_max_rate_rad_s)
             )
+            static_settings = getattr(self.tracker, "_static_imu_settings", None)
+            if static_settings is not None and static_settings["mode"] == "recorded_rest_event":
+                # The image group serializes event updates with initialization reads.
+                self.rest_event_sub = self.create_subscription(
+                    String, static_settings["events_topic"], self.rest_event_callback,
+                    QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE),
+                    callback_group=self.image_callback_group,
+                )
+                self.get_logger().info(
+                    "Subscribing to recorded rest events from %s" % static_settings["events_topic"])
             if (
                 imu_config.get("gravity_initialization") in {
                     "ground_truth_initial_pose", "ground_truth_gel_pose"
@@ -275,13 +303,6 @@ class TrackerNode(Node):
                        if diagnostic_gt
                        else "first-trial velocity initialization", ground_truth_imu_topic)
                 )
-                if not diagnostic_gt:
-                    # Run in the GT subscriptions' default mutually-exclusive
-                    # group, so destruction cannot race a GT callback.
-                    self._gt_imu_cleanup_timer = self.create_timer(
-                        0.1, self._release_initialization_imu_gt,
-                        clock=Clock(clock_type=ClockType.STEADY_TIME),
-                    )
 
         # Initialize publishers
         self.keyframe_pub = self.create_publisher(KeyFrameMsg, "keyframe", 1000)
@@ -318,13 +339,38 @@ class TrackerNode(Node):
                 ),
             )
 
-    def image_callback(self, msg):
-        """
-        Callback function for the image subscriber.
-        Tracks the frame and publishes keyframes/frames.
+    def _initialize_image_imu_sync(self):
+        """Wake serialized image processing when IMU reaches the image time."""
+        self._pending_image = None
+        self._pending_image_waited = False
+        self._image_imu_waits = 0
+        self._image_imu_replacements = 0
+        self._latest_accepted_imu_timestamp = (
+            self.tracker.imu_buffer.latest_timestamp() if self.tracker.imu_enabled else None
+        )
+        self._imu_image_sync_guard = None
+        if self.tracker.imu_enabled:
+            self._imu_image_sync_guard = self.create_guard_condition(
+                self._resume_image_after_imu, callback_group=self.image_callback_group,
+            )
+            self.logger.info(
+                "Image/IMU synchronization: wait for IMU to cover the selected "
+                "image time; keep only the latest waiting image"
+            )
 
-        :param msg: Image; The image message.
-        """
+    def image_callback(self, msg):
+        """Resolve the image clock and queue the latest image until IMU is ready."""
+        stream = getattr(self, 'streaming_source_clock', None)
+        if stream is not None:
+            try:
+                stream.add_image(msg)
+            except ValueError as error:
+                TrackerNode._source_clock_error(self, error)
+                return
+            self._source_clock_imu_guard.trigger()
+            TrackerNode._drain_source_images(self)
+            return
+        source_time = None
         if self.recorded_source_clock is not None:
             source_time = self.recorded_source_clock.image_timestamp(msg.header)
             if source_time is None:
@@ -334,7 +380,91 @@ class TrackerNode(Node):
                         "Dropping image without matching recorded camera timing"
                     )
                 return
+        TrackerNode._queue_selected_image(self, msg, source_time)
+
+    def _queue_selected_image(self, msg, source_time=None):
+        if source_time is not None:
             self.tracker.set_recorded_image_timestamp(msg.header, source_time)
+        if self._imu_image_sync_guard is not None:
+            if self._pending_image is not None:
+                self._image_imu_replacements += 1
+            self._pending_image = msg
+            self._pending_image_waited = False
+            self._process_pending_image()
+        else:
+            self._process_image(msg)
+
+    def _resume_image_after_imu(self):
+        """Resume in the image group; worker adapters can enqueue this operation."""
+        TrackerNode._drain_source_images(self)
+        self._process_pending_image()
+
+    def _source_clock_error(self, error):
+        if not getattr(self, '_source_clock_error_logged', False):
+            self._source_clock_error_logged = True
+            self.get_logger().error("Source timing stopped: %s" % error)
+
+    def source_camera_timing_callback(self, message):
+        try:
+            self.streaming_source_clock.add_camera_timing(message)
+        except ValueError as error:
+            TrackerNode._source_clock_error(self, error)
+            return
+        self._source_clock_imu_guard.trigger()
+        TrackerNode._drain_source_images(self)
+
+    def source_imu_timing_callback(self, message):
+        try:
+            self.streaming_source_clock.add_imu_timing(message)
+        except ValueError as error:
+            TrackerNode._source_clock_error(self, error)
+            return
+        TrackerNode._drain_source_imus(self)
+
+    def _resume_source_imu(self):
+        TrackerNode._drain_source_imus(self)
+
+    def _drain_source_imus(self):
+        stream = getattr(self, 'streaming_source_clock', None)
+        if stream is None:
+            return
+        for message, timestamp in stream.take_imus():
+            TrackerNode._ingest_imu(self, message, timestamp)
+        if stream.ready:
+            if not getattr(self, '_source_clock_ready_logged', False):
+                self._source_clock_ready_logged = True
+                self.get_logger().info(
+                    "Source timing topics ready; clock offsets fixed; "
+                    "camera PTS and unwrapped IMU device time active")
+            self._imu_image_sync_guard.trigger()
+
+    def _drain_source_images(self):
+        stream = getattr(self, 'streaming_source_clock', None)
+        if stream is not None:
+            for message, timestamp in stream.take_images():
+                TrackerNode._queue_selected_image(self, message, timestamp)
+
+    def _process_pending_image(self):
+        """Run on the image owner after input or an accepted IMU wakeup."""
+        msg = self._pending_image
+        if msg is None:
+            return
+        timestamp = self.tracker._imu_timestamp(msg.header)
+        if timestamp is not None:
+            latest = self._latest_accepted_imu_timestamp
+            if latest is None or latest < timestamp:
+                if not self._pending_image_waited:
+                    self._image_imu_waits += 1
+                    self._pending_image_waited = True
+                return
+        # Clear before processing. The node serializes this operation with
+        # image input; the worker adapter does both on its tracking worker.
+        self._pending_image = None
+        self._pending_image_waited = False
+        self._process_image(msg)
+
+    def _process_image(self, msg):
+        """Track an image with its resolved clock and publish its result."""
         image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         ret, track_result = self.tracker.track(
             image, header=msg.header, log_prefix="Track Thread"
@@ -370,6 +500,8 @@ class TrackerNode(Node):
             pose_message.header = frame_msg.header
             pose_message.fid, pose_message.ref_kid = frame_msg.fid, frame_msg.ref_kid
             pose_message.ref_t_curr = np.asarray(frame_msg.ref_t_curr).ravel().tolist()
+            for field in ("tracking_status", "pose_valid", "pose_timestamp"):
+                setattr(pose_message, field, getattr(frame_msg, field))
             self.frame_pose_pub.publish(pose_message)
             message = to_ros(frame_msg, self.bridge) if isinstance(frame_msg, FramePacket) else frame_msg
             self.frame_pub.publish(message)
@@ -497,6 +629,15 @@ class TrackerNode(Node):
 
     def imu_callback(self, msg):
         """Store calibrated gyro/accel measurements for future preintegration."""
+        stream = getattr(self, 'streaming_source_clock', None)
+        if stream is not None:
+            try:
+                stream.add_imu(msg)
+            except ValueError as error:
+                TrackerNode._source_clock_error(self, error)
+                return
+            TrackerNode._drain_source_imus(self)
+            return
         stamp = msg.header.stamp
         timestamp = float(stamp.sec) + float(stamp.nanosec) * 1e-9
         if self.recorded_source_clock is not None:
@@ -508,6 +649,30 @@ class TrackerNode(Node):
                         "Dropping IMU without matching recorded device time"
                     )
                 return
+        TrackerNode._ingest_imu(self, msg, timestamp)
+
+    def rest_event_callback(self, msg):
+        """Pass rest/GO host wall times to static IMU initialization."""
+        try:
+            event = json.loads(msg.data)
+        except ValueError:
+            self.get_logger().warning("Ignoring rest event that is not JSON")
+            return
+        name = event.get("event") if isinstance(event, dict) else None
+        if name not in REST_EVENTS:
+            return
+        if name == "recorded_rest_completed" and event.get("completed") is not True:
+            self.get_logger().warning("Ignoring recorded_rest_completed without completed: true")
+            return
+        try:
+            timestamp = int(event["host_wall_ns"]) * 1e-9
+            self.tracker.add_rest_event(name, timestamp)
+        except (KeyError, TypeError, ValueError) as error:
+            self.get_logger().warning("Ignoring rest event %s: %s" % (name, error))
+            return
+        self.get_logger().info("Recorded rest event %s at %.9f s" % (name, timestamp))
+
+    def _ingest_imu(self, msg, timestamp):
         if timestamp <= 0.0:
             self._imu_dropped_samples += 1
             if self._imu_dropped_samples == 1:
@@ -552,6 +717,14 @@ class TrackerNode(Node):
                 self.get_logger().warning(
                     "Dropping IMU: duplicate/out-of-order timestamp or no simulation truth support"
                 )
+        else:
+            # Publish readiness only after both frontend and backend IMU
+            # buffers have accepted the sample, not during a partial append.
+            self._latest_accepted_imu_timestamp = timestamp
+            if self._imu_image_sync_guard is not None:
+                # Never track in the IMU callback. The executor runs the guard
+                # in the image group and keeps this producer available for IMU.
+                self._imu_image_sync_guard.trigger()
 
     def ground_truth_gel_pose_callback(self, msg):
         """Buffer GT GelSight pose for explicit simulation initialization."""
@@ -579,24 +752,31 @@ class TrackerNode(Node):
         )
         self.tracker.add_recent_ground_truth_gel_rotation(timestamp, world_R_gel)
 
-    def _release_initialization_imu_gt(self):
-        """Stop initialization-only GT after the first trial state is ready."""
+    def _initialization_imu_gt_release_ready(self):
+        """Check whether initialization-only GT can be retired by the spin owner."""
         tracker = self.tracker
         if gt_state_test_needs_gt(resolve_gt_state_test(tracker.imu_config)):
-            return
-        if (self.ground_truth_imu_pose_sub is None
-                or getattr(tracker, "_frontend_vi_state", None) is None
-                or getattr(tracker, "_pending_frontend_initialization", None) is not None
-                or getattr(tracker, "_pending_trial_contact", None) is not None
-                or getattr(tracker, "_trial_index", -1) < 0):
-            return
+            return False
+        return (self.ground_truth_imu_pose_sub is not None
+                and getattr(tracker, "_frontend_vi_state", None) is not None
+                and getattr(tracker, "_pending_frontend_initialization", None) is None
+                and getattr(tracker, "_pending_trial_contact", None) is None
+                and getattr(tracker, "_trial_index", -1) >= 0)
+
+    def _release_initialization_imu_gt(self):
+        """Delete initialization GT only after TrackerExecutor has drained its workers."""
+        # Recheck after draining: an in-flight image can change initialization state.
+        if not self._initialization_imu_gt_release_ready():
+            return False
         if self.destroy_subscription(self.ground_truth_imu_pose_sub):
             self.ground_truth_imu_pose_sub = None
-            tracker._ground_truth_imu_positions.clear()
-            self._gt_imu_cleanup_timer.cancel()
+            self.tracker._ground_truth_imu_positions.clear()
             self.get_logger().info(
-                "First-trial initialization complete; stopped GT IMU subscription"
+                "First-trial initialization complete; drained executor callbacks "
+                "and stopped GT IMU subscription"
             )
+            return True
+        raise RuntimeError("Could not destroy initialization-only GT IMU subscription")
 
     def ground_truth_imu_pose_callback(self, msg):
         """Use the GT IMU position directly; gravity still uses GelSight attitude."""
@@ -626,12 +806,27 @@ class TrackerNode(Node):
         Clean up node and save tracker state.
         """
         self._publish_stream_end()
+        sync_counts = dict(
+            waited_images=self._image_imu_waits,
+            replaced_images=self._image_imu_replacements,
+            pending_images=int(self._pending_image is not None),
+        )
+        self.logger.info(
+            "Image/IMU synchronization summary: "
+            + ", ".join("%s=%d" % item for item in sync_counts.items())
+        )
         self.tracker.log_frontend_tracking_summary()
         if getattr(self, 'session_id', None) is not None:
+            stream = getattr(self, 'streaming_source_clock', None)
+            source_timing = (None if stream is None else dict(
+                mode='topics', ready=stream.ready, error=stream.error,
+                paired_images=stream.image_count, paired_imus=stream.imu_count))
             with open(os.path.join(self.save_dir, 'tracker_process_summary.json'), 'w') as handle:
                 json.dump(dict(pid=os.getpid(), session_id=self.session_id,
                     last_published_kid=self._last_published_kid,
                     backend_feedback_enabled=self.backend_feedback_enabled,
+                    image_imu_sync=sync_counts,
+                    source_timing=source_timing,
                     tracking_counts=dict(self.tracker._frontend_tracking_counts)), handle, indent=2)
         if self.state_velocity_evaluation is not None:
             try:
@@ -654,7 +849,7 @@ def main(args=None):
     # Keep ROS logging available until the final summary has been written.
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = TrackerNode()
-    executor = MultiThreadedExecutor(num_threads=2)
+    executor = TrackerExecutor(num_threads=2)
     executor.add_node(node)
     previous_handlers = {
         signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
@@ -669,6 +864,13 @@ def main(args=None):
         # A bounded wait lets Python handle stop signals even with no inputs.
         while rclpy.ok():
             executor.spin_once(timeout_sec=0.1)
+            if node._initialization_imu_gt_release_ready():
+                # No more dispatch on this executor. Finish all submitted work
+                # before deleting the subscription, then rebuild its wait set.
+                executor.shutdown()
+                node._release_initialization_imu_gt()
+                executor = TrackerExecutor(num_threads=2)
+                executor.add_node(node)
     except (KeyboardInterrupt, SystemExit):
         # ros2 launch can send a second SIGINT while the node is saving state.
         # Do not let that interrupt the cleanup and output write.

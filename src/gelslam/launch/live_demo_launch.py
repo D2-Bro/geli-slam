@@ -6,7 +6,6 @@ from launch.actions import (
     DeclareLaunchArgument,
     EmitEvent,
     RegisterEventHandler,
-    SetEnvironmentVariable,
 )
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit

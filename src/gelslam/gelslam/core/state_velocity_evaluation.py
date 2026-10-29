@@ -48,13 +48,17 @@ class NativeImuVelocityTruth:
 
 def capture_state_velocity(tracker, frame_msg):
     """Snapshot the exact published contact/coast State, never a stale anchor."""
+    if not getattr(frame_msg, 'pose_valid', True):
+        return None
     if getattr(tracker, 'frontend_visual_inertial', None) is None:
         return None
-    mode = tracker.tracking_mode.value
+    mode = getattr(frame_msg, 'tracking_status', tracker.tracking_mode.value)
     if mode in {'tactile_hold', 'reacquire'}:
         return None
     coasting = mode in {'no_contact_coasting', 'imu_coasting'}
-    state = getattr(tracker, '_frontend_coast_state' if coasting else '_frontend_vi_state', None)
+    state_attribute = ('_frontend_frame_prediction' if mode == 'imu_prediction' else
+                       '_frontend_coast_state' if coasting else '_frontend_vi_state')
+    state = getattr(tracker, state_attribute, None)
     target = tracker._imu_timestamp(frame_msg.header)
     if state is None or target is None or abs(state.timestamp - target) > 1e-7:
         return None
@@ -64,14 +68,38 @@ def capture_state_velocity(tracker, frame_msg):
     stamp = frame_msg.header.stamp
     anchor_time = getattr(tracker, '_frontend_trial_start_timestamp', None)
     initialization = anchor_time is not None and abs(state.timestamp - anchor_time) <= 1e-7
-    stage = ('no_contact_prediction' if coasting else
+    stage = ('imu_frame_prediction' if mode == 'imu_prediction' else
+             'imu_recovery_prediction' if mode == 'imu_only' else
+             'no_contact_prediction' if coasting else
              'initialization' if initialization else 'accepted_contact_state')
-    return dict(state_timestamp_s=float(state.timestamp),
+    record = dict(state_timestamp_s=float(state.timestamp),
                 image_timestamp_s=float(stamp.sec) + float(stamp.nanosec) * 1e-9,
                 fid=int(frame_msg.fid), ref_kid=int(frame_msg.ref_kid),
                 trial_id=int(tracker._trial_index),
                 stage=stage,
                 tracking_mode=mode, pose=pose.tolist(), velocity=velocity.tolist())
+    # Diagnostics use the State that produced this frame, including coast and
+    # uncommitted image predictions. Keep sensor axes separate from world axes.
+    for name in ('accel_bias', 'gyro_bias'):
+        value = getattr(state, name, None)
+        if value is not None and np.asarray(value).shape == (3,) and np.isfinite(value).all():
+            record[name] = np.asarray(value).tolist()
+    gravity = getattr(tracker.frontend_visual_inertial, 'gravity', None)
+    if gravity is not None and np.asarray(gravity).shape == (3,) and np.isfinite(gravity).all():
+        record['gravity_world_mps2'] = np.asarray(gravity).tolist()
+    buffer = getattr(tracker, 'imu_buffer', None)
+    sample = None if buffer is None else buffer.sample_at(state.timestamp)
+    if sample is not None:
+        record.update(imu_sample_timestamp_s=float(sample.timestamp),
+                      specific_force_imu_mps2=sample.acceleration.tolist(),
+                      angular_velocity_imu_rps=sample.angular_velocity.tolist())
+        if 'accel_bias' in record and 'gravity_world_mps2' in record:
+            record['linear_acceleration_world_mps2'] = (
+                pose[:3, :3] @ (sample.acceleration - state.accel_bias) + gravity).tolist()
+            # This is an endpoint diagnostic. Native preintegration averages
+            # adjacent measurements and uses its configured interval attitude.
+            record['acceleration_sampling'] = 'measurement_at_state_timestamp'
+    return record
 
 
 class StateVelocityEvaluation:

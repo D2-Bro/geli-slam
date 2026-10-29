@@ -1,8 +1,9 @@
 """IMU data structures and dead-reckoning utilities independent of ROS hardware."""
 
 from collections import deque
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
+from operator import attrgetter
 from threading import RLock
 
 import numpy as np
@@ -17,21 +18,14 @@ def _vector3(value, name):
 
 
 def gyro_to_rad_per_sec(value, input_unit="rad_s", max_rate_rad_s=None):
-    """Normalize a declared gyro input unit and reject implausible rates.
+    """Check the declared rad/s gyro input unit and reject implausible rates.
 
-    ROS ``sensor_msgs/Imu`` specifies angular velocity in rad/s.  A publisher
-    that instead emits deg/s is indistinguishable from valid slow rad/s motion
-    from one sample alone, so this function intentionally requires an explicit
-    declaration rather than guessing and silently converting data.
+    ROS ``sensor_msgs/Imu`` specifies angular velocity in rad/s.  Only that
+    unit is accepted; other declarations are rejected, not converted.
     """
-    angular_velocity = _vector3(value, "angular_velocity")
-    unit = str(input_unit).strip().lower()
-    if unit == "rad_s":
-        result = angular_velocity
-    elif unit == "deg_s":
-        result = np.deg2rad(angular_velocity)
-    else:
-        raise ValueError("gyro_input_unit must be 'rad_s' or 'deg_s'")
+    result = _vector3(value, "angular_velocity")
+    if str(input_unit).strip().lower() != "rad_s":
+        raise ValueError("gyro_input_unit must be 'rad_s'")
     if max_rate_rad_s is not None:
         limit = float(max_rate_rad_s)
         if not np.isfinite(limit) or limit <= 0.0:
@@ -161,6 +155,9 @@ class InertialState:
         object.__setattr__(self, "gyro_bias", _vector3(self.gyro_bias, "gyro_bias"))
 
 
+_sample_time = attrgetter("timestamp")
+
+
 class ImuBuffer:
     """Bounded, strictly timestamp-ordered IMU buffer for future preintegration."""
 
@@ -197,11 +194,15 @@ class ImuBuffer:
         if end_time < start_time:
             raise ValueError("end_time must not precede start_time")
         with self._lock:
-            return tuple(
-                sample
-                for sample in self._samples
-                if start_time <= sample.timestamp <= end_time
+            return self._slice(
+                bisect_left(self._samples, start_time, key=_sample_time),
+                bisect_right(self._samples, end_time, key=_sample_time),
             )
+
+    def _slice(self, start, stop):
+        """Samples[start:stop]; caller holds the lock. Deque indexing avoids a full copy."""
+        samples = self._samples
+        return tuple(samples[index] for index in range(start, stop))
 
     def sample_at(self, timestamp):
         """Return a measurement at ``timestamp``, linearly interpolating if needed.
@@ -213,22 +214,20 @@ class ImuBuffer:
         if not np.isfinite(timestamp):
             raise ValueError("timestamp must be finite")
         with self._lock:
-            samples = tuple(self._samples)
-        if (
-            not samples
-            or timestamp < samples[0].timestamp
-            or timestamp > samples[-1].timestamp
-        ):
-            return None
-        timestamps = [sample.timestamp for sample in samples]
-        index = bisect_left(timestamps, timestamp)
-        if index < len(samples) and np.isclose(
-            samples[index].timestamp, timestamp, rtol=0.0, atol=1e-9
-        ):
+            samples = self._samples
+            if (
+                not samples
+                or timestamp < samples[0].timestamp
+                or timestamp > samples[-1].timestamp
+            ):
+                return None
+            index = bisect_left(samples, timestamp, key=_sample_time)
             sample = samples[index]
+            earlier = samples[index - 1] if index > 0 else None
+        if abs(sample.timestamp - timestamp) <= 1e-9:
             return ImuSample(timestamp, sample.acceleration, sample.angular_velocity)
-        if index > 0:
-            earlier, later = samples[index - 1], samples[index]
+        if earlier is not None:
+            later = sample
             ratio = (timestamp - earlier.timestamp) / (later.timestamp - earlier.timestamp)
             return ImuSample(
                 timestamp,
@@ -248,20 +247,24 @@ class ImuBuffer:
                     return sample
         return None
 
+    def latest_timestamp(self):
+        """Return the newest received measurement time, or None if empty."""
+        with self._lock:
+            return self._samples[-1].timestamp if self._samples else None
+
     def samples_covering(self, start_time, end_time):
         """Return samples spanning both interval endpoints without extrapolation."""
         if end_time < start_time:
             raise ValueError("end_time must not precede start_time")
-        start_sample = self.sample_at(start_time)
-        end_sample = self.sample_at(end_time)
-        if start_sample is None or end_sample is None:
-            return ()
         with self._lock:
-            interior = [
-                sample
-                for sample in self._samples
-                if start_time < sample.timestamp < end_time
-            ]
+            start_sample = self.sample_at(start_time)
+            end_sample = self.sample_at(end_time)
+            if start_sample is None or end_sample is None:
+                return ()
+            interior = self._slice(
+                bisect_right(self._samples, start_time, key=_sample_time),
+                bisect_left(self._samples, end_time, key=_sample_time),
+            )
         return (start_sample, *interior, end_sample)
 
     def begin_online_interval(self, timestamp):

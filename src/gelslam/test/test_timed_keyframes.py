@@ -8,7 +8,7 @@ import gelslam.core.tracker as tm
 from gelslam.core.gtsam_vi import GtsamVisualInertialSolver
 from gelslam.core.marginal_prior import NavigationPrior
 from gelslam.core.numpy_vi import NavigationState
-from gelslam.core.tracker import Tracker, TrackingMode
+from gelslam.core.tracker import Tracker
 
 
 def header(t):
@@ -45,6 +45,7 @@ def make_tracker(monkeypatch, mode='joint'):
     t.last_tactile_ref_T = np.eye(4)
     t.last_tactile_header = t.prev_header
     t.gelsight_T_imu = np.eye(4)
+    t.imu_buffer = None  # This fixture supplies accepted states without IMU input.
     t.bg_images = [None]*10
     t.ppmm = 1.
     t.contact_mask_config = dict(color_dist_threshold=1, height_threshold=1)

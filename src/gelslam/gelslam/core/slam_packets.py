@@ -20,6 +20,9 @@ class FramePacket:
     fid: int
     ref_kid: int
     ref_t_curr: np.ndarray
+    tracking_status: str = "contact_tracking"
+    pose_valid: bool = True
+    pose_timestamp: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -109,7 +112,7 @@ def to_ros(packet, bridge):
               'navigation_timestamp', 'velocity', 'accel_bias', 'gyro_bias',
               'gravity', 'imu_measurements', 'tactile_valid', 'session_id', 'trial_id',
               'anchor_kid', 'solution_revision', 'navigation_pose') if keyframe else
-             ('fid', 'ref_kid', 'ref_t_curr'))
+             ('fid', 'ref_kid', 'ref_t_curr', 'tracking_status', 'pose_valid', 'pose_timestamp'))
     for name in names:
         value = getattr(packet, name)
         setattr(message, name, value.flatten().tolist() if isinstance(value, np.ndarray) else value)

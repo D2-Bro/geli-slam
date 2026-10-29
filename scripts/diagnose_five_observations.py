@@ -25,10 +25,11 @@ import yaml
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
 from rclpy.serialization import deserialize_message
-from scipy.spatial.transform import Rotation, Slerp
+from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import Image, Imu
 
 import gelslam.core.gtsam_vi as gv
+import gelslam.core.reference_tracking as rt
 import gelslam.core.tracker as tm
 from gelslam.core.gt_state_diagnostic import GroundTruthImuStates
 from gelslam.core.imu_navigation import gelsight_pose
@@ -55,8 +56,18 @@ def cosine(a, b):
 
 class IterationObserver:
     """Read the exact production iteration, candidate, and accepted states."""
-    def __init__(self, function=None):
-        function = gv.GtsamVisualInertialSolver.refine_current if function is None else function
+    def __init__(self, target=None):
+        if hasattr(target, 'reference_marginalization') or (isinstance(target, type) and issubclass(target, rt.ReferenceMarginalizationSolver)):
+            self.mode = 'reference_marginalization'
+            fn = rt.ReferenceMarginalizationSolver._solve
+            lines, first = inspect.getsourcelines(fn)
+            self.code = fn.__code__
+            locate = lambda token: [first+i for i,s in enumerate(lines) if token in s]
+            self.start = locate('self.last_optimization_trace.append(dict(')[0]
+            self.iterations = []
+            return
+        self.mode = 'pairwise'
+        function = gv.GtsamVisualInertialSolver.refine_current if target is None else target
         lines, first = inspect.getsourcelines(function)
         if not any('self.last_optimization_trace.append(trace)' in line for line in lines):
             # The public entry point owns the per-solve projection cache.
@@ -77,6 +88,153 @@ class IterationObserver:
         if event != 'line':
             return self.observe
         values = frame.f_locals
+        if self.mode == 'reference_marginalization':
+            if frame.f_lineno == self.start:
+                solver = values['self']
+                val_dict = values['values']
+                cand_dict = values['candidate']
+                layout = values['layout']
+                prior = values['prior']
+                factors = values['factors']
+                reference_id = values['reference_id']
+                current_id = values['current_id']
+                step = values['step']
+                prev_time = values['previous'].timestamp
+                curr_time = values['current'].timestamp
+                extrinsic = values['extrinsic']
+                visual = values['visual']
+                iteration = values['iteration']
+                converged = values['converged']
+                normal_cost = values['normal_cost']
+                rank = values['rank']
+                singular = values['singular']
+                rhs = values['rhs']
+                pose_steps = values['pose_steps']
+
+                prev_blocks = rt.state_blocks(prev_time)
+                curr_blocks = rt.state_blocks(curr_time)
+
+                prev_state_before = (rt.navigation_state(val_dict, prev_time)
+                                     if prev_blocks[0] in layout.slices else values['previous'])
+                curr_state_before = rt.navigation_state(val_dict, curr_time)
+
+                prev_state_after = (rt.navigation_state(cand_dict, prev_time)
+                                    if prev_blocks[0] in layout.slices else values['previous'])
+                curr_state_after = rt.navigation_state(cand_dict, curr_time)
+
+                curr_delta = layout.expanded_step(curr_blocks, step)
+                pose_step = curr_delta[:6]
+                velocity_step = curr_delta[6:9]
+                bias_step = curr_delta[9:15]
+
+                dp = (layout.expanded_step(prev_blocks, step)
+                      if prev_blocks[0] in layout.slices else np.zeros(15))
+
+                ref_world = val_dict[reference_id]
+                ref_pose_gelsight = gelsight_pose(ref_world, extrinsic)
+                cur_pose_gelsight = gelsight_pose(val_dict[current_id], extrinsic)
+
+                evaluate = values['evaluate']
+                evaluated = evaluate(ref_pose_gelsight, cur_pose_gelsight)
+                residual, Jr, Jt = evaluated
+                Jr, Jt = solver._normal_pose_rows(visual, ref_pose_gelsight, cur_pose_gelsight, Jr, Jt)
+                gel_J = values['gel_J']
+                normal_scale = np.sqrt(solver.visual_weight)
+                normal_A, normal_b, _, _ = gv._normal_huber_linearization(
+                    residual, np.column_stack((Jr @ gel_J, Jt @ gel_J)),
+                    normal_scale, solver.normal_huber_delta_at(iteration))
+
+                imu_terms = gv.navigation_factor_terms(factors[0], prev_state_before, curr_state_before)
+                bias_terms = gv.navigation_factor_terms(factors[1], prev_state_before, curr_state_before)
+                imu_cost = float(solver.imu_weight * (imu_terms[2] @ imu_terms[2]) / 2)
+                bias_cost = float(solver.imu_weight * (bias_terms[2] @ bias_terms[2]) / 2)
+
+                prior_vals = dict(prior.fixed_values)
+                prior_vals.update(rt.state_values(prev_state_before))
+                if reference_id in prior.anchors and reference_id not in prior_vals:
+                    prior_vals[reference_id] = ref_world
+                prior_cost = float(prior.error_values(prior_vals))
+
+                base_cost = float(rhs @ rhs / 2)
+                active_rows = visual.last_active_rows
+
+                raw_norms_dict = dict(
+                    previous=gv._navigation_step_norms(dp),
+                    target=gv._navigation_step_norms(curr_delta)
+                )
+
+                trace = dict(
+                    iteration=iteration,
+                    update_rule="full_gauss_newton",
+                    variable_reference=reference_id not in prior.fixed_values,
+                    first_pose_fixed=True,
+                    solve_dimension=layout.dimension,
+                    numerical_rank=int(rank),
+                    scaled_min_singular=float(singular[-1]),
+                    base_cost=base_cost,
+                    base_normal_cost=normal_cost,
+                    base_imu_cost=imu_cost,
+                    base_bias_cost=bias_cost,
+                    base_prior_cost=prior_cost,
+                    accepted_scale=1.0,
+                    accepted_cost=base_cost,
+                    accepted_normal_cost=normal_cost,
+                    accepted_imu_cost=imu_cost,
+                    accepted_bias_cost=bias_cost,
+                    accepted_prior_cost=prior_cost,
+                    active_rows=int(np.count_nonzero(active_rows)),
+                    raw_step_norms=raw_norms_dict,
+                    convergence_step_norms=dict(
+                        rotation_rad=float(max(np.linalg.norm(s[:3]) for s in pose_steps)),
+                        translation_xy_m=float(max(np.linalg.norm(s[3:5]) for s in pose_steps))
+                    ),
+                    attempts=[dict(
+                        scale=1.0, cost=base_cost, reason="full_gn_step",
+                        imu_cost=imu_cost, bias_cost=bias_cost, prior_cost=prior_cost, normal_cost=normal_cost
+                    )],
+                    step_converged=bool(converged),
+                    stop_reason="step_converged" if converged else "max_iterations" if iteration + 1 == solver.max_iterations else None
+                )
+
+                candidates = [dict(
+                    scale=1.0,
+                    current=curr_state_after,
+                    previous=prev_state_after,
+                    costs=dict(normal=normal_cost, imu=imu_cost, bias=bias_cost, prior=prior_cost, total=base_cost)
+                )]
+
+                ref_step = step[layout.slices[reference_id]] if reference_id in layout.slices else np.zeros(6)
+
+                record = dict(
+                    previous=prev_state_before,
+                    current=curr_state_before,
+                    after_previous=prev_state_after,
+                    after_current=curr_state_after,
+                    reference_pose=ref_pose_gelsight,
+                    reference_block=reference_id,
+                    reference_world_pose=ref_world.copy(),
+                    ref_step=ref_step,
+                    prior=prior,
+                    normal_A=normal_A,
+                    normal_b=normal_b,
+                    residual=residual,
+                    pose_step=pose_step,
+                    velocity_step=velocity_step,
+                    bias_step=bias_step,
+                    previous_step=dp,
+                    active_rows=active_rows,
+                    visual=copy.copy(visual),
+                    imu_factor=factors[0],
+                    bias_factor=factors[1],
+                    normal_scale=normal_scale,
+                    solver=solver,
+                    candidates=candidates,
+                    iteration=iteration,
+                    direction_attempt=0,
+                    trace=trace
+                )
+                self.iterations.append(record)
+            return self.observe
         if frame.f_lineno == self.start:
             keys = ('previous', 'current', 'reference_pose', 'prior', 'normal_A', 'normal_b',
                     'normal_jacobian', 'residual', 'pose_step', 'velocity_step', 'bias_step',
@@ -203,7 +361,17 @@ def costs(record, previous, current, reference=None, oracle_z=False):
     values = gv._imu_values(previous,current)
     imu = solver.imu_weight * float(record['imu_factor'].error(values))
     bias = solver.imu_weight * float(record['bias_factor'].error(values))
-    prior = 0. if record['prior'] is None else record['prior'].error(previous)
+    if record['prior'] is None:
+        prior = 0.
+    elif hasattr(record['prior'], 'error_values'):
+        vals = dict(record['prior'].fixed_values)
+        vals.update(rt.state_values(previous))
+        ref_block = record.get('reference_block')
+        if ref_block is not None and ref_block in record['prior'].anchors and ref_block not in vals:
+            vals[ref_block] = record['reference_world_pose']
+        prior = float(record['prior'].error_values(vals))
+    else:
+        prior = float(record['prior'].error(previous))
     return dict(normal=normal,imu=imu,bias=bias,prior=prior,
                 total=None if normal is None else normal+imu+bias+prior)
 
@@ -215,7 +383,11 @@ def describe_iteration(record, truth, extrinsic, reference_time, path):
     delta = np.r_[record['pose_step'], record['velocity_step'], record['bias_step']]
     dp = np.zeros(15) if record['previous_step'] is None else record['previous_step']
     correction = split_pose_coordinates(current.pose,gt_current.pose)
-    projections = dict(normal=float(record['normal_b']@(record['normal_A']@delta[:6])))
+    if record['normal_A'].shape[1] == 12:
+        step12 = np.r_[record.get('ref_step', np.zeros(6)), delta[:6]]
+        projections = dict(normal=float(record['normal_b']@(record['normal_A']@step12)))
+    else:
+        projections = dict(normal=float(record['normal_b']@(record['normal_A']@delta[:6])))
     arrays = dict(normal_A=record['normal_A'],normal_b=record['normal_b'],
                   raw_residual=record['residual'],active_rows=record['active_rows'],
                   current_step=delta,previous_step=dp)
@@ -225,6 +397,22 @@ def describe_iteration(record, truth, extrinsic, reference_time, path):
         arrays.update({name+'_previous_A':a,name+'_current_A':b,name+'_rhs':rhs})
     if record['prior'] is None:
         projections['prior'] = 0.
+    elif hasattr(record['prior'], 'linearize_values'):
+        vals = dict(record['prior'].fixed_values)
+        vals.update(rt.state_values(previous))
+        ref_block = record.get('reference_block')
+        if ref_block is not None and ref_block in record['prior'].anchors and ref_block not in vals:
+            vals[ref_block] = record['reference_world_pose']
+        a_prior, rhs_prior = record['prior'].linearize_values(vals)
+        prev_blocks = rt.state_blocks(previous.timestamp)
+        prev_cols = [record['prior'].layout.slices[b] for b in prev_blocks if b in record['prior'].layout.slices]
+        if prev_cols:
+            prev_cols_flat = np.concatenate([np.arange(s.start, s.stop) for s in prev_cols])
+            projections['prior'] = float(-rhs_prior @ (a_prior[:, prev_cols_flat] @ dp[:len(prev_cols_flat)]))
+        else:
+            projections['prior'] = 0.
+        arrays.update(prior_A=a_prior, prior_rhs=rhs_prior, prior_frozen_A=record['prior'].A,
+                      prior_frozen_rhs=record['prior'].rhs)
     else:
         a,rhs = record['prior'].linearize(previous)
         projections['prior'] = float(-rhs@(a@dp))
@@ -281,13 +469,15 @@ def replay(inputs, config, output, truth, observed, analysis_start, observations
     log=(output/('tracker.log' if observed else 'control_tracker.log')).open('w')
     logger=SimpleNamespace(info=lambda m:log.write(str(m)+'\n'),warning=lambda m:log.write(str(m)+'\n'))
     tracker=tm.Tracker(config['device_config']['calibration_model_path'],copy.deepcopy(config),True,logger)
-    original=gv.GtsamVisualInertialSolver.refine_current
+    solver_cls=type(tracker.frontend_visual_inertial)
+    is_ref_marg=getattr(tracker.frontend_visual_inertial, 'reference_marginalization', False)
+    original=solver_cls.refine_current
     original_quality=tm.normalflow_quality
     calls=[];raw_records=[];event_calls=[]
-    def refine(solver,visual,reference,previous,current,samples,extrinsic,preintegrated=None):
-        observer=IterationObserver(original)
-        result=(observer.run(original,solver,visual,reference,previous,current,samples,extrinsic,preintegrated=preintegrated)
-                if observed else original(solver,visual,reference,previous,current,samples,extrinsic,preintegrated=preintegrated))
+    def refine(solver,visual,reference,previous,current,samples,extrinsic,preintegrated=None,**kwargs):
+        observer=IterationObserver(solver if is_ref_marg else original)
+        result=(observer.run(original,solver,visual,reference,previous,current,samples,extrinsic,preintegrated=preintegrated,**kwargs)
+                if observed else original(solver,visual,reference,previous,current,samples,extrinsic,preintegrated=preintegrated,**kwargs))
         reference_frame=(visual.ref if visual is not None
                          else tracker.latest_normal_correspondences['reference'])
         reference_header=(tracker.ref_header if reference_frame is tracker.ref_frame else tracker.prev_header)
@@ -300,7 +490,7 @@ def replay(inputs, config, output, truth, observed, analysis_start, observations
         calls.append(item);event_calls.append(len(calls)-1)
         raw_records.append(observer.iterations)
         return result
-    gv.GtsamVisualInertialSolver.refine_current=refine
+    solver_cls.refine_current=refine
     def quality(*args,**kwargs):
         result=original_quality(*args,**kwargs)
         if calls:
@@ -347,7 +537,7 @@ def replay(inputs, config, output, truth, observed, analysis_start, observations
                 if not all_images and len(events)==observations:
                     break
     finally:
-        gv.GtsamVisualInertialSolver.refine_current=original
+        solver_cls.refine_current=original
         tm.normalflow_quality=original_quality
         log.close()
     if not all_images:
@@ -380,7 +570,7 @@ def main():
             for name in short if name!='/image'}
     inputs['/image']=[r for r in full['/image'] if stamp(r[2])<start-1e-9]+short['/image']
     truth=Truth(inputs['/ground_truth/imu_pose'],args.bias_archive)
-    hashes={m.__file__:hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest() for m in (tm,gv)}
+    hashes={m.__file__:hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest() for m in (tm,gv,rt)}
     observed=replay(inputs,config,args.output,truth,True,start,args.observations,args.all_images)
     control=replay(inputs,config,args.output,truth,False,start,args.observations,args.all_images)
     assert observed['events']==control['events'],'Observer changed tracking states or decisions'
@@ -414,7 +604,17 @@ def main():
                 short_bag_audit=audits,bias_truth_archive=str(args.bias_archive),code_hashes=hashes,
                 observer_matches_control_exactly=True,callback_lookahead_s=.005,
                 statistics=observed['tracker'].frontend_tracking_statistics())
-    (args.output/'result.json').write_text(json.dumps(result,indent=2,allow_nan=False)+'\n')
+    def json_default(o):
+        if isinstance(o, (np.bool_, bool)):
+            return bool(o)
+        if isinstance(o, (np.floating, float)):
+            return float(o)
+        if isinstance(o, (np.integer, int)):
+            return int(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+    (args.output/'result.json').write_text(json.dumps(result,indent=2,allow_nan=False,default=json_default)+'\n')
     print(json.dumps(dict(frames=len(result['events']),calls=len(calls),statistics=result['statistics'],
                          observer_matches_control_exactly=True),indent=2))
 
