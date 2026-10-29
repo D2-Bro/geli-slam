@@ -843,3 +843,21 @@ def test_real_objects_preset_uses_rest_events_and_previous_state_start():
     assert imu["image_to_imu_time_offset_s"] == pytest.approx(-0.0615)
     history = ContactVelocityHistory.from_config(effective)
     assert history.settings["model"] == "contact_kinematic" and history.settings["kinematic_fit_order"] == 2
+
+
+def test_contact_velocity_sigma_adds_variance_and_keeps_mean():
+    samples = segment(0.5, 2.6) + segment(2.6, 3.005, acceleration=(0.2, 0, 9.81))
+    seeds = {}
+    for extra in (None, 0.2):
+        detector, buffer, extrinsic = initializer(event_config(contact_velocity_sigma_mps=extra))
+        for sample in samples:
+            buffer.add(sample)
+        detector.observe(buffer.samples_between(0., 3.0), rest_events=REST)
+        seeds[extra] = predict(detector, buffer, extrinsic, 3.0)
+    base, inflated = (np.linalg.inv(seeds[k].prior.A.T @ seeds[k].prior.A) for k in (None, 0.2))
+    np.testing.assert_allclose(seeds[0.2].state.velocity, seeds[None].state.velocity)
+    np.testing.assert_allclose(inflated[6:9, 6:9] - base[6:9, 6:9], 0.04 * np.eye(3), atol=1e-9)
+    np.testing.assert_allclose(np.delete(np.delete(inflated, slice(6, 9), 0), slice(6, 9), 1),
+                               np.delete(np.delete(base, slice(6, 9), 0), slice(6, 9), 1), atol=1e-9)
+    with pytest.raises(ValueError, match="contact_velocity_sigma_mps"):
+        resolve_static_imu_config(event_config(contact_velocity_sigma_mps=0), np.eye(4))

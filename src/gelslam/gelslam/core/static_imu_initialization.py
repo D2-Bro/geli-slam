@@ -37,6 +37,9 @@ DEFAULTS = {
     "max_sample_gap_s": 0.05,
     "max_propagation_s": 5.0,
     "velocity_sigma_mps": 0.01,
+    # Optional independent velocity sigma added at first contact (world axes).
+    # A long hand-held approach adds unmodeled velocity error to the seed.
+    "contact_velocity_sigma_mps": None,
     "gyro_bias_uncertainty_from_samples": False,
     # recorded_rest_event: average [recorded_rest_started, recorded_rest_completed]
     # and start propagation at trial_ready (GO) with zero velocity.
@@ -115,13 +118,17 @@ def resolve_static_imu_config(config, gelsight_T_imu):
     }
     for name, value in settings.items():
         if (name in {"enabled", "mode", "start_time_s", "end_time_s", "duration_s", "min_samples",
-                     "gyro_bias_uncertainty_from_samples", "events_topic", "motion_check"}
+                     "gyro_bias_uncertainty_from_samples", "events_topic", "motion_check",
+                     "contact_velocity_sigma_mps"}
                 or (mode != "stationary_detection" and name in detection_options)
                 or (not settings["motion_check"] and name in MOTION_CHECK_OPTIONS)):
             continue
         if isinstance(value, bool) or not np.isfinite(float(value)) or float(value) <= 0:
             raise ValueError("static_initialization.%s must be positive and finite" % name)
         settings[name] = float(value)
+    extra = settings["contact_velocity_sigma_mps"]
+    if extra is not None and (isinstance(extra, bool) or not np.isfinite(float(extra)) or float(extra) <= 0):
+        raise ValueError("static_initialization.contact_velocity_sigma_mps must be positive and finite or null")
     count = settings["min_samples"]
     if isinstance(count, bool) or not isinstance(count, int) or count < 4:
         raise ValueError("static_initialization.min_samples must be an integer >= 4")
@@ -459,6 +466,13 @@ class StaticImuInitializer:
                 np.vstack([np.zeros((15, 15))] + [row[1] for row in rows]),
                 np.concatenate([np.zeros(15)] + [row[2] for row in rows]),
             ).information
+        extra = self.settings.get("contact_velocity_sigma_mps")
+        if extra is not None:
+            # Add the variance in covariance form; keep every cross term.
+            covariance = np.linalg.inv(information)
+            covariance[6:9, 6:9] += float(extra) ** 2 * np.eye(3)
+            information = np.linalg.inv(covariance)
+            information = 0.5 * (information + information.T)
         # Preserve the first-contact heading convention without leaving the
         # gravity-aligned world. This coordinate rotation is about world Z only.
         contact_gel_pose = gelsight_pose(state.pose, gelsight_T_imu)
