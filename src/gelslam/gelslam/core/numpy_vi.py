@@ -110,16 +110,41 @@ class NavigationState:
         return result
 
 
+def normal_tangent_basis(normals):
+    """Two orthonormal tangent vectors per normal, shape (N, 2, 3)."""
+    normals = np.asarray(normals, dtype=np.float64)
+    normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+    # Cross with the world axis least aligned with each normal.
+    helper = np.zeros_like(normals)
+    helper[np.arange(len(normals)), np.argmin(np.abs(normals), axis=1)] = 1.0
+    first = np.cross(normals, helper)
+    first /= np.linalg.norm(first, axis=1, keepdims=True)
+    return np.stack((first, np.cross(normals, first)), axis=1)
+
+
 class DenseNormalResidual:
     """NormalFlow normal residual with dynamic shared contacts.
 
     The strongest-curvature reference candidates stay fixed, as in original
     NormalFlow.  Their target contact overlap is recomputed at every GN
     linearization, so the residual contains exactly the current shared rows.
+
+    residual_space "vector" keeps NormalFlow's three-component difference
+    R^-1 n_tar - n_ref per point. "tangent" projects it onto two tangent
+    vectors of the reference normal: a unit normal has two degrees of
+    freedom, and the dropped n_ref component is cos(angle) - 1 (second order).
     """
 
+    RESIDUAL_SPACES = {"vector": 3, "tangent": 2}
+
     def __init__(self, ref, tar, ppmm, initial_reference_pose,
-                 initial_target_pose, max_samples=3000, dtype=np.float64):
+                 initial_target_pose, max_samples=3000, dtype=np.float64,
+                 residual_space="vector"):
+        if residual_space not in self.RESIDUAL_SPACES:
+            raise ValueError("dense_normalflow_residual_space must be 'vector' or 'tangent'")
+        self.residual_space = residual_space
+        # Residual rows per active point; Huber weights act on these blocks.
+        self.residual_dim = self.RESIDUAL_SPACES[residual_space]
         # Precision of the normal residual and stored reference IC rows.
         # float32 (original NormalFlow) measured no faster here: projection,
         # contact selection, height and the IC pose mapping must stay float64
@@ -314,6 +339,16 @@ class DenseNormalResidual:
         xx, yy = self._pixel_coordinates(points_tar[shared])
         return reference_xy, np.column_stack((xx, yy))
 
+    def _in_residual_space(self, rows, normal_error, *jacobians):
+        """Flatten (N, 3) errors and (3N, 6) Jacobians in the residual space."""
+        if self.residual_space == "vector":
+            return (normal_error.reshape(-1),) + jacobians
+        basis = normal_tangent_basis(self.candidate_normals[rows])
+        residual = np.einsum("nij,nj->ni", basis, normal_error).reshape(-1)
+        return (residual,) + tuple(
+            np.einsum("nij,njk->nik", basis, J.reshape(-1, 3, J.shape[1])).reshape(-1, J.shape[1])
+            for J in jacobians)
+
     def evaluate(self, reference_pose, target_pose):
         """Compatibility entry point for the reference-map IC linearization."""
         return self.evaluate_ic(reference_pose, target_pose)
@@ -370,8 +405,7 @@ class DenseNormalResidual:
             xy = np.diag((1.0, 1.0, 0.0))
             tangent_xy = reference_R_target.T @ xy @ reference_R_target
             target_jacobian[:, 3:6] = target_jacobian[:, 3:6] @ tangent_xy
-        residual = normal_error.reshape(-1)
-        return residual, reference_jacobian, target_jacobian
+        return self._in_residual_space(shared, normal_error, reference_jacobian, target_jacobian)
 
     def evaluate_relinearized(self, reference_pose, target_pose):
         """Rebuild the normal Jacobian from the current target-map locations.
@@ -414,10 +448,8 @@ class DenseNormalResidual:
             reference_R_target = reference_pose[:3, :3].T @ target_pose[:3, :3]
             tangent_xy = reference_R_target.T @ np.diag((1., 1., 0.)) @ reference_R_target
             target_jacobian[:, 3:6] = target_jacobian[:, 3:6] @ tangent_xy
-        residual = (
-            normals @ np.linalg.inv(rotation).T - self.candidate_normals[shared]
-        ).reshape(-1)
-        return residual, reference_jacobian, target_jacobian
+        normal_error = normals @ np.linalg.inv(rotation).T - self.candidate_normals[shared]
+        return self._in_residual_space(shared, normal_error, reference_jacobian, target_jacobian)
 
     def residual_on_fixed_rows(self, reference_pose, target_pose, rows):
         """Evaluate the current iteration's rows at a candidate pose.
@@ -438,7 +470,7 @@ class DenseNormalResidual:
             normal_tar[valid_rows] @ np.linalg.inv(rotation).T
             - self.candidate_normals[valid_rows]
         )
-        return normal_error.reshape(-1)
+        return self._in_residual_space(valid_rows, normal_error)[0]
 
     def target_z_height_correction(self, reference_pose, target_pose):
         """Return the original NormalFlow mean height correction in metres.

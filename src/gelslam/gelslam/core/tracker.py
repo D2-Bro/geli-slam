@@ -1639,7 +1639,8 @@ class Tracker:
         ref_pose = gelsight_pose(previous.pose, self.gelsight_T_imu)
         visual = DenseNormalResidual(
             reference, frame, self.ppmm, ref_pose, gelsight_pose(current.pose, self.gelsight_T_imu),
-            max_samples=int(self.imu_config.get("dense_normalflow_samples", 3000)))
+            max_samples=int(self.imu_config.get("dense_normalflow_samples", 3000)),
+            residual_space=self.imu_config.get("dense_normalflow_residual_space", "vector"))
         refined = staged_solver.refine_recovery_reference(
             visual, ref_pose, previous, current, samples, self.gelsight_T_imu, preintegrated=pim)
         accepted = False
@@ -1841,6 +1842,7 @@ class Tracker:
             reference_frame, current_frame, self.ppmm,
             navigation_reference_pose, gelsight_pose(current.pose, self.gelsight_T_imu),
             max_samples=int(self.imu_config.get("dense_normalflow_samples", 3000)),
+            residual_space=self.imu_config.get("dense_normalflow_residual_space", "vector"),
         ))
         self._count_frontend_event(
             "imu_prediction_only_calls" if prediction_only else "vi_solve_calls"
@@ -1875,6 +1877,7 @@ class Tracker:
                 reference_frame, current_frame, self.ppmm,
                 navigation_reference_pose, gelsight_pose(current.pose, self.gelsight_T_imu),
                 max_samples=int(self.imu_config.get("dense_normalflow_samples", 3000)),
+                residual_space=self.imu_config.get("dense_normalflow_residual_space", "vector"),
             )
             self._count_frontend_event("previous_state_retry_calls")
             self._count_frontend_event("vi_solve_calls")

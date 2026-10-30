@@ -30,9 +30,14 @@ def create_frontend_solver(config):
     return GtsamVisualInertialSolver(config)
 
 
-def _normal_huber_cost(residual, scale, delta):
-    """Mean Huber cost per valid three-component normal residual."""
-    norms = np.linalg.norm(np.asarray(residual).reshape(-1, 3) * scale, axis=1)
+def _normal_dim(visual):
+    """Residual rows per normal point: 3 (vector) or 2 (tangent)."""
+    return int(getattr(visual, "residual_dim", 3))
+
+
+def _normal_huber_cost(residual, scale, delta, dim=3):
+    """Mean Huber cost per valid normal-point residual block."""
+    norms = np.linalg.norm(np.asarray(residual).reshape(-1, dim) * scale, axis=1)
     return _normal_huber_cost_from_norms(norms, delta)
 
 
@@ -48,10 +53,10 @@ def _normal_huber_cost_from_norms(norms, delta):
     )))
 
 
-def _normal_huber_linearization(residual, jacobian, scale, delta):
+def _normal_huber_linearization(residual, jacobian, scale, delta, dim=3):
     """IRLS rows scaled by 1/sqrt(N) to match the mean Huber cost."""
     scaled = np.asarray(residual) * scale
-    norms = np.linalg.norm(scaled.reshape(-1, 3), axis=1)
+    norms = np.linalg.norm(scaled.reshape(-1, dim), axis=1)
     if len(norms) == 0:
         raise ValueError("normal linearization requires valid contact points")
     block_weights = np.ones(len(norms), dtype=np.float64)
@@ -60,7 +65,7 @@ def _normal_huber_linearization(residual, jacobian, scale, delta):
         block_weights[outliers] = delta / norms[outliers]
     else:
         outliers = np.zeros(len(norms), dtype=bool)
-    row_weights = np.repeat(np.sqrt(block_weights / len(norms)), 3)
+    row_weights = np.repeat(np.sqrt(block_weights / len(norms)), dim)
     return (
         np.asarray(jacobian) * (scale * row_weights[:, None]),
         scaled * row_weights,
@@ -541,11 +546,11 @@ class GtsamVisualInertialSolver:
             if evaluated is None:
                 return None
             residual, Jr, Jt = evaluated
-            if len(residual) < 30:
+            if len(residual) < 10 * _normal_dim(visual):
                 return None
             A, b, _, _ = _normal_huber_linearization(
                 residual, np.column_stack((Jr @ gel_J, Jt @ gel_J)),
-                np.sqrt(self.visual_weight), delta)
+                np.sqrt(self.visual_weight), delta, _normal_dim(visual))
             Ap, Ac, rhs = self._joint_rows(factors, prior, left, right)
             normal_p, normal_c = np.zeros((len(b), width)), np.zeros((len(b), width))
             normal_p[:, :6], normal_c[:, :6] = A[:, :6], A[:, 6:]
@@ -818,7 +823,7 @@ class GtsamVisualInertialSolver:
             if evaluated is None:
                 return None
             residual, _, normal_jacobian = evaluated
-            if (len(residual) < 30 or not np.all(np.isfinite(residual))
+            if (len(residual) < 10 * _normal_dim(visual) or not np.all(np.isfinite(residual))
                     or not np.all(np.isfinite(normal_jacobian))):
                 return None
             if self.normal_zero_pose_z_jacobian:
@@ -827,7 +832,8 @@ class GtsamVisualInertialSolver:
             normal_jacobian = normal_jacobian @ gel_from_imu_increment
             normal_A, normal_b, normal_cost, downweighted = (
                 _normal_huber_linearization(
-                    residual, normal_jacobian, normal_scale, normal_huber_delta
+                    residual, normal_jacobian, normal_scale, normal_huber_delta,
+                    _normal_dim(visual),
                 )
             )
             normal_factor = gtsam.JacobianFactor(
@@ -944,7 +950,7 @@ class GtsamVisualInertialSolver:
                 "normal_jacobian_source": normal_jacobian_source,
                 "normal_huber_delta": normal_huber_delta,
                 "normal_huber_active": normal_huber_delta > 0.0,
-                "active_rows": len(residual) // 3,
+                "active_rows": len(residual) // _normal_dim(visual),
                 "base_cost": base_cost,
                 "base_normal_cost": normal_cost,
                 "height_z_enabled": self.height_z_enabled,
@@ -988,11 +994,11 @@ class GtsamVisualInertialSolver:
                 candidate_residual = None if candidate_result is None else candidate_result[0]
             valid_normal = (
                 candidate_residual is not None and len(candidate_residual) > 0
-                and len(candidate_residual) % 3 == 0
+                and len(candidate_residual) % _normal_dim(visual) == 0
                 and np.all(np.isfinite(candidate_residual))
             )
             candidate_normal_cost = (_normal_huber_cost(
-                candidate_residual, normal_scale, normal_huber_delta
+                candidate_residual, normal_scale, normal_huber_delta, _normal_dim(visual)
             ) if valid_normal else None)
             candidate_values = _imu_values(candidate_previous, candidate)
             candidate_imu_cost = self.imu_weight * float(
@@ -1055,14 +1061,14 @@ class GtsamVisualInertialSolver:
             if evaluated is None:
                 return None
             residual, _, J = evaluated
-            if len(residual) < 30 or not np.all(np.isfinite(residual)):
+            if len(residual) < 10 * _normal_dim(visual) or not np.all(np.isfinite(residual)):
                 return None
             if self.normal_zero_pose_z_jacobian:
                 J = J.copy()
                 J[:, 5] = 0.0
             J = J @ gel_from_imu_increment
             normal_A, normal_b, _, _ = _normal_huber_linearization(
-                residual, J, normal_scale, normal_huber_delta
+                residual, J, normal_scale, normal_huber_delta, _normal_dim(visual)
             )
             # Use the last solve's normal loss for retention (ordinary least
             # squares after step five). Prior rows are always unrobustified.

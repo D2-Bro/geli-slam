@@ -146,6 +146,10 @@ imu_config:
     - [0.0, 0.0, 0.0, 1.0]
   # Strongest-curvature candidates; shared contact rows change each iteration.
   dense_normalflow_samples: 500
+  # Normal residual per point: "vector" = NormalFlow R^-1 n_tar - n_ref (3 rows);
+  # "tangent" = its projection on two tangent vectors of n_ref (2 rows; unit
+  # normals have 2 DoF). Offline: same accuracy as "vector" on real and sim.
+  dense_normalflow_residual_space: "tangent"
   # Positive relative objective weights for the joint frontend solve.
   dense_normalflow_residual_weight: 1.0
   # Shared objective weight for the separate IMU and bias factors.

@@ -57,6 +57,10 @@ imu_config:
   # eliminate_first: eliminate previous from prior+IMU+bias once, GN over
   # [reference, current] (21D); IMU fixed at the accepted previous state.
   frontend_reference_previous_state: "eliminate_first"
+  # rows: stack all factor rows (~1500 x 21) and solve/compress with SVD.
+  # hessian: reduce them to the 21x21 H = A^T A first (eliminate_first only).
+  # Same result to 1e-12 on all 12 trials; solve 8.6 -> 6.2 ms median.
+  frontend_reference_linear_system: "hessian"
   # Shared native preintegration: midpoint only (half-step attitude). It averages
   # adjacent accel/gyro samples and composes rotations.
   # Covers VI prediction, recovery, no-contact coast and backend IMU factors.
@@ -166,6 +170,10 @@ imu_config:
     - [0.0, 0.0, 0.0, 1.0]
   # Strongest-curvature candidates; shared contact rows change each iteration.
   dense_normalflow_samples: 500
+  # Normal residual per point: "vector" = NormalFlow R^-1 n_tar - n_ref (3 rows);
+  # "tangent" = its projection on two tangent vectors of n_ref (2 rows; unit
+  # normals have 2 DoF). Offline: same accuracy as "vector" on real and sim.
+  dense_normalflow_residual_space: "tangent"
   # Positive relative objective weights for the joint frontend solve.
   dense_normalflow_residual_weight: 1.0
   # Shared objective weight for the separate IMU and bias factors.

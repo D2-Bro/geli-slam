@@ -7,7 +7,7 @@ import numpy as np
 
 from gelslam.core.gtsam_vi import (
     GtsamVisualInertialSolver, _bias_factor, _imu_values, _navigation_step_norms,
-    _normal_huber_linearization, _split_imu_factor, navigation_factor_terms,
+    _normal_dim, _normal_huber_linearization, _split_imu_factor, navigation_factor_terms,
     preintegrate_imu,
 )
 from gelslam.core.gt_state_diagnostic import resolve_gt_state_test
@@ -15,12 +15,13 @@ from gelslam.core.imu_navigation import gelsight_pose, gelsight_pose_jacobian
 from gelslam.core.marginal_prior import NavigationPrior
 from gelslam.core.numpy_vi import adjoint
 from gelslam.core.retained_prior import (
-    RetainedPrior, VariableBlock, VariableLayout, eliminate_rows, navigation_state,
-    rank_solve, state_blocks, state_values,
+    RetainedPrior, VariableBlock, VariableLayout, compress_normal, eliminate_rows,
+    navigation_state, rank_solve, rank_solve_normal, state_blocks, state_values,
 )
 from gelslam.core.split_pose import split_pose_plus
 
 PREVIOUS_STATE_MODES = ("joint", "eliminate_first")
+LINEAR_SYSTEMS = ("rows", "hessian")
 
 
 def _expanded_step(layout, blocks, step):
@@ -57,6 +58,17 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
         if self.previous_state_mode not in PREVIOUS_STATE_MODES:
             raise ValueError("frontend_reference_previous_state must be one of "
                              + ", ".join(PREVIOUS_STATE_MODES))
+        # rows: stack every factor row and solve/compress them with SVD.
+        # hessian: reduce each factor to H = A^T A, g = A^T rhs on the 21D
+        # [reference, current] system first. Needs eliminate_first, whose solve
+        # blocks are exactly the retained blocks.
+        self.linear_system = str(config.get("frontend_reference_linear_system", "rows"))
+        if self.linear_system not in LINEAR_SYSTEMS:
+            raise ValueError("frontend_reference_linear_system must be one of "
+                             + ", ".join(LINEAR_SYSTEMS))
+        if self.linear_system == "hessian" and self.previous_state_mode != "eliminate_first":
+            raise ValueError("frontend_reference_linear_system hessian requires "
+                             "frontend_reference_previous_state eliminate_first")
         self.reference_id = None
         self.first_pose_id = None
         self.last_reference_pose = None  # IMU-origin world pose, candidate only.
@@ -266,12 +278,12 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
             A_nav, b_nav = eliminated.linearize_values(point, solve_layout)
             return [A_nav], [b_nav]
 
-        def rows_at(point, iteration):
-            layout = solve_layout
+        def terms_at(point, iteration):
+            """(rows, rhs, blocks) per factor; blocks None means solve_layout columns."""
             reference = gelsight_pose(point[reference_id], extrinsic)
             target = gelsight_pose(point[current_id], extrinsic)
             evaluated = evaluate(reference, target)
-            if evaluated is None or len(evaluated[0]) < 30:
+            if evaluated is None or len(evaluated[0]) < 10 * _normal_dim(visual):
                 raise ValueError("invalid_normal_residual")
             residual, Jr, Jt = evaluated
             if not all(np.isfinite(v).all() for v in (residual, Jr, Jt)):
@@ -279,10 +291,10 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
             Jr, Jt = self._normal_pose_rows(visual, reference, target, Jr, Jt)
             normal_A, normal_b, normal_cost, _ = _normal_huber_linearization(
                 residual, np.column_stack((Jr @ gel_J, Jt @ gel_J)),
-                np.sqrt(self.visual_weight), self.normal_huber_delta_at(iteration))
-            rows, right = navigation_rows(point)
-            rows.append(layout.embed(normal_A, (reference_id, current_id)))
-            right.append(-normal_b)
+                np.sqrt(self.visual_weight), self.normal_huber_delta_at(iteration),
+                _normal_dim(visual))
+            terms = [(A_nav, b_nav, None) for A_nav, b_nav in zip(*navigation_rows(point))]
+            terms.append((normal_A, -normal_b, (reference_id, current_id)))
             height = self._height_z_linearization(visual, reference, target, gel_J)
             if height is None:
                 raise ValueError("invalid_height_residual")
@@ -290,17 +302,51 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
                 Ht, hb, _ = height
                 Hr = -self._height_z_jacobian(np.eye(6)) @ adjoint(
                     np.linalg.inv(target) @ reference) @ gel_J
-                rows.append(layout.embed(np.column_stack((Hr, Ht)), (reference_id, current_id)))
-                right.append(-hb)
-            A, rhs = np.vstack(rows), np.concatenate(right)
+                terms.append((np.column_stack((Hr, Ht)), -hb, (reference_id, current_id)))
+            return terms, normal_cost
+
+        def rows_at(point, iteration):
+            terms, normal_cost = terms_at(point, iteration)
+            A = np.vstack([rows if blocks is None else solve_layout.embed(rows, blocks)
+                           for rows, _, blocks in terms])
+            rhs = np.concatenate([right for _, right, _ in terms])
             if not np.isfinite(A).all() or not np.isfinite(rhs).all():
                 raise ValueError("nonfinite_factor_rows")
             return A, rhs, normal_cost
 
+        def normal_equation_at(point, iteration):
+            """H = A^T A, g = A^T rhs, |rhs|^2 and the row count of rows_at()."""
+            terms, normal_cost = terms_at(point, iteration)
+            H = np.zeros((solve_layout.dimension,) * 2)
+            g = np.zeros(solve_layout.dimension)
+            squared_norm, row_count = 0., 0
+            for rows, right, blocks in terms:
+                Hf, gf = rows.T @ rows, rows.T @ right
+                if blocks is not None:
+                    # Maps factor columns to solve columns (drops fixed, sums aliases).
+                    embed = solve_layout.embed(np.eye(rows.shape[1]), blocks)
+                    Hf, gf = embed.T @ Hf @ embed, embed.T @ gf
+                H += Hf
+                g += gf
+                squared_norm += float(right @ right)
+                row_count += len(right)
+            if not np.isfinite(H).all() or not np.isfinite(g).all():
+                raise ValueError("nonfinite_factor_rows")
+            return H, g, squared_norm, row_count, normal_cost
+
+        hessian = self.linear_system == "hessian"
+        if hessian and solve_layout.blocks != VariableLayout(
+                retained_blocks, prior.fixed_values).blocks:
+            raise ValueError("hessian linear system requires solve blocks == retained blocks")
         rank = 0
         for iteration in range(self.max_iterations):
-            A, rhs, normal_cost = rows_at(values, iteration)
-            step, rank, singular = rank_solve(A, rhs)
+            if hessian:
+                H, g, squared_norm, row_count, normal_cost = normal_equation_at(values, iteration)
+                step, rank, singular = rank_solve_normal(H, g, row_count)
+            else:
+                A, rhs, normal_cost = rows_at(values, iteration)
+                step, rank, singular = rank_solve(A, rhs)
+                squared_norm = float(rhs @ rhs)
             if rank == 0 or not np.isfinite(step).all():
                 raise ValueError("empty_observable_system")
             candidate = solve_layout.plus(values, step)
@@ -319,16 +365,26 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
                 variable_reference=reference_id not in prior.fixed_values,
                 first_pose_fixed=True,
                 solve_dimension=solve_layout.dimension, numerical_rank=int(rank),
-                scaled_min_singular=float(singular[-1]), base_cost=float(rhs @ rhs / 2),
+                linear_system=self.linear_system,
+                scaled_min_singular=float(singular[-1]), base_cost=squared_norm / 2,
                 base_normal_cost=normal_cost, raw_step_norms=state_steps,
                 stop_reason="step_converged" if converged else "max_iterations"
                 if iteration + 1 == self.max_iterations else None))
             values = candidate
             if converged:
                 break
-        A, rhs, _ = rows_at(values, iteration)
-        retained = self._compress(solve_layout, values, A, rhs, retained_blocks,
-                                  current.timestamp, prior.absorbed_intervals + 1, prior.fixed_values)
+        if hessian:
+            H, g, _, _, _ = normal_equation_at(values, iteration)
+            retained = RetainedPrior(
+                VariableLayout(retained_blocks, prior.fixed_values), values,
+                *compress_normal(H, g), current.timestamp, prior.absorbed_intervals + 1,
+                prior.fixed_values)
+        else:
+            A, rhs, _ = rows_at(values, iteration)
+            H, g = A.T @ A, A.T @ rhs
+            retained = self._compress(solve_layout, values, A, rhs, retained_blocks,
+                                      current.timestamp, prior.absorbed_intervals + 1,
+                                      prior.fixed_values)
         if eliminated is not None and reference_id.timestamp == previous.timestamp:
             # The previous state is published as the reference state. Recover its
             # eliminated blocks by back-substitution in the same linear system.
@@ -349,10 +405,9 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
                                      if reference_id.timestamp == previous.timestamp else None)
         # Only the small normal equation is retained for diagnostics, not raw
         # NormalFlow pixels or old IMU measurements. It is never an active factor.
-        H = A.T @ A
         self.last_problem = dict(
             blocks=solve_layout.blocks, solve_dimension=solve_layout.dimension,
-            retained_dimension=retained.layout.dimension, hessian=H, rhs=A.T @ rhs,
+            retained_dimension=retained.layout.dimension, hessian=H, rhs=g,
             # Diagnostic only: rank of the last solved GN system. Avoid a
             # second full solve of the final rows just to report it.
             numerical_rank=int(rank),

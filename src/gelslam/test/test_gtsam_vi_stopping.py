@@ -170,9 +170,9 @@ def test_normal_huber_switches_off_at_sixth_step_and_stays_off_in_prior(monkeypa
     deltas = []
     linearize = gv._normal_huber_linearization
 
-    def capture(residual, J, scale, delta):
+    def capture(residual, J, scale, delta, dim=3):
         deltas.append(delta)
-        return linearize(residual, J, scale, delta)
+        return linearize(residual, J, scale, delta, dim)
 
     monkeypatch.setattr(gv, '_normal_huber_linearization', capture)
     solver = gv.GtsamVisualInertialSolver({'gtsam_vi_normal_linearization': mode})
