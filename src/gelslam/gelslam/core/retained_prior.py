@@ -17,6 +17,10 @@ from gelslam.core.split_pose import (
 
 
 RANK_TOLERANCE = 1e-12
+# Relative singular-value threshold for solves from H = A^T A, whose small
+# singular values carry about sqrt(eps) * s_max noise. Real frontend systems
+# had s_min / s_max >= 2.2e-4 (trial_001, 4000 scaled systems).
+NORMAL_RANK_TOLERANCE = 1e-6
 STATE_KINDS = ("pose", "velocity", "accel_bias", "gyro_bias")
 
 
@@ -139,6 +143,49 @@ def eliminate_rows(A, rhs, eliminate_columns, retain_columns):
     compressed = singular[active, None] * vt[active] * scales
     compressed[:, zero_columns] = 0.
     return compressed, u[:, active].T @ rhs
+
+
+def _scaled_normal_eigh(H, g, inactive):
+    """Eigenpairs of the column-scaled H = A^T A, largest first, as singular values of A."""
+    scales = np.sqrt(np.clip(np.diag(H), 0., None))
+    inactive = inactive(scales)
+    scales[inactive] = 1.
+    Hs, gs = H / np.outer(scales, scales), g / scales
+    Hs[inactive], Hs[:, inactive], gs[inactive] = 0., 0., 0.
+    eigenvalues, vectors = np.linalg.eigh(Hs)
+    singular = np.sqrt(np.clip(eigenvalues[::-1], 0., None))
+    return scales, inactive, singular, vectors[:, ::-1], gs
+
+
+def rank_solve_normal(H, g, rows):
+    """rank_solve(A, rhs) from H = A^T A and g = A^T rhs of a system with `rows` rows.
+
+    Same column scaling as rank_solve. Singular values from H are accurate only
+    to about sqrt(eps) of the largest one, so an exact null direction appears
+    near 1e-8 instead of 1e-16. Use NORMAL_RANK_TOLERANCE, not RANK_TOLERANCE.
+    """
+    H, g = np.asarray(H, float), np.asarray(g, float)
+    if not np.isfinite(H).all() or not np.isfinite(g).all():
+        raise ValueError("nonfinite linear system")
+    scales, inactive, singular, vectors, gs = _scaled_normal_eigh(
+        H, g, lambda s: s <= np.finfo(float).eps * max(rows, len(s))
+        * max(float(s.max(initial=0.)), 1.))
+    active = singular > NORMAL_RANK_TOLERANCE * (singular[0] if len(singular) else 0.)
+    solution = vectors[:, active] @ ((vectors[:, active].T @ gs) / singular[active] ** 2)
+    solution[inactive] = 0.
+    return solution / scales, int(active.sum()), singular
+
+
+def compress_normal(H, g):
+    """eliminate_rows(A, rhs, [], all columns) from H = A^T A and g = A^T rhs."""
+    H, g = np.asarray(H, float), np.asarray(g, float)
+    if not np.isfinite(H).all() or not np.isfinite(g).all():
+        raise ValueError("marginalization rows must be finite")
+    scales, zero_columns, singular, vectors, gs = _scaled_normal_eigh(H, g, lambda s: s == 0.)
+    active = singular > NORMAL_RANK_TOLERANCE * max(float(singular[0]) if len(singular) else 0., 1.)
+    compressed = singular[active, None] * vectors[:, active].T * scales
+    compressed[:, zero_columns] = 0.
+    return compressed, (vectors[:, active].T @ gs) / singular[active]
 
 
 @dataclass

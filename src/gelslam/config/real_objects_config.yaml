@@ -59,7 +59,8 @@ imu_config:
   frontend_reference_previous_state: "eliminate_first"
   # rows: stack all factor rows (~1500 x 21) and solve/compress with SVD.
   # hessian: reduce them to the 21x21 H = A^T A first (eliminate_first only).
-  # Same result to 1e-12 on all 12 trials; solve 8.6 -> 6.2 ms median.
+  # Same states to 1e-12 on all 12 trials. Solve median, trial_001:
+  # vector residual 8.6 -> 6.2 ms; tangent residual 10.0 -> 8.6 ms.
   frontend_reference_linear_system: "hessian"
   # Shared native preintegration: midpoint only (half-step attitude). It averages
   # adjacent accel/gyro samples and composes rotations.

@@ -12,8 +12,8 @@ from gelslam.core.inertial import ImuSample
 from gelslam.core.marginal_prior import NavigationPrior
 from gelslam.core.numpy_vi import DenseNormalResidual, NavigationState, adjoint
 from gelslam.core.retained_prior import (
-    RetainedPrior, VariableLayout, eliminate_rows, rank_solve,
-    state_blocks, state_values,
+    RetainedPrior, VariableLayout, compress_normal, eliminate_rows, rank_solve,
+    rank_solve_normal, state_blocks, state_values,
 )
 from gelslam.core.split_pose import split_pose_plus
 
@@ -79,6 +79,27 @@ def test_rank_deficiency_preserves_zero_information_and_observable_solution():
     reduced = rank_solve(Ar, br)[0]
     np.testing.assert_allclose(full, reduced, atol=1e-12)
     assert rank_solve(Ar, br)[1] == 20
+
+
+def test_normal_equation_solve_and_compression_match_row_versions():
+    rng = np.random.default_rng(17)
+    A = rng.normal(size=(1500, 21)) * np.r_[np.full(6, 1e3), np.full(15, 1e-2)]
+    A[:, 5] = 0.  # Unobserved column.
+    A[:, 9] = A[:, 10]  # Rank-deficient pair.
+    rhs = rng.normal(size=1500)
+    H, g = A.T @ A, A.T @ rhs
+    step, rank, singular = rank_solve(A, rhs)
+    step_h, rank_h, singular_h = rank_solve_normal(H, g, len(A))
+    assert rank_h == rank == 19
+    np.testing.assert_allclose(step_h, step, rtol=0., atol=1e-9 * np.abs(step).max())
+    np.testing.assert_allclose(singular_h[:rank], singular[:rank], rtol=1e-10)
+    Ar, br = eliminate_rows(A, rhs, np.empty(0, int), np.arange(21))
+    Ah, bh = compress_normal(H, g)
+    assert Ah.shape == Ar.shape == (19, 21)
+    assert not Ah[:, 5].any()
+    # Rows are unique only up to an orthogonal transform; compare A^T A and A^T rhs.
+    np.testing.assert_allclose(Ah.T @ Ah, Ar.T @ Ar, rtol=0., atol=1e-9 * np.abs(H).max())
+    np.testing.assert_allclose(Ah.T @ bh, Ar.T @ br, rtol=0., atol=1e-9 * np.abs(g).max())
 
 
 def test_frozen_prior_jacobian_and_cost_gradient_away_from_pose_anchors():
@@ -286,6 +307,46 @@ def test_eliminate_first_matches_joint_solve_with_smaller_system():
             np.testing.assert_allclose(getattr(b, field), getattr(a, field), atol=1e-6)
 
 
+def test_hessian_linear_system_matches_stacked_rows():
+    from test_frontend_gauss_newton import frame
+    image = frame()
+
+    class PerturbedVisual(FlatVisual):
+        def evaluate(self, ref, tar):
+            visual = DenseNormalResidual(image, image, 1., ref, tar, 1000)
+            residual, Jr, Jt = visual.evaluate(ref, tar)
+            return residual + .01, Jr, Jt
+
+        def target_z_height_correction(self, ref, tar):
+            visual = DenseNormalResidual(image, image, 1., ref, tar, 1000)
+            return visual.target_z_height_correction(ref, tar)
+
+    runs = {}
+    for system in ('rows', 'hessian'):
+        s = solver(dense_normalflow_residual_weight=1e5, gtsam_vi_height_z_enabled=True,
+                   frontend_reference_previous_state='eliminate_first',
+                   frontend_reference_linear_system=system)
+        states = [advance(s, state(), PerturbedVisual())]  # Bootstrap: first pose fixed.
+        states.append(advance(s, states[-1], PerturbedVisual()))  # Reference = first pose.
+        s.set_reference(states[-1].timestamp, states[-1])
+        states.append(advance(s, states[-1], PerturbedVisual()))  # Reference = previous.
+        states.append(advance(s, states[-1], PerturbedVisual()))  # Generic reference.
+        assert {t['linear_system'] for t in s.last_optimization_trace} == {system}
+        runs[system] = (states, s.marginal_prior, s.last_problem, s.last_optimization_trace)
+    (rows, prior_r, problem_r, trace_r), (hess, prior_h, problem_h, trace_h) = (
+        runs['rows'], runs['hessian'])
+    for a, b in zip(rows, hess):
+        for field in ('pose', 'velocity', 'accel_bias', 'gyro_bias'):
+            np.testing.assert_allclose(getattr(b, field), getattr(a, field), rtol=0., atol=1e-10)
+    for h, r in ((prior_h.A.T @ prior_h.A, prior_r.A.T @ prior_r.A),
+                 (problem_h['hessian'], problem_r['hessian'])):
+        np.testing.assert_allclose(h, r, rtol=0., atol=1e-11 * np.abs(r).max())
+    assert prior_h.layout.blocks == prior_r.layout.blocks
+    assert [t['numerical_rank'] for t in trace_h] == [t['numerical_rank'] for t in trace_r]
+    np.testing.assert_allclose([t['base_cost'] for t in trace_h],
+                               [t['base_cost'] for t in trace_r], rtol=1e-9)
+
+
 @pytest.mark.parametrize('mode', ['inverse_compositional', 'target_relinearized'])
 def test_projected_normal_rows_do_not_observe_common_world_motion(mode):
     from test_frontend_gauss_newton import frame
@@ -374,6 +435,8 @@ def test_nonfinite_failure_keeps_accepted_prior(bad):
     {'frontend_imu_prediction_only': True}, {'gtsam_vi_marginalization': False},
     {'frontend_gt_previous_state_test': True}, {'frontend_state_mode': 'unknown'},
     {'frontend_reference_previous_state': 'unknown'},
+    {'frontend_reference_linear_system': 'unknown'},
+    {'frontend_reference_linear_system': 'hessian'},  # joint is the default.
 ])
 def test_incompatible_modes_fail_explicitly(options):
     with pytest.raises(ValueError):
