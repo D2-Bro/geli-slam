@@ -247,6 +247,13 @@ gelslam_config:
     min_sift_inliers: 8
     scr_threshold: 0.3
     ccs_threshold: 0.7
+    # Backend-only IMU integration sigma; the frontend keeps imu_config 0.001.
+    # Keyframe states from the frontend disagree with backend IMU factors by
+    # 4-6 mm per 0.53 s contact link, so 0.01 lets loops correct them.
+    imu_integration_sigma_m: 0.01
+    # Huber kernel on registered-loop residuals; loop rotation errors of 1-5 deg
+    # otherwise bend the trajectory. Odometry factors stay Gaussian.
+    loop_pgo_loop_robust: huber
 
 # Resolve each stored FrameMsg through the final pose graph at shutdown, then
 # rigidly align it to this bag's GT trajectory.  The GT is evaluation-only.

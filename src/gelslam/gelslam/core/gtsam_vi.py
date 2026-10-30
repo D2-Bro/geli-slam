@@ -416,6 +416,11 @@ class GtsamVisualInertialSolver:
         self.initialize_from_imu_preintegration = self.config.get(
             "frontend_initialize_from_imu_preintegration", True
         )
+        # With initialize_from_imu_preintegration false: start the solve at the IMU
+        # rotation but keep the previous GelSight origin (zero relative translation).
+        self.initialize_rotation_from_imu = self.config.get("frontend_initialize_rotation_from_imu", False)
+        if not isinstance(self.initialize_rotation_from_imu, bool):
+            raise ValueError("frontend_initialize_rotation_from_imu must be a boolean")
         self.fix_previous_state = self.config.get("frontend_fix_previous_state", False)
         if not isinstance(self.fix_previous_state, bool):
             raise ValueError("frontend_fix_previous_state must be a boolean")
@@ -657,6 +662,18 @@ class GtsamVisualInertialSolver:
                 and not self.imu_prediction_only):
             current = previous.copy()
             current.timestamp = timestamp
+            if self.initialize_rotation_from_imu:
+                try:
+                    rotation = np.asarray(pim.predict(
+                        gtsam.NavState(gtsam.Pose3(previous.pose), previous.velocity),
+                        _bias(previous)).pose().rotation().matrix(), dtype=np.float64)
+                except (RuntimeError, ValueError):
+                    return current, pim
+                transform = np.asarray(self.config.get("gelsight_T_imu", np.eye(4)), dtype=np.float64)
+                gel_in_imu = -transform[:3, :3].T @ transform[:3, 3]
+                gel_origin = previous.pose[:3, :3] @ gel_in_imu + previous.pose[:3, 3]
+                current.pose[:3, :3] = rotation
+                current.pose[:3, 3] = gel_origin - rotation @ gel_in_imu
             return current, pim
         try:
             predicted = pim.predict(

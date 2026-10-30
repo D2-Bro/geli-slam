@@ -22,6 +22,13 @@ class LoopPoseGraph:
     def __init__(self, config, imu_config=None):
         self.config = dict(config)
         self.imu_config = dict(imu_config or {})
+        # Optional backend-only IMU noise (default: the frontend imu_config values).
+        # A stiff frontend integration sigma (0.001) made each first global solve
+        # move whole trajectories to absorb stale keyframe velocities.
+        for key, name in (('imu_integration_sigma_m', 'gtsam_integration_sigma_m'),
+                          ('imu_accel_bias_random_walk', 'accelerometer_bias_random_walk')):
+            if self.config.get(key) is not None:
+                self.imu_config[name] = self._positive(key, 1.)
         mounting = self.imu_config.get('gelsight_T_imu')
         self.extrinsic = np.asarray(np.eye(4) if mounting is None else mounting, dtype=float)
         self.imu_T_gel = np.linalg.inv(self.extrinsic)
@@ -29,6 +36,28 @@ class LoopPoseGraph:
             self._positive('loop_pgo_rotation_sigma_rad', .01),
             self._positive('loop_pgo_translation_sigma_m', .0001),
         ], 3))
+        # Loop registrations may use their own sigmas (default: the odometry sigmas)
+        # and an optional robust kernel. Registered loop rotations were measured
+        # 1-5 deg (up to 15 deg) off GT on real-objects, far above 0.01 rad.
+        loop_sigmas = np.repeat([
+            self._positive('loop_pgo_loop_rotation_sigma_rad', self._positive('loop_pgo_rotation_sigma_rad', .01)),
+            self._positive('loop_pgo_loop_translation_sigma_m', self._positive('loop_pgo_translation_sigma_m', .0001)),
+        ], 3)
+        self.loop_noise = gtsam.noiseModel.Diagonal.Sigmas(loop_sigmas)
+        robust = self.config.get('loop_pgo_loop_robust')
+        if robust is not None:
+            width = self._positive('loop_pgo_loop_robust_width', 1.345)
+            kernels = {'huber': gtsam.noiseModel.mEstimator.Huber, 'cauchy': gtsam.noiseModel.mEstimator.Cauchy}
+            if robust not in kernels:
+                raise ValueError("pose_graph_config.loop_pgo_loop_robust must be null, 'huber' or 'cauchy'")
+            self.loop_noise = gtsam.noiseModel.Robust.Create(kernels[robust].Create(width), self.loop_noise)
+        # IMU-only links (target keyframe not tactile, i.e. across a no-contact gap):
+        # optionally inflate accelerometer and integration noise and the accel bias
+        # walk; gyro noise is unchanged. Global PGO runs only after a loop is accepted.
+        self.imu_only_accel_scale = self._positive('imu_only_edge_accel_noise_scale', 1.)
+        self.imu_only_walk_scale = self._positive('imu_only_edge_accel_bias_walk_scale', 1.)
+        error = self.config.get('imu_only_edge_accel_error_mps2')
+        self.imu_only_accel_error = None if error is None else self._positive('imu_only_edge_accel_error_mps2', 1.)
         self.anchor_noise = gtsam.noiseModel.Isotropic.Sigma(
             6, self._positive('anchor_sigma', 1e-6))
         self.graph = gtsam.NonlinearFactorGraph()
@@ -172,13 +201,16 @@ class LoopPoseGraph:
                        for a, b in zip(samples, samples[1:]))):
             raise ValueError('global PGO IMU interval must cover both keyframe times with no gaps')
         gravity = -np.linalg.norm(record.gravity) * self.up
-        pim = preintegrate_imu(samples, previous, self.imu_config, self.extrinsic, gravity)
+        imu_config, walk_scale = self.imu_config, 1.
+        if not record.tactile_valid:
+            imu_config, walk_scale = self._imu_only_noise(end - start)
+        pim = preintegrate_imu(samples, previous, imu_config, self.extrinsic, gravity)
         if pim is None:
             raise ValueError('global PGO IMU preintegration unavailable')
         imu = gtsam.ImuFactor(reference, velocity_key(reference), target,
                               velocity_key(target), bias_key(reference), pim)
         densities = np.repeat([
-            float(self.imu_config.get('accelerometer_bias_random_walk', .0002)),
+            float(self.imu_config.get('accelerometer_bias_random_walk', .0002)) * walk_scale,
             float(self.imu_config.get('gyroscope_bias_random_walk', .00002)),
         ], 3)
         if not np.isfinite(densities).all() or np.any(densities <= 0):
@@ -187,6 +219,27 @@ class LoopPoseGraph:
             bias_key(reference), bias_key(target), gtsam.imuBias.ConstantBias(),
             gtsam.noiseModel.Diagonal.Sigmas(densities * np.sqrt(pim.deltaTij())))
         return imu, bias
+
+    def _imu_only_noise(self, duration):
+        """Return the preintegration config and accel bias walk scale of one IMU-only link.
+
+        Constant mode multiplies accel/integration sigmas by a fixed scale. The
+        error model instead matches a constant acceleration error a over the
+        link: white accel density sqrt(3)/2 * a * sqrt(dt) gives position sigma
+        a * dt^2 / 2, and the bias may change by a over the link.
+        """
+        accel = float(self.imu_config.get('accelerometer_noise_density', .02))
+        integration = float(self.imu_config.get('gtsam_integration_sigma_m', 1e-4))
+        walk = float(self.imu_config.get('accelerometer_bias_random_walk', .0002))
+        accel_scale, walk_scale = self.imu_only_accel_scale, self.imu_only_walk_scale
+        if self.imu_only_accel_error is not None:
+            accel_scale = max(accel_scale, .5 * np.sqrt(3.) * self.imu_only_accel_error * np.sqrt(duration) / accel)
+            walk_scale = max(walk_scale, self.imu_only_accel_error / np.sqrt(duration) / walk)
+        if accel_scale == 1. and walk_scale == 1.:
+            return self.imu_config, 1.
+        config = dict(self.imu_config, accelerometer_noise_density=accel * accel_scale,
+                      gtsam_integration_sigma_m=integration * accel_scale)
+        return config, walk_scale
 
     def solve(self):
         """Jointly optimize full rotations, positions, velocities and both biases."""
@@ -224,7 +277,7 @@ class LoopPoseGraph:
                 add(split_between_factor(reference, target, measurement, self.noise,
                                          self.imu_T_gel), 'odometry')
         for reference, target, measurement in self.loops:
-            add(split_between_factor(reference, target, measurement, self.noise,
+            add(split_between_factor(reference, target, measurement, self.loop_noise,
                                      self.imu_T_gel), 'loop')
         initial_cost = float(graph.error(values))
         result = optimize_split_pose_graph(graph, values,
@@ -246,6 +299,33 @@ class LoopPoseGraph:
         self.factor_kinds, self.corrections = kinds, corrections
         self.velocity_corrections, self.bias_corrections = velocities, biases
         self.last_initial_cost, self.last_final_cost = initial_cost, final_cost
+        if self.config.get('debug_dump_dir'):
+            self._dump_solve(graph, values, result, kinds)
+
+    def _dump_solve(self, graph, values, result, kinds):
+        """Diagnostics only: one JSON per solve with loops, poses and per-factor chi2."""
+        import json
+        import os
+        os.makedirs(self.config['debug_dump_dir'], exist_ok=True)
+        factors = []
+        for index, kind in enumerate(kinds):
+            factor = graph.at(index)
+            factors.append(dict(kind=kind, keys=[int(k) for k in factor.keys()],
+                                chi2_initial=2 * float(factor.error(values)),
+                                chi2_final=2 * float(factor.error(result))))
+        gel = lambda pose: (np.asarray(pose) @ self.imu_T_gel).tolist()
+        data = dict(
+            timestamps=[float(s.timestamp) for s in self.local_states],
+            tactile_valid=[bool(r.tactile_valid) for r in self.records],
+            temporal_links=[[int(r), int(t)] for r, t in self.temporal_links],
+            loops=[dict(reference=int(r), target=int(t), measurement_gel=np.asarray(m).tolist())
+                   for r, t, m in self.loops],
+            map_gel_before=[gel(values.atPose3(k).matrix()) for k in range(len(self.local_states))],
+            map_gel_after=[gel(result.atPose3(k).matrix()) for k in range(len(self.local_states))],
+            factors=factors, initial_cost=self.last_initial_cost, final_cost=self.last_final_cost)
+        name = 'solve_%04d_kf%04d.json' % (len(os.listdir(self.config['debug_dump_dir'])), len(self.local_states))
+        with open(os.path.join(self.config['debug_dump_dir'], name), 'w') as handle:
+            json.dump(data, handle)
 
     def snapshot(self):
         return dict(degrees_of_freedom=self.degrees_of_freedom,

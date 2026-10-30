@@ -143,3 +143,70 @@ def test_global_solver_rejects_missing_imu_instead_of_filling_velocity_and_bias(
     graph.keyframes[2].imu_samples = ()
     with pytest.raises(ValueError, match='global PGO IMU interval'):
         graph.solve(global_optimization=True)
+
+
+def _gap_imu_factor(settings):
+    graph = PoseGraph(settings)
+    graph.add_keyframes([frame(new=True), frame(1, tactile=False), frame(2)], 0, 3)
+    graph._add_loop_pair(0, 2, np.eye(4))
+    graph.solve(global_optimization=True)
+    loop = graph.loop_pgo
+    factors = [loop.graph.at(i) for i, kind in enumerate(loop.factor_kinds) if kind in ('imu', 'bias')]
+    by_target = {}
+    for factor in factors:
+        keys = [k if k < 3 else gtsam.Symbol(k).index() for k in factor.keys()]
+        by_target.setdefault(max(keys), []).append(factor)
+    return loop, by_target
+
+
+def test_imu_only_edge_defaults_keep_the_imu_configuration():
+    loop, _ = _gap_imu_factor(config())
+    config_used, walk = loop._imu_only_noise(.5)
+    assert config_used is loop.imu_config and walk == 1.
+
+
+def test_imu_only_edge_scale_inflates_accel_and_integration_but_not_gyro():
+    base_loop, base = _gap_imu_factor(config())
+    loop, scaled = _gap_imu_factor(config(imu_only_edge_accel_noise_scale=10., imu_only_edge_accel_bias_walk_scale=4.))
+    cfg, walk = loop._imu_only_noise(.5)
+    assert cfg['accelerometer_noise_density'] == pytest.approx(.2) and walk == 4.
+    assert cfg['gyroscope_noise_density'] == loop.imu_config['gyroscope_noise_density']
+    cov = lambda f: f.preintegratedMeasurements().preintMeasCov()
+    gap_base = [f for f in base[1] if isinstance(f, gtsam.ImuFactor)][0]
+    gap_scaled = [f for f in scaled[1] if isinstance(f, gtsam.ImuFactor)][0]
+    tactile_base = [f for f in base[2] if isinstance(f, gtsam.ImuFactor)][0]
+    tactile_scaled = [f for f in scaled[2] if isinstance(f, gtsam.ImuFactor)][0]
+    # Preintegrated covariance order: rotation, position, velocity.
+    np.testing.assert_allclose(cov(gap_scaled)[:3, :3], cov(gap_base)[:3, :3], rtol=1e-9)
+    assert np.all(np.diag(cov(gap_scaled))[3:] > 50 * np.diag(cov(gap_base))[3:])
+    np.testing.assert_allclose(cov(tactile_scaled), cov(tactile_base), rtol=1e-12)
+
+
+def test_imu_only_edge_error_model_matches_constant_acceleration_error():
+    settings = config(imu_only_edge_accel_error_mps2=.025)
+    settings['imu_config']['accelerometer_noise_density'] = .002   # real IMU density, below the model
+    loop, _ = _gap_imu_factor(settings)
+    dt = .64
+    cfg, walk = loop._imu_only_noise(dt)
+    density = cfg['accelerometer_noise_density']
+    # White acceleration density q gives position sigma q * dt^1.5 / sqrt(3).
+    assert density * dt**1.5 / np.sqrt(3) == pytest.approx(.5 * .025 * dt**2)
+    assert walk * .0002 * np.sqrt(dt) == pytest.approx(.025)
+
+
+def test_loop_noise_and_robust_kernel_are_separate_from_odometry():
+    graph = PoseGraph(config(loop_pgo_loop_rotation_sigma_rad=.05, loop_pgo_loop_robust='huber'))
+    loop = graph.loop_pgo
+    assert loop.loop_noise.isRobust() if hasattr(loop.loop_noise, 'isRobust') else 'Robust' in type(loop.loop_noise).__name__
+    np.testing.assert_allclose(loop.noise.sigmas(), np.repeat([.01, .0001], 3))
+    with pytest.raises(ValueError, match='loop_pgo_loop_robust'):
+        PoseGraph(config(loop_pgo_loop_robust='tukey'))
+
+
+def test_backend_only_imu_noise_overrides_do_not_touch_the_frontend_config():
+    settings = config(imu_integration_sigma_m=.01, imu_accel_bias_random_walk=.0009)
+    graph = PoseGraph(settings)
+    assert graph.loop_pgo.imu_config['gtsam_integration_sigma_m'] == .01
+    assert graph.loop_pgo.imu_config['accelerometer_bias_random_walk'] == .0009
+    assert 'gtsam_integration_sigma_m' not in settings['imu_config']
+    assert settings['imu_config']['accelerometer_bias_random_walk'] == .0002
