@@ -44,8 +44,9 @@ imu_config:
     max_propagation_s: 15.0
     velocity_sigma_mps: 0.0001
     # The 3-7 s hand-held approach leaves 0.13-0.29 m/s seed velocity error; let the
-    # first contact frames re-estimate it (first 0.25 s position error 9-22 -> <11 mm).
-    contact_velocity_sigma_mps: 0.3
+    # first contact frames re-estimate it. 1.0 (vs 0.3): velocity error at 0.25 s
+    # 58-93 -> 12-29 mm/s, first 0.25 s position error <=10.6 -> <=1.7 mm.
+    contact_velocity_sigma_mps: 1.0
   enabled: true
   frontend_optimization: true
   # Use reference_marginalization / pairwise for a variable reference + current 21D prior.
@@ -149,7 +150,10 @@ imu_config:
   # On contact return, the frontend retains the accepted prior and full IMU interval.
   accelerometer_noise_density: 0.002
   gyroscope_noise_density: 0.00016
-  accelerometer_bias_random_walk: 0.00086
+  # 3x (0.00086 -> 0.0026): no-contact coast error grows with dt^2 (about 0.025 m/s^2,
+  # the rest-unobservable tangential bias); a looser walk lets contact update it.
+  # Offline 12 trials: final error 14.1 -> 11.1 mm. 10x was worse (14.2 mm).
+  accelerometer_bias_random_walk: 0.0026
   # 2.2e-5 let the gyro z bias wander 2 mrad/s in 70 s (yaw RMSE 2.3 deg); rest
   # means show a stable bias. 2.2e-6: yaw/rotation RMSE 2.27 -> 1.10 deg.
   gyroscope_bias_random_walk: 0.0000022

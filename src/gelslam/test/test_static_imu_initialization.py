@@ -840,7 +840,7 @@ def test_real_objects_preset_uses_rest_events_source_time_and_previous_state_sta
     assert settings["mode"] == "recorded_rest_event" and settings["max_propagation_s"] == 15.
     assert imu["frontend_initialize_from_imu_preintegration"] is False
     assert imu["image_to_imu_time_offset_s"] == pytest.approx(-0.0615)
-    assert settings["contact_velocity_sigma_mps"] == pytest.approx(.3)
+    assert settings["contact_velocity_sigma_mps"] == pytest.approx(1.)
     assert imu["timestamp_source"] == "recorded_source"
     assert imu["gtsam_integration_sigma_m"] == pytest.approx(1e-3)
     assert ContactVelocityHistory.from_config(effective) is None
