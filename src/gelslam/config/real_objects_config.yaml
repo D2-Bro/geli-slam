@@ -159,6 +159,21 @@ imu_config:
   # the rest-unobservable tangential bias); a looser walk lets contact update it.
   # Offline 12 trials: final error 14.1 -> 11.1 mm. 10x was worse (14.2 mm).
   accelerometer_bias_random_walk: 0.0026
+  # EBIMU ASCII output truncates toward zero (gyro 0.1 deg/s, accel 0.001 g):
+  # the zero level is two steps wide, so in motion each value reads half a step
+  # low and the rest-window gyro mean is biased by a session constant (up to
+  # about 1 mrad/s). Map nonzero levels to interval centres before buffering;
+  # static initialization then uses the corrected rest samples. null disables.
+  # Only for AGC-off EBIMU output (near rig with AGC on: no gain).
+  output_truncation_gyro_step_rad_s: 0.0017453292519943296  # 0.1 deg/s
+  output_truncation_accel_step_mps2: 0.00980665  # 0.001 g
+  # Fixed EBIMU accelerometer calibration, f_corrected = f - (bias + scale * f),
+  # applied after the truncation correction. Fitted from the |f| - g residual of
+  # near-rig motion windows; checked on this rig and on 45 static
+  # rests (|f| error 0.019 -> 0.002..0.003 m/s^2). Isotropic scale is not
+  # identifiable, so the scale terms sum to 0.
+  accel_calibration_bias_mps2: [0.010146590820458705, -0.018299274385377835, -0.07040754072005488]
+  accel_calibration_scale: [-1.5244874151686127e-05, -0.003497099531017146, 0.0035123444051688322]
   # 2.2e-5 let the gyro z bias wander 2 mrad/s in 70 s (yaw RMSE 2.3 deg); rest
   # means show a stable bias. 2.2e-6: yaw/rotation RMSE 2.27 -> 1.10 deg.
   gyroscope_bias_random_walk: 0.0000022
@@ -198,8 +213,9 @@ imu_config:
   gtsam_vi_normal_linearization: "inverse_compositional"
   # Full undamped GN steps; IMU/bias/prior terms are relinearized each iteration.
   # 0.01 left velocity unobserved (median error 24 mm/s, p90 78); 0.001 -> 6 mm/s.
+  # 0.0003: offline 12 trials mean RMSE 8.70 -> 7.82 mm (near rig 8.59 -> 7.84 mm).
   # Not for bag_simulation_config: there 0.001 adds tactile rejections on long runs.
-  gtsam_integration_sigma_m: 0.001
+  gtsam_integration_sigma_m: 0.0003
   # Original NormalFlow thresholds in reference GelSight IC coordinates.
   # Z, velocity, bias and previous-state updates do not control convergence.
   gtsam_vi_rotation_stop_rad: 0.001
@@ -223,6 +239,11 @@ gelslam_config:
     # Continuous-contact quality rejections: recover from IMU after this image-time gap.
     # Recontact or missing correspondences use valid IMU immediately, without this wait.
     contact_failure_keyframe_interval_s: 0.5
+    # Recontact after at least this image-time gap without contact: skip
+    # registration against the pre-gap reference and make an IMU recovery
+    # keyframe. Accepted cross-gap registrations erred about 4 mm (median).
+    # null disables (always try cross-gap registration first).
+    recontact_imu_recovery_min_gap_s: 0.2
     # Sample at most 30 pairs for display. Set 0 to show all pairs.
     correspondence_max_lines: 30
     # DDS queue depth for /image. 1 drops stale images when tracking is slow.

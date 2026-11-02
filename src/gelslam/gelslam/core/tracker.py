@@ -16,6 +16,7 @@ from normalflow.utils import Frame
 from gelslam.core.frame import create_frame_msg, create_keyframe_msg
 from gelslam.core.inertial import (
     ImuBuffer,
+    ImuOutputCorrection,
     ImuSample,
     InertialPropagator,
     InertialState,
@@ -112,6 +113,8 @@ class Tracker:
             if self.imu_enabled
             else None
         )
+        self.imu_output_correction = ImuOutputCorrection.from_config(self.imu_config)
+        self._recontact_imu_recovery_min_gap_s()  # Validate the recontact rule.
         self.gelsight_T_imu = self._parse_gelsight_T_imu(
             self.imu_config.get("gelsight_T_imu")
         )
@@ -1029,6 +1032,40 @@ class Tracker:
         if isinstance(value, bool) or not np.isfinite(interval) or interval < 0:
             raise ValueError("track_config.keyframe_max_interval_s must be finite and nonnegative")
         return interval
+
+    def _recontact_imu_recovery_min_gap_s(self):
+        value = self.track_config.get("recontact_imu_recovery_min_gap_s")
+        if value is None:
+            return None
+        try:
+            gap = float(value)
+        except (TypeError, ValueError):
+            gap = float("nan")
+        if isinstance(value, bool) or not np.isfinite(gap) or gap < 0:
+            raise ValueError("track_config.recontact_imu_recovery_min_gap_s "
+                             "must be null or finite and nonnegative")
+        return gap
+
+    def _reject_long_gap_recontact(self, header, log_prefix):
+        """Use IMU recovery, not cross-gap registration, after a long no-contact gap.
+
+        The gap is the image time from the last accepted contact frame to this
+        recontact frame. Registration across a long gap compares images taken
+        before and after the sensor moved without contact; it can pass the
+        quality gate with a wrong pose. The raised LoseTrackError sends this
+        frame to the IMU recovery keyframe path.
+        """
+        limit = self._recontact_imu_recovery_min_gap_s()
+        current = self._camera_timestamp(header)
+        previous = self._camera_timestamp(getattr(self, "prev_header", None))
+        if limit is None or current is None or previous is None:
+            return
+        gap = current - previous
+        if gap >= limit:
+            self.logger.info(
+                "%s -- Recontact after %.3f s without contact: skip cross-gap registration"
+                % (log_prefix, gap))
+            raise LoseTrackError("recontact_gap_%.3f_s_ge_recovery_limit" % gap)
 
     def _maybe_add_timed_keyframe(self, frame, header, log_prefix, *, force=False):
         """Promote a valid contact target after the common keyframe deadline."""
@@ -2383,6 +2420,15 @@ class Tracker:
             return False
         if not isinstance(sample, ImuSample):
             raise TypeError("sample must be an ImuSample")
+        correction = getattr(self, "imu_output_correction", None)
+        if correction is not None:
+            # Static initialization, frontend and backend all read the corrected sample.
+            sample = correction.apply(sample)
+            if correction.off_grid_samples and not getattr(self, "_imu_off_grid_warned", False):
+                self._imu_off_grid_warned = True
+                self.logger.warning(
+                    "IMU sample is not on the configured output_truncation step grid; "
+                    "off-grid values are not truncation-corrected")
         try:
             self.imu_buffer.add(sample)
         except ValueError:
@@ -2704,6 +2750,7 @@ class Tracker:
                             and getattr(self, "_frontend_vi_state", None) is not None)
                     ):
                         try:
+                            self._reject_long_gap_recontact(header, log_prefix)
                             self.ref_T_prev = self._track_contact(frame, header)
                             self.prev_in_contact_flag = True
                             self.prev_is_keyframe_flag = False

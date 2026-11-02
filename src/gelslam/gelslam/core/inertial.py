@@ -131,6 +131,75 @@ class ImuSample:
         )
 
 
+def undo_truncation(values, step):
+    """Map toward-zero truncated output levels to their interval centres.
+
+    A device that truncates toward zero reports level k for true values in
+    [k, k + 1) * step when k > 0 and in (k - 1, k] * step when k < 0, so the
+    zero level covers two steps. Add sign(k) * step / 2 to each nonzero level.
+    Keep zero, and keep values that are not on the step grid unchanged.
+    Return the corrected values and whether every value was on the grid.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if not step:
+        return values, True
+    levels = np.round(values / step)
+    on_grid = np.abs(values / step - levels) <= 1e-6
+    corrected = np.where(on_grid & (levels != 0),
+                         values + np.sign(levels) * 0.5 * step, values)
+    return corrected, bool(on_grid.all())
+
+
+class ImuOutputCorrection:
+    """Fixed correction of IMU output before buffering, from ``imu_config``.
+
+    1. ``output_truncation_gyro_step_rad_s`` / ``output_truncation_accel_step_mps2``:
+       undo toward-zero truncation of a fixed-point output (``undo_truncation``).
+    2. ``accel_calibration_bias_mps2`` / ``accel_calibration_scale``: per-axis
+       accelerometer calibration, f_corrected = f - (bias + scale * f).
+    Missing, null or zero values disable each part.
+    """
+
+    def __init__(self, gyro_step=0.0, accel_step=0.0, accel_bias=None, accel_scale=None):
+        self.gyro_step = self._step(gyro_step, "output_truncation_gyro_step_rad_s")
+        self.accel_step = self._step(accel_step, "output_truncation_accel_step_mps2")
+        self.accel_bias = _vector3(
+            np.zeros(3) if accel_bias is None else accel_bias, "accel_calibration_bias_mps2")
+        self.accel_scale = _vector3(
+            np.zeros(3) if accel_scale is None else accel_scale, "accel_calibration_scale")
+        self.off_grid_samples = 0
+
+    @staticmethod
+    def _step(value, name):
+        step = 0.0 if value is None else float(value)
+        if not np.isfinite(step) or step < 0.0:
+            raise ValueError("imu_config.%s must be finite and nonnegative" % name)
+        return step
+
+    @classmethod
+    def from_config(cls, imu_config):
+        """Return the configured correction, or ``None`` if every part is disabled."""
+        correction = cls(
+            imu_config.get("output_truncation_gyro_step_rad_s"),
+            imu_config.get("output_truncation_accel_step_mps2"),
+            imu_config.get("accel_calibration_bias_mps2"),
+            imu_config.get("accel_calibration_scale"),
+        )
+        if (correction.gyro_step == 0.0 and correction.accel_step == 0.0
+                and not correction.accel_bias.any() and not correction.accel_scale.any()):
+            return None
+        return correction
+
+    def apply(self, sample):
+        """Return a corrected copy of ``sample``; count samples that are off the grid."""
+        gyro, gyro_on_grid = undo_truncation(sample.angular_velocity, self.gyro_step)
+        accel, accel_on_grid = undo_truncation(sample.acceleration, self.accel_step)
+        if not (gyro_on_grid and accel_on_grid):
+            self.off_grid_samples += 1
+        accel = accel - (self.accel_bias + self.accel_scale * accel)
+        return ImuSample(sample.timestamp, accel, gyro)
+
+
 @dataclass(frozen=True)
 class InertialState:
     """Body-to-world navigation state used for IMU-only propagation."""

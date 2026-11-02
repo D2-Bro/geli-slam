@@ -5,12 +5,14 @@ import pytest
 
 from gelslam.core.inertial import (
     ImuBuffer,
+    ImuOutputCorrection,
     ImuSample,
     InertialPropagator,
     InertialState,
     gravity_from_world_R_imu,
     gyro_to_rad_per_sec,
     rotation_aligning_gravity_to_negative_z,
+    undo_truncation,
 )
 
 
@@ -187,3 +189,52 @@ def test_online_coast_retains_frontend_preintegration_interval():
     assert [sample.timestamp for sample in buffer.samples_covering(1.0, 4.0)] == [
         1.0, 2.0, 3.0, 4.0
     ]
+
+
+def test_undo_truncation_maps_nonzero_levels_to_interval_centres():
+    step = 0.1
+    corrected, on_grid = undo_truncation([0.1, -0.2, 0.0], step)
+    assert on_grid
+    np.testing.assert_allclose(corrected, [0.15, -0.25, 0.0])
+    # Toward-zero truncation of true values; zero covers (-step, step).
+    true = np.linspace(-0.55, 0.55, 221)
+    truncated = np.trunc(true / step) * step
+    corrected, on_grid = undo_truncation(truncated, step)
+    assert on_grid
+    nonzero = truncated != 0
+    assert np.all(np.abs(corrected - true)[nonzero] <= step / 2 + 1e-12)
+    assert abs(np.mean(corrected - true)) < abs(np.mean(np.abs(truncated - true))) / 10
+
+
+def test_undo_truncation_keeps_off_grid_values_and_disabled_step():
+    corrected, on_grid = undo_truncation([0.123, 0.2, 0.0], 0.1)
+    assert not on_grid
+    np.testing.assert_allclose(corrected, [0.123, 0.25, 0.0])
+    corrected, on_grid = undo_truncation([0.123, 0.2, 0.0], 0.0)
+    assert on_grid
+    np.testing.assert_allclose(corrected, [0.123, 0.2, 0.0])
+
+
+def test_imu_output_correction_from_config():
+    assert ImuOutputCorrection.from_config({}) is None
+    assert ImuOutputCorrection.from_config({
+        "output_truncation_gyro_step_rad_s": None,
+        "accel_calibration_bias_mps2": [0.0, 0.0, 0.0],
+    }) is None
+    with pytest.raises(ValueError):
+        ImuOutputCorrection.from_config({"output_truncation_accel_step_mps2": -1.0})
+
+    correction = ImuOutputCorrection.from_config({
+        "output_truncation_gyro_step_rad_s": 0.01,
+        "output_truncation_accel_step_mps2": 0.5,
+        "accel_calibration_bias_mps2": [0.1, 0.0, -0.2],
+        "accel_calibration_scale": [0.0, 0.01, 0.0],
+    })
+    sample = correction.apply(ImuSample(2.0, (1.0, -2.0, 0.0), (0.02, 0.0, -0.01)))
+    assert sample.timestamp == 2.0
+    np.testing.assert_allclose(sample.angular_velocity, [0.025, 0.0, -0.015])
+    # Truncation correction first (1.25, -2.25, 0), then f - (bias + scale * f).
+    np.testing.assert_allclose(sample.acceleration, [1.15, -2.25 + 0.0225, 0.2])
+    assert correction.off_grid_samples == 0
+    correction.apply(ImuSample(2.1, (1.1, 0.0, 0.0), (0.0, 0.0, 0.0)))
+    assert correction.off_grid_samples == 1

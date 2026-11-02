@@ -184,6 +184,36 @@ def test_only_continuous_quality_failures_accumulate_the_half_second_wait(monkey
     assert ok and message["tracking_status"] == "imu_only"
 
 
+@pytest.mark.parametrize("limit,target_time,registration_tried", [
+    (.15, 1.10, True), (.15, 1.20, False), (None, 1.20, True),
+])
+def test_long_gap_recontact_skips_cross_gap_registration(
+        monkeypatch, limit, target_time, registration_tried):
+    tracker, _ = tracker_with_imu(monkeypatch)
+    tracker.track_config["recontact_imu_recovery_min_gap_s"] = limit
+    tracker.prev_in_contact_flag = False  # Last accepted contact frame: t = 1.0 s.
+    calls = []
+
+    def reject_registration(*args, **kwargs):
+        calls.append(args)
+        raise tm.LoseTrackError("initial_shared_points_lt_10")
+
+    monkeypatch.setattr(tracker, "_track_contact", reject_registration)
+    ok, (message, packets) = tracker.track(np.zeros((1, 1, 3), np.uint8), header(target_time))
+    assert bool(calls) is registration_tried
+    assert ok and message["tracking_status"] == "imu_only"
+    assert len(packets) == 1 and not packets[0]["tactile_valid"]
+    assert tracker._frontend_vi_state.timestamp == pytest.approx(target_time)
+
+
+@pytest.mark.parametrize("value", [-.1, float("nan"), True, "x"])
+def test_recontact_recovery_gap_rejects_invalid_values(monkeypatch, value):
+    tracker, _ = tracker_with_imu(monkeypatch)
+    tracker.track_config["recontact_imu_recovery_min_gap_s"] = value
+    with pytest.raises(ValueError):
+        tracker._recontact_imu_recovery_min_gap_s()
+
+
 def test_recontact_without_valid_imu_retains_the_accepted_state(monkeypatch):
     from gelslam.core.inertial import ImuBuffer
     tracker, anchor = tracker_with_imu(monkeypatch)

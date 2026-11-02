@@ -18,6 +18,7 @@ from sensor_msgs.msg import Imu
 from tf2_ros import TransformBroadcaster
 
 from gelslam.core.inertial import (
+    ImuOutputCorrection,
     ImuSample,
     InertialPropagator,
     InertialState,
@@ -86,6 +87,8 @@ class ImuPropagationNode(Node):
             imu_config.get("initial_gyro_bias_rps", (0.0, 0.0, 0.0)), dtype=np.float64
         )
         self.gravity_magnitude = float(imu_config.get("gravity_mps2", 9.81))
+        # Same output correction as the tracker's IMU input.
+        self.output_correction = ImuOutputCorrection.from_config(imu_config)
         self.declare_parameter("gravity_initialization", "measured_acceleration")
         self.gravity_initialization = self.get_parameter("gravity_initialization").value
         if self.gravity_initialization not in {"measured_acceleration", "fixed_world_z"}:
@@ -123,6 +126,8 @@ class ImuPropagationNode(Node):
         except ValueError as error:
             self.get_logger().warning("Dropping IMU sample: %s" % error)
             return
+        if self.output_correction is not None:
+            sample = self.output_correction.apply(sample)
         if self.previous_sample is not None and sample.timestamp <= self.previous_sample.timestamp:
             self.get_logger().warning("Dropping non-monotonic IMU timestamp")
             return
