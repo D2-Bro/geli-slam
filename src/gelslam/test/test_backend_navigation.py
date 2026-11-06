@@ -92,6 +92,7 @@ def test_tracker_packet_uses_keyframe_imu_times_and_separate_buffer(monkeypatch)
     tracker.imu_enabled = True
     tracker.imu_buffer = ImuBuffer(100)
     tracker.image_to_imu_time_offset_s = .02
+    tracker.gelsight_T_imu = np.eye(4)
     tracker.frontend_visual_inertial = SimpleNamespace(gravity=np.array([0., 0., -9.81]))
     for t in np.linspace(1., 1.3, 31):
         tracker.add_imu_sample(ImuSample(float(t), [0., 0., 9.81], [0., 0., 0.]))

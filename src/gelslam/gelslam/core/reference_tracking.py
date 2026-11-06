@@ -8,15 +8,14 @@ import numpy as np
 from gelslam.core.gtsam_vi import (
     GtsamVisualInertialSolver, _bias_factor, _imu_values, _navigation_step_norms,
     _normal_dim, _normal_huber_linearization, _split_imu_factor, navigation_factor_terms,
-    preintegrate_imu,
+    preintegrate_imu, split_rotation_motion_rows,
 )
-from gelslam.core.gt_state_diagnostic import resolve_gt_state_test
 from gelslam.core.imu_navigation import gelsight_pose, gelsight_pose_jacobian
 from gelslam.core.marginal_prior import NavigationPrior
 from gelslam.core.numpy_vi import adjoint
 from gelslam.core.retained_prior import (
-    RetainedPrior, VariableBlock, VariableLayout, compress_normal, eliminate_rows,
-    navigation_state, rank_solve, rank_solve_normal, state_blocks, state_values,
+    RetainedPrior, VariableBlock, VariableLayout, compress_normal, eliminate_normal,
+    eliminate_rows, navigation_state, rank_solve, rank_solve_normal, state_blocks, state_values,
 )
 from gelslam.core.split_pose import split_pose_plus
 
@@ -43,12 +42,8 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
 
     reference_marginalization = True
 
-    def __init__(self, config):
-        super().__init__(config)
-        if (self.fix_previous_state or self.imu_prediction_only
-                or not self.marginalization_enabled or resolve_gt_state_test(config)["enabled"]):
-            raise ValueError("reference_marginalization requires estimated 15D states, "
-                             "marginalization, and disabled GT state overrides/prediction-only")
+    def __init__(self, config, gravity=None):
+        super().__init__(config, gravity)
         # joint: solve [reference, previous, current] and eliminate previous after GN;
         # the IMU factor is relinearized at the updated previous state every iteration.
         # eliminate_first: eliminate previous from prior+IMU+bias once at its accepted
@@ -59,21 +54,30 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
             raise ValueError("frontend_reference_previous_state must be one of "
                              + ", ".join(PREVIOUS_STATE_MODES))
         # rows: stack every factor row and solve/compress them with SVD.
-        # hessian: reduce each factor to H = A^T A, g = A^T rhs on the 21D
-        # [reference, current] system first. Needs eliminate_first, whose solve
-        # blocks are exactly the retained blocks.
+        # hessian: reduce each factor to H = A^T A, g = A^T rhs on the solve
+        # blocks first. joint then Schur-eliminates the previous-state blocks
+        # from H, g after GN; eliminate_first solves on the retained blocks only.
         self.linear_system = str(config.get("frontend_reference_linear_system", "rows"))
         if self.linear_system not in LINEAR_SYSTEMS:
             raise ValueError("frontend_reference_linear_system must be one of "
                              + ", ".join(LINEAR_SYSTEMS))
-        if self.linear_system == "hessian" and self.previous_state_mode != "eliminate_first":
-            raise ValueError("frontend_reference_linear_system hessian requires "
-                             "frontend_reference_previous_state eliminate_first")
         self.reference_id = None
         self.first_pose_id = None
         self.last_reference_pose = None  # IMU-origin world pose, candidate only.
         self.last_reference_state = None
         self.last_problem = None
+        # Optional staged IMU coupling (imu_coupling.CouplingSchedule). None keeps
+        # the full 9D IMU rows unchanged.
+        self.coupling_schedule = None
+
+    def motion_row_scale(self, timestamp):
+        """Scale c of the accelerometer motion rows for the interval ending here.
+
+        None: the 9D IMU rows are used as one block (option off). 0 <= c <= 1:
+        rotation rows keep their weight and motion rows are multiplied by c.
+        """
+        schedule = self.coupling_schedule
+        return None if schedule is None else schedule.scale(timestamp)
 
     def _accepted_prior(self, previous):
         prior = self.marginal_prior
@@ -141,17 +145,24 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
         rows, right = [Ap], [bp]
         # The IMU and bias factors linearize at the same endpoint states.
         linearization_point = _imu_values(previous, current)
-        for factor in factors:
-            Ai, Aj, rhs = navigation_factor_terms(factor, previous, current,
-                                                  values=linearization_point)
-            rows.append(np.sqrt(self.imu_weight) * layout.embed(
-                np.column_stack((Ai, Aj)), state_blocks(previous_time) + state_blocks(current_time)))
-            right.append(np.sqrt(self.imu_weight) * rhs)
+        # factors is the (IMU, bias random-walk) pair; each has its own weight.
+        blocks = state_blocks(previous_time) + state_blocks(current_time)
+        motion_scale = self.motion_row_scale(current_time)
+        for index, (factor, scale) in enumerate(zip(factors, self.inertial_scales(), strict=True)):
+            terms = [navigation_factor_terms(factor, previous, current,
+                                             values=linearization_point)]
+            if index == 0 and motion_scale is not None:
+                # Staged coupling: exact rotation marginal at full weight and
+                # accelerometer motion rows (position/velocity | rotation) at c.
+                motion, rotation = split_rotation_motion_rows(factor, *terms[0])
+                terms = [rotation] + ([tuple(motion_scale * m for m in motion)]
+                                      if motion_scale > 0 else [])
+            for Ai, Aj, rhs in terms:
+                rows.append(scale * layout.embed(np.column_stack((Ai, Aj)), blocks))
+                right.append(scale * rhs)
         return rows, right
 
-    def propagate_prior(self, previous, current, pim, *, fixed_anchor=False):
-        if fixed_anchor:
-            raise ValueError("backend conditioning would discard the correlated frontend prior")
+    def propagate_prior(self, previous, current, pim):
         prior, layout, values = self._problem(previous, current)
         rows, right = self._inertial_rows(
             prior, layout, values, previous.timestamp, current.timestamp,
@@ -164,13 +175,15 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
         # eliminate_first builds the same rows and elimination from the same
         # inputs when the solve starts at this prediction; let it reuse them.
         self._last_propagation = dict(prior=prior, pim=pim, blocks=layout.blocks,
-                                      values=values, A=A, rhs=rhs, prior_out=propagated)
+                                      values=values, A=A, rhs=rhs, prior_out=propagated,
+                                      motion_scale=self.motion_row_scale(current.timestamp))
         return propagated
 
-    def _reuse_propagation(self, prior, pim, layout, values):
+    def _reuse_propagation(self, prior, pim, layout, values, motion_scale):
         """Rows and elimination from propagate_prior() for identical inputs, else None."""
         cached = getattr(self, "_last_propagation", None)
         if (cached is None or cached["prior"] is not prior or cached["pim"] is not pim
+                or cached["motion_scale"] != motion_scale
                 or cached["blocks"] != layout.blocks or cached["values"].keys() != values.keys()
                 or not all(np.array_equal(cached["values"][b], v) for b, v in values.items())):
             return None
@@ -188,30 +201,21 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
         their reference columns were unused. Map those projected rows to the
         variable reference too, so a common rigid pose change is still null.
         """
-        if self.normal_zero_pose_z_jacobian:
-            Jt = Jt.copy()
-            Jt[:, 5] = 0.
-        if (self.normal_zero_pose_z_jacobian
-                or getattr(visual, "fixed_reference_z_m", None) is not None):
+        if getattr(visual, "fixed_reference_z_m", None) is not None:
             Jr = -Jt @ adjoint(np.linalg.inv(target) @ reference)
         return Jr, Jt
-
-    def refine_from_keyframe(self, *args, **kwargs):
-        raise ValueError("reference marginalization uses tracker-local states; backend map is separate")
 
     def refine_recovery_reference(self, visual, reference_pose, previous, *args, **kwargs):
         self.set_reference(previous.timestamp, previous)
         return self.refine_current(visual, reference_pose, previous, *args, **kwargs)
 
     def refine_current(self, visual, reference_pose, previous, current, samples,
-                       gelsight_T_imu, preintegrated=None, *, fixed_anchor=False):
+                       gelsight_T_imu, preintegrated=None):
         self.discard_pending_prior()
         self.last_optimization_trace = []
         self.last_refinement_failure = None
         self.last_problem = None
         started = monotonic()
-        if fixed_anchor:
-            raise ValueError("reference pose cannot be hard fixed in reference marginalization")
         if visual is None or len(visual) < 10:
             self.last_refinement_failure = "initial_shared_points_lt_10"
             return None
@@ -257,7 +261,8 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
             # Same factors as propagate_prior(): prior + IMU + bias at the accepted
             # previous state, previous blocks eliminated once. The result is a
             # fixed linear prior on [reference, current]; only its chart moves.
-            propagated = self._reuse_propagation(prior, pim, layout, values)
+            propagated = self._reuse_propagation(
+                prior, pim, layout, values, self.motion_row_scale(current.timestamp))
             if propagated is not None:
                 nav_A, nav_rhs = propagated["A"], propagated["rhs"]
                 eliminated = propagated["prior_out"]
@@ -335,9 +340,6 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
             return H, g, squared_norm, row_count, normal_cost
 
         hessian = self.linear_system == "hessian"
-        if hessian and solve_layout.blocks != VariableLayout(
-                retained_blocks, prior.fixed_values).blocks:
-            raise ValueError("hessian linear system requires solve blocks == retained blocks")
         rank = 0
         for iteration in range(self.max_iterations):
             if hessian:
@@ -375,10 +377,15 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
                 break
         if hessian:
             H, g, _, _, _ = normal_equation_at(values, iteration)
+            retained_layout = VariableLayout(retained_blocks, prior.fixed_values)
+            # joint: remove the previous-state blocks the retained prior does not
+            # keep. eliminate_first: none, so this is the retained H, g itself.
+            removed = [b for b in solve_layout.blocks if b not in retained_layout.blocks]
+            H_retained, g_retained = eliminate_normal(
+                H, g, solve_layout.columns(removed), solve_layout.columns(retained_layout.blocks))
             retained = RetainedPrior(
-                VariableLayout(retained_blocks, prior.fixed_values), values,
-                *compress_normal(H, g), current.timestamp, prior.absorbed_intervals + 1,
-                prior.fixed_values)
+                retained_layout, values, *compress_normal(H_retained, g_retained),
+                current.timestamp, prior.absorbed_intervals + 1, prior.fixed_values)
         else:
             A, rhs, _ = rows_at(values, iteration)
             H, g = A.T @ A, A.T @ rhs

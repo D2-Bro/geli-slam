@@ -1,7 +1,6 @@
 """Thread ownership, atomic correction and shutdown tests."""
 from dataclasses import FrozenInstanceError, replace
 from threading import Event, Thread
-from types import SimpleNamespace
 import numpy as np
 import pytest
 from std_msgs.msg import Header
@@ -11,11 +10,7 @@ from gelslam.core.shared_map import SharedMap, MapEstimate
 from gelslam.core.slam_system import SlamSystem
 from gelslam.core.local_mapping import LocalMapping, LoopCandidate
 from gelslam.core.numpy_vi import NavigationState
-from gelslam.core.tracker import Tracker
 from gelslam.core.inertial import ImuBuffer, ImuSample
-from gelslam.core.gtsam_vi import GtsamVisualInertialSolver
-from gelslam.core.marginal_prior import NavigationPrior
-from gelslam.core.imu_navigation import gelsight_pose
 from gelslam.utils import Logger
 from backend_test_support import frame, config
 
@@ -201,176 +196,6 @@ class PositionVisual:
         return np.zeros(30), np.zeros_like(jacobian), jacobian
 
 
-def test_corrected_keyframe_solve_omits_old_prior_and_builds_fresh_target_prior():
-    solver = GtsamVisualInertialSolver(dict(gtsam_vi_marginalization=True,
-        gtsam_vi_max_iterations=2))
-    anchor = estimate().state
-    samples = [ImuSample(t, [0, 0, 9.81], [0, 0, 0]) for t in np.linspace(1., 1.1, 11)]
-    solver.marginal_prior = NavigationPrior.initial(anchor, np.ones(15) * .001)
-    solver.marginal_prior.rhs[:] = 1000.
-    old = solver.marginal_prior
-    current, pim = solver.predict_current(anchor, samples, np.eye(4))
-    result = solver.refine_from_keyframe(PositionVisual(), np.eye(4), anchor, current,
-                                         samples, np.eye(4), preintegrated=pim)
-    assert result is not None and solver.last_prior_source == 'backend_keyframe'
-    assert solver.fix_previous_state is False
-    assert solver.marginal_prior is old
-    assert solver.pending_marginal_prior is not None
-    solver.commit_marginal_prior(result)
-    assert solver.marginal_prior.matches(result) and solver.marginal_prior is not old
-    assert np.linalg.norm(result.pose[:3, 3]) < 1e-10
-
-
-def test_feedback_requires_complete_interval_and_uses_corrected_anchor_bias():
-    tracker = Tracker.__new__(Tracker)
-    tracker.curr_kid = 0
-    tracker._trial_index = 0
-    tracker.trial_T_ref = np.eye(4)
-    tracker.ref_T_prev = np.eye(4)
-    tracker.gelsight_T_imu = np.eye(4)
-    tracker.imu_config = {}
-    tracker.frontend_visual_inertial = GtsamVisualInertialSolver({})
-    tracker._frontend_vi_state = estimate().state
-    tracker._backend_imu_buffer = ImuBuffer()
-    tracker._keyframe_seed_states = {0: estimate().state}
-    store = SharedMap()
-    store.append_keyframe(packet())
-    corrected = estimate(.01)
-    corrected.state.accel_bias[:] = .001
-    store.commit_solution(0, {0: corrected})
-    header = Header()
-    header.stamp.sec = 1
-    header.stamp.nanosec = 100000000
-    tracker._imu_timestamp = lambda _: 1.1
-    assert not tracker.apply_map_snapshot(store.snapshot_for_tracking(), header)
-    assert np.array_equal(tracker.trial_T_ref, np.eye(4))
-    for t in np.linspace(1., 1.1, 11):
-        tracker._backend_imu_buffer.add(ImuSample(t, [.001, .001, 9.811], [0, 0, 0]))
-    assert tracker.apply_map_snapshot(store.snapshot_for_tracking(), header)
-    assert tracker.trial_T_ref[0, 3] == .01
-    assert np.array_equal(tracker._backend_correction_anchor.accel_bias, [.001] * 3)
-
-
-
-@pytest.mark.parametrize("kid", [0, 1])
-@pytest.mark.parametrize("rounded_reference", [False, True])
-def test_first_identical_feedback_preserves_later_tactile_state(kid, rounded_reference):
-    tracker = Tracker.__new__(Tracker)
-    tracker.curr_kid, tracker._trial_index = kid, 0
-    seed = estimate(.012345678901).state
-    tracker.gelsight_T_imu = np.eye(4)
-    tracker.trial_T_ref = seed.pose.astype(np.float32) if rounded_reference else seed.pose.copy()
-    tracker.ref_T_prev = np.eye(4)
-    tracker.imu_config = {}
-    tracker.frontend_visual_inertial = GtsamVisualInertialSolver({})
-    previous = seed.copy()
-    previous.timestamp = 1.05
-    previous.pose[0, 3] += .001  # Tactile correction at F_i after K_k.
-    previous.velocity[0] = .02
-    tracker._frontend_vi_state = previous
-    tracker._keyframe_seed_states = {kid: seed}
-    tracker._backend_imu_buffer = ImuBuffer()
-    for t in np.linspace(1., 1.1, 11):
-        tracker._backend_imu_buffer.add(ImuSample(t, [0, 0, 9.81], [0, 0, 0]))
-    tracker._imu_timestamp = lambda _: 1.1
-    prior = NavigationPrior.initial(previous, np.ones(15))
-    tracker.frontend_visual_inertial.marginal_prior = prior
-    cache = object()
-    tracker._frontend_imu_preintegration = cache
-    if kid:
-        tracker._backend_feedback_anchor = (kid - 1, estimate().state)
-        tracker._backend_feedback_token = (0, kid - 1, 1)
-    store = SharedMap()
-    for index in range(kid + 1):
-        store.append_keyframe(packet(index))
-    store.commit_solution(0, {kid: MapEstimate(seed, seed.pose.copy(), seed.pose.copy(), 0, 0)})
-    assert not tracker.apply_map_snapshot(store.snapshot_for_tracking(), Header())
-    assert tracker._frontend_vi_state is previous
-    assert previous.pose[0, 3] == pytest.approx(seed.pose[0, 3] + .001)
-    assert previous.velocity[0] == .02
-    assert tracker.frontend_visual_inertial.marginal_prior is prior
-    assert tracker._frontend_imu_preintegration is cache
-    assert getattr(tracker, '_backend_correction_anchor', None) is None
-    assert tracker._frontend_tracking_counts['backend_feedback_unchanged'] == 1
-
-
-@pytest.mark.parametrize("with_extrinsic", [False, True])
-@pytest.mark.parametrize("previous_time", [1., 1.05])
-def test_feedback_preserves_accepted_relative_pose_without_imu_propagation(
-        monkeypatch, with_extrinsic, previous_time):
-    tracker = Tracker.__new__(Tracker)
-    tracker.curr_kid, tracker._trial_index = 0, 0
-    extrinsic = np.eye(4)
-    if with_extrinsic:
-        extrinsic[:3, :3] = [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]
-        extrinsic[:3, 3] = [.01, -.015, .03]
-    tracker.gelsight_T_imu = extrinsic
-    seed = estimate(.02).state
-    seed.pose[:3, :3] = [[.8, -.6, 0.], [.6, .8, 0.], [0., 0., 1.]]
-    previous = seed.copy()
-    previous.timestamp = previous_time
-    if previous_time > seed.timestamp:
-        relative = np.eye(4)
-        relative[:3, :3] = [[1., 0., 0.], [0., .8, -.6], [0., .6, .8]]
-        relative[:3, 3] = [.001, -.002, .0003]
-        previous.pose = seed.pose @ relative
-    previous.velocity[:] = [.15, -.25, .35]
-    previous.accel_bias[:] = [.01, .02, -.03]
-    previous.gyro_bias[:] = [.001, -.002, .003]
-    tracker.trial_T_ref = gelsight_pose(seed.pose, extrinsic)
-    old_relative = np.linalg.inv(tracker.trial_T_ref) @ gelsight_pose(previous.pose, extrinsic)
-    tracker.ref_T_prev = old_relative.astype(np.float32)
-    tracker._frontend_vi_state = previous
-    tracker._keyframe_seed_states = {0: seed}
-    tracker.imu_config = {}
-    tracker.frontend_visual_inertial = GtsamVisualInertialSolver({})
-    solver = tracker.frontend_visual_inertial
-    prior = NavigationPrior.initial(previous, np.ones(15))
-    prior.rhs[:] = np.arange(15)
-    solver.marginal_prior = prior
-    def unexpected_prediction(*args, **kwargs):
-        pytest.fail('feedback must not replace F_i with an IMU prediction')
-    monkeypatch.setattr(solver, 'predict_current', unexpected_prediction)
-    tracker._frontend_imu_preintegration = tracker._frontend_coast_state = object()
-    tracker._backend_imu_buffer = ImuBuffer()
-    for t in np.linspace(1., 1.1, 11):
-        tracker._backend_imu_buffer.add(ImuSample(t, [0, 0, 9.81], [0, 0, 0]))
-    tracker._imu_timestamp = lambda _: 1.1
-    store = SharedMap()
-    store.append_keyframe(packet())
-    shift = np.eye(4)
-    shift[:3, :3] = [[.8, 0., .6], [0., 1., 0.], [-.6, 0., .8]]
-    shift[:3, 3] = [.004, -.003, .002]
-    anchor = seed.copy()
-    anchor.velocity[:] = [-.2, .4, .1]
-    anchor.accel_bias[:] = .1
-    anchor.gyro_bias[:] = .02
-    # Consecutive revisions must preserve the same relative observation pose,
-    # without applying the original correction again on the second revision.
-    for revision in range(2):
-        anchor.pose = shift @ anchor.pose
-        pose = gelsight_pose(anchor.pose, extrinsic)
-        assert store.commit_solution(0, {0: MapEstimate(anchor, pose, pose, 0, 0)})
-        assert tracker.apply_map_snapshot(store.snapshot_for_tracking(), Header())
-        corrected = tracker._frontend_vi_state
-        assert np.allclose(np.linalg.inv(pose) @ gelsight_pose(corrected.pose, extrinsic),
-                           old_relative, rtol=0., atol=1e-12)
-        assert np.allclose(tracker.ref_T_prev, old_relative, rtol=0., atol=3e-8)
-        assert np.allclose(corrected.pose,
-                           anchor.pose @ np.linalg.inv(seed.pose) @ previous.pose,
-                           rtol=0., atol=1e-12)
-        assert corrected.timestamp == previous.timestamp
-        for field in ('velocity', 'accel_bias', 'gyro_bias'):
-            assert np.array_equal(getattr(corrected, field), getattr(previous, field))
-        assert np.array_equal(tracker._frontend_vi_state.pose, corrected.pose)
-        assert np.array_equal(tracker._frontend_vi_state.velocity, previous.velocity)
-        assert solver.marginal_prior is prior
-        assert np.array_equal(prior.rhs, np.arange(15))
-        assert tracker._frontend_imu_preintegration is tracker._frontend_coast_state is None
-        assert np.array_equal(tracker._backend_correction_anchor.accel_bias, anchor.accel_bias)
-        assert np.array_equal(tracker._backend_correction_anchor.velocity, anchor.velocity)
-
-
 def test_seed_appended_during_ba_rebases_against_local_anchor_without_pose_factor():
     cfg = config(coverage_graph_overlap_threshold=.8)
     cfg['device_config'] = {'ppmm': 1.}
@@ -433,44 +258,6 @@ def test_concurrent_batch_matches_sequential_reference():
     for expected, actual in zip(reference.graph.states, concurrent.graph.states):
         for field in ('pose', 'velocity', 'accel_bias', 'gyro_bias'):
             assert np.allclose(getattr(expected, field), getattr(actual, field), atol=1e-10)
-
-
-def test_rejected_target_keeps_backend_anchor_until_success(monkeypatch):
-    from gelslam.core import tracker as module
-    tracker = Tracker.__new__(Tracker)
-    tracker._trial_index = tracker._backend_correction_trial = 0
-    tracker._backend_correction_anchor = estimate().state
-    tracker._frontend_vi_state = estimate().state.copy()
-    tracker._frontend_vi_state.timestamp = 1.05
-    tracker._frontend_imu_preintegration = None
-    tracker.imu_config = {}
-    tracker.track_config = dict(scr_threshold=.3, ccs_threshold=.5)
-    tracker.ppmm = 1.
-    tracker.gelsight_T_imu = tracker.trial_T_ref = np.eye(4)
-    tracker.ref_frame = SimpleNamespace()
-    tracker.ref_header = Header()
-    tracker._imu_timestamp = lambda _: 1.1
-    tracker._imu_coasting_ready = lambda: True
-    tracker.logger = Logger(print_output=False)
-    tracker.imu_buffer = tracker._backend_imu_buffer = ImuBuffer()
-    for t in np.linspace(1., 1.1, 11):
-        tracker.imu_buffer.add(ImuSample(t, [0, 0, 9.81], [0, 0, 0]))
-    tracker.frontend_visual_inertial = GtsamVisualInertialSolver(dict(gtsam_vi_marginalization=True))
-    solver = tracker.frontend_visual_inertial
-    solver.marginal_prior = NavigationPrior.initial(tracker._frontend_vi_state, np.ones(15))
-    old_prior = solver.marginal_prior
-    monkeypatch.setattr(module, 'DenseNormalResidual', lambda *args, **kwargs: PositionVisual())
-    monkeypatch.setattr(module, 'normalflow_quality', lambda *args: (0., 0.))
-    tracker._record_normal_correspondences = lambda *args, **kwargs: None
-    with pytest.raises(module.QualityGateError):
-        tracker._refine_normalflow_with_imu(np.eye(4), Header(), tracker.ref_frame, SimpleNamespace())
-    assert tracker._backend_correction_anchor is not None
-    assert solver.pending_marginal_prior is None and solver.marginal_prior is old_prior
-    assert solver.last_prior_source == 'backend_keyframe'
-    monkeypatch.setattr(module, 'normalflow_quality', lambda *args: (1., 1.))
-    tracker._refine_normalflow_with_imu(np.eye(4), Header(), tracker.ref_frame, SimpleNamespace())
-    assert tracker._backend_correction_anchor is None
-    assert solver.marginal_prior.matches(tracker._frontend_vi_state)
 
 
 def test_late_candidate_merges_disconnected_trials_and_ignores_old_epoch():

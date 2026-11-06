@@ -13,6 +13,7 @@ setup(
         ("share/" + package_name + "/launch", ["launch/imu_propagation_launch.py"]),
         ("share/" + package_name + "/launch", ["launch/live_replay_demo_launch.py"]),
         ("share/" + package_name + "/launch", ["launch/live_demo_launch.py"]),
+        ("share/" + package_name + "/launch", ["launch/live_vi_launch.py"]),
         (
             "share/" + package_name + "/config",
             [
@@ -22,6 +23,7 @@ setup(
                 "config/real_config.yaml",
                 "config/real_far_config.yaml",
                 "config/real_objects_config.yaml",
+                "config/live_thick_far_config.yaml",
                 "config/gelslam_rviz.rviz",
             ],
         ),
@@ -47,8 +49,10 @@ setup(
             "visualizer_node = gelslam.nodes.visualizer_node:main",
             "rviz_visualizer_node = gelslam.nodes.rviz_visualizer_node:main",
             "imu_propagation_node = gelslam.nodes.imu_propagation_node:main",
+            "rest_event_node = gelslam.nodes.rest_event_node:main",
             "gelslam_offline = gelslam.scripts.gelslam_offline:main",
             "visualize_pose_graph = gelslam.scripts.visualize_pose_graph:main",
+            "poisson_remesh = gelslam.scripts.poisson_remesh:main",
         ],
     },
 )

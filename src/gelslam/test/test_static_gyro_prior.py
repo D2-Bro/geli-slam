@@ -9,7 +9,7 @@ from gelslam.core.static_imu_initialization import StaticImuInitializer, resolve
 def setup(enabled=True, mode='fixed_time'):
     settings=dict(enabled=True,mode=mode,gyro_bias_uncertainty_from_samples=enabled)
     if mode=='fixed_time':settings.update(start_time_s=1.,end_time_s=2.)
-    cfg=dict(enabled=True,frontend_optimization=True,gtsam_vi_marginalization=True,
+    cfg=dict(enabled=True,frontend_optimization=True,
              gravity_mps2=9.81,gyroscope_noise_density=.00016,gyroscope_bias_random_walk=.000022,
              static_initialization=settings,
              initial_accel_bias_mps2=[0.,0.,0.],initial_gyro_bias_rps=[.0002,-.0001,.00015])

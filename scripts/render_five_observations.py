@@ -106,7 +106,8 @@ def main():
                 [s['after']['current_error']['accel_bias_mps2'] for s in iterations],'o-',label='target accel bias')
         ax.set_ylabel('Bias GT error [m/s²]');ax.set_xlabel('Iteration boundary');ax.legend(fontsize=8);ax.grid(alpha=.25)
         record=iterations[0];arrays=np.load(directory/record['arrays'])
-        points=arrays['reference_pixels'];norm=np.linalg.norm(arrays['raw_residual'].reshape(-1,3),axis=1)
+        dim = len(arrays['raw_residual']) // max(1, len(arrays['reference_pixels']))
+        points=arrays['reference_pixels'];norm=np.linalg.norm(arrays['raw_residual'].reshape(-1,dim),axis=1)
         ax=axes[2,0];image=plt.imread(directory/call['reference_image']);ax.imshow(image)
         scatter=ax.scatter(points[:,0],points[:,1],c=norm,s=8,cmap='magma',vmin=0,vmax=max(np.percentile(norm,98),1e-9))
         fig.colorbar(scatter,ax=ax,label='Raw normal residual norm');ax.set_title('Shared points on actual reference %.3f s'%call['reference_time']);ax.set_xlim(0,320);ax.set_ylim(240,0)
@@ -124,9 +125,10 @@ def main():
     for call in calls:
         for step in call['iterations']:
             arrays=np.load(directory/step['arrays'])
+            dim = len(arrays['raw_residual']) // max(1, len(arrays['reference_pixels']))
             step['heatmap']=dict(x=arrays['reference_pixels'][:,0].round(3).tolist(),
                                  y=arrays['reference_pixels'][:,1].round(3).tolist(),
-                                 residual=np.linalg.norm(arrays['raw_residual'].reshape(-1,3),axis=1).round(6).tolist())
+                                 residual=np.linalg.norm(arrays['raw_residual'].reshape(-1,dim),axis=1).round(6).tolist())
     html=HTML.replace('__PLOTLY__',get_plotlyjs()).replace('__DATA__',json.dumps(result,allow_nan=False))
     (directory/'dashboard.html').write_text(html)
     print(directory/'dashboard.html')

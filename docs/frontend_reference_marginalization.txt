@@ -3,31 +3,22 @@ Python NormalFlow + IMU frontend: reference marginalization
 추가 정책: 각 trial의 최초 접촉 F_0 pose 6D는 초기값에 정확히 고정한다.
 
 결과와 설정
-기존 pairwise 경로를 유지했다. 다음 설정으로 새 경로를 선택한다.
+2026-11-04 갱신: pairwise 경로를 삭제했다. Contact frontend는 이 경로만 사용한다.
+삭제한 설정: frontend_state_mode, gtsam_vi_marginalization, frontend_fix_previous_state,
+frontend_imu_prediction_only, frontend_gt_previous_state_test.
 
 imu_config:
-  frontend_state_mode: reference_marginalization
   frontend_optimization: true
-  gtsam_vi_marginalization: true
-  frontend_fix_previous_state: false
-  frontend_fix_bias: false
-  frontend_imu_prediction_only: false
-  frontend_gt_previous_state_test:
-    enabled: false
 
-현재 config.yaml과 real_config.yaml은 pairwise다.
-현재 bag_simulation_config.yaml은 reference_marginalization이다.
-새 모드의 최초 접촉 pose는 항상 고정한다. 별도 큰 가중치 설정은 필요 없다.
-새 경로와 고정 state/bias, prediction-only, GT state 덮어쓰기의 조합은 오류로 거부한다.
+최초 접촉 pose는 항상 고정한다. 별도 큰 가중치 설정은 필요 없다.
 Gravity/velocity의 기존 초기화 선택과 static_initialization은 계속 사용할 수 있다.
 이 문서는 contact frontend 경로를 설명한다. Backend 최적화는 변경하지 않았다.
 
 변경 파일
 - core/retained_prior.py: 변수 ID, 블록 배치, manifold prior, rank-aware 제거.
 - core/reference_tracking.py: 36D solve, 21D 유지, bootstrap 및 reference 전이.
-- core/gtsam_vi.py: solver 선택 factory.
-- core/tracker.py: 설정 선택, 수락 후 commit, reference 전이, backend 경계.
-- config/*.yaml: frontend_state_mode 선택 항목.
+- core/gtsam_vi.py: frontend solver 생성 factory.
+- core/tracker.py: 수락 후 commit, reference 전이, backend 경계.
 - test/test_reference_marginalization.py: 수치 및 lifecycle 검증.
 - scripts/validate_reference_marginalization.py: 저장 ROS 메시지 재생 검증 모듈.
   위 scripts는 src/gelslam/gelslam/scripts 디렉터리다.
@@ -57,12 +48,11 @@ Velocity는 IMU 원점의 world 속도이며 단위는 m/s다.
 Gravity는 world 벡터로 유지한다. 초기 정렬 후 일반적으로 [0,0,-g]다.
 Gravity는 최적화 변수가 아니다. IMU 예측과 native factor가 같은 중력을 사용한다.
 
-기존 pairwise 최적화는 보통 이전 state15 + 현재 state15 = 30D다.
-고정 이전 state 옵션이면 15D, bias 고정이면 state당 9D 경로도 있다.
-기존 marginal_prior.py의 NavigationPrior는 현재 state에 대한 15D prior다.
-기존 reference GelSight pose는 보통 고정이다. IMU-only reference 회복은 예외다.
-기존 final prior는 이전 state를 제거한 뒤 gradient를 0으로 재설정한다.
-새 경로는 축약한 gradient를 보존한다. Pairwise의 기존 동작은 변경하지 않았다.
+삭제한 pairwise 최적화는 보통 이전 state15 + 현재 state15 = 30D였다.
+그 경로의 reference GelSight pose는 보통 고정이었다. IMU-only reference 회복은 예외였다.
+그 경로의 final prior는 이전 state를 제거한 뒤 gradient를 0으로 재설정했다.
+marginal_prior.py의 NavigationPrior는 현재 state에 대한 15D prior다.
+이 경로는 축약한 gradient를 보존한다.
 
 IMU factor는 native gtsam.ImuFactor의 9D motion residual이다.
 이전/현재 pose 및 velocity, 이전 bias를 연결한다.
@@ -186,9 +176,8 @@ ROS 및 backend 경계
 이미지 callback은 직렬화된 경로에서 solve와 prior commit을 실행한다.
 IMU callback은 buffer에 측정을 추가한다. Solve 중인 state/prior를 직접 수정하지 않는다.
 Backend callback은 immutable snapshot을 교체한다.
-기존 pairwise 경로는 apply_map_snapshot에서 내부 state와 reference를 수정할 수 있다.
-그 경로는 유지했다.
-새 모드에서는 backend feedback을 map snapshot으로만 받는다.
+삭제한 pairwise 경로는 apply_map_snapshot에서 내부 state와 reference를 수정했다.
+이 경로는 backend feedback을 map snapshot으로만 받는다.
 Frontend state, gravity, reference, prior에 backend pose를 덮어쓰지 않는다.
 기존 backend map 및 keyframe seed rebasing 경로는 유지한다.
 Frontend 측정을 이미 사용한 backend 결과를 독립 측정 prior로 다시 넣지 않는다.
@@ -268,7 +257,6 @@ export OMP_NUM_THREADS=1
   --output diagnostics/first_pose_fixed_20261021/replay
 
 ROS 실행:
-사용할 YAML의 imu_config.frontend_state_mode를 reference_marginalization으로 설정한다.
 ros2 launch gelslam bag_replay_launch.py config_path:=<YAML 절대 경로> rendering:=false rviz:=false
 별도 터미널에서 ros2 bag play <bag 경로> --clock을 실행한다.
 Static fixed_time 설정은 해당 bag의 초기 정지 구간과 일치해야 한다.

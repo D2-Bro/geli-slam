@@ -44,3 +44,9 @@ uint64 solution_revision
 float64[] navigation_pose
 # Optional 26-double anchor row: timestamp, IMU pose, velocity, ba, bg.
 float64[] anchor_state
+# Optional frontend re-estimate of the previous keyframe (anchor_kid) after its
+# publication, relative to anchor_state (empty: none). 27 doubles: kid, navigation
+# timestamp, 4x4 IMU-pose change inv(anchor pose) * estimated pose (anchor body
+# frame), velocity change in anchor body axes, accel bias change, gyro bias change.
+# The backend applies it to that keyframe's stored seed.
+float64[] keyframe_update

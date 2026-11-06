@@ -41,7 +41,8 @@ def generate_launch_description():
         default_value="true",
         description=(
             "Enable loop closure and pose-graph optimization; false still records "
-            "keyframes and writes a raw tracker-odometry trajectory evaluation"
+            "keyframes, applies the frontend keyframe updates, and evaluates the "
+            "tracker trajectory on the final keyframe poses"
         ),
     )
     rviz_arg = DeclareLaunchArgument(

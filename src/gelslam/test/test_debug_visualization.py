@@ -31,7 +31,6 @@ def test_debug_gate_skips_construction_without_skipping_tracking(monkeypatch, en
     monkeypatch.setattr(tracker_node_module, "normal_map_to_rgb8", rgb)
     normal_message = SimpleNamespace(header=None)
     node = SimpleNamespace(
-        recorded_source_clock=None,
         debug_visualization_enabled=enabled,
         bridge=SimpleNamespace(
             imgmsg_to_cv2=record("input_conversion", np.zeros((2, 2, 3), np.uint8)),

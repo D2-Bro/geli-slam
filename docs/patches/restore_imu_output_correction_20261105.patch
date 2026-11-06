@@ -1,0 +1,231 @@
+diff -ruN a/src/gelslam/config/live_thick_far_config.yaml b/src/gelslam/config/live_thick_far_config.yaml
+--- a/src/gelslam/config/live_thick_far_config.yaml
++++ b/src/gelslam/config/live_thick_far_config.yaml
+@@ -142,6 +142,19 @@
+   # the rest-unobservable tangential bias); a looser walk lets contact update it.
+   # Offline 12 trials: final error 14.1 -> 11.1 mm. 10x was worse (14.2 mm).
+   accelerometer_bias_random_walk: 0.0026
++  # EBIMU ASCII output truncates toward zero (gyro 0.1 deg/s, accel 0.001 g):
++  # the zero level is two steps wide, so in motion each value reads half a step
++  # low and the rest-window gyro mean is biased by a session constant. Map
++  # nonzero levels to interval centres before buffering; static initialization
++  # then uses the corrected rest samples. null disables.
++  # Frontend-only, 12 real-objects trials (docs/recontact_gap_error_20261105.md):
++  # truncation alone 7.94 -> 6.36 mm; with the calibration below 5.80 mm.
++  output_truncation_gyro_step_rad_s: 0.0017453292519943296  # 0.1 deg/s
++  output_truncation_accel_step_mps2: 0.00980665  # 0.001 g
++  # Fixed EBIMU accelerometer calibration, f_corrected = f - (bias + scale * f),
++  # applied after the truncation correction (fitted on near-rig motion windows).
++  accel_calibration_bias_mps2: [0.010146590820458705, -0.018299274385377835, -0.07040754072005488]
++  accel_calibration_scale: [-1.5244874151686127e-05, -0.003497099531017146, 0.0035123444051688322]
+   gyroscope_bias_random_walk: 0.0000022
+   buffer_max_samples: 6000
+   # T_GI derived from this bag's /tf_static: IMU coordinates into gel_frame.
+diff -ruN a/src/gelslam/config/real_objects_config.yaml b/src/gelslam/config/real_objects_config.yaml
+--- a/src/gelslam/config/real_objects_config.yaml
++++ b/src/gelslam/config/real_objects_config.yaml
+@@ -139,6 +139,19 @@
+   # the rest-unobservable tangential bias); a looser walk lets contact update it.
+   # Offline 12 trials: final error 14.1 -> 11.1 mm. 10x was worse (14.2 mm).
+   accelerometer_bias_random_walk: 0.0026
++  # EBIMU ASCII output truncates toward zero (gyro 0.1 deg/s, accel 0.001 g):
++  # the zero level is two steps wide, so in motion each value reads half a step
++  # low and the rest-window gyro mean is biased by a session constant. Map
++  # nonzero levels to interval centres before buffering; static initialization
++  # then uses the corrected rest samples. null disables.
++  # Frontend-only, 12 real-objects trials (docs/recontact_gap_error_20261105.md):
++  # truncation alone 7.94 -> 6.36 mm; with the calibration below 5.80 mm.
++  output_truncation_gyro_step_rad_s: 0.0017453292519943296  # 0.1 deg/s
++  output_truncation_accel_step_mps2: 0.00980665  # 0.001 g
++  # Fixed EBIMU accelerometer calibration, f_corrected = f - (bias + scale * f),
++  # applied after the truncation correction (fitted on near-rig motion windows).
++  accel_calibration_bias_mps2: [0.010146590820458705, -0.018299274385377835, -0.07040754072005488]
++  accel_calibration_scale: [-1.5244874151686127e-05, -0.003497099531017146, 0.0035123444051688322]
+   gyroscope_bias_random_walk: 0.0000022
+   buffer_max_samples: 6000
+   # T_GI derived from this bag's /tf_static: IMU coordinates into gel_frame.
+diff -ruN a/src/gelslam/gelslam/core/inertial.py b/src/gelslam/gelslam/core/inertial.py
+--- a/src/gelslam/gelslam/core/inertial.py
++++ b/src/gelslam/gelslam/core/inertial.py
+@@ -131,6 +131,75 @@
+         )
+ 
+ 
++def undo_truncation(values, step):
++    """Map toward-zero truncated output levels to their interval centres.
++
++    A device that truncates toward zero reports level k for true values in
++    [k, k + 1) * step when k > 0 and in (k - 1, k] * step when k < 0, so the
++    zero level covers two steps. Add sign(k) * step / 2 to each nonzero level.
++    Keep zero, and keep values that are not on the step grid unchanged.
++    Return the corrected values and whether every value was on the grid.
++    """
++    values = np.asarray(values, dtype=np.float64)
++    if not step:
++        return values, True
++    levels = np.round(values / step)
++    on_grid = np.abs(values / step - levels) <= 1e-6
++    corrected = np.where(on_grid & (levels != 0),
++                         values + np.sign(levels) * 0.5 * step, values)
++    return corrected, bool(on_grid.all())
++
++
++class ImuOutputCorrection:
++    """Fixed correction of IMU output before buffering, from ``imu_config``.
++
++    1. ``output_truncation_gyro_step_rad_s`` / ``output_truncation_accel_step_mps2``:
++       undo toward-zero truncation of a fixed-point output (``undo_truncation``).
++    2. ``accel_calibration_bias_mps2`` / ``accel_calibration_scale``: per-axis
++       accelerometer calibration, f_corrected = f - (bias + scale * f).
++    Missing, null or zero values disable each part.
++    """
++
++    def __init__(self, gyro_step=0.0, accel_step=0.0, accel_bias=None, accel_scale=None):
++        self.gyro_step = self._step(gyro_step, "output_truncation_gyro_step_rad_s")
++        self.accel_step = self._step(accel_step, "output_truncation_accel_step_mps2")
++        self.accel_bias = _vector3(
++            np.zeros(3) if accel_bias is None else accel_bias, "accel_calibration_bias_mps2")
++        self.accel_scale = _vector3(
++            np.zeros(3) if accel_scale is None else accel_scale, "accel_calibration_scale")
++        self.off_grid_samples = 0
++
++    @staticmethod
++    def _step(value, name):
++        step = 0.0 if value is None else float(value)
++        if not np.isfinite(step) or step < 0.0:
++            raise ValueError("imu_config.%s must be finite and nonnegative" % name)
++        return step
++
++    @classmethod
++    def from_config(cls, imu_config):
++        """Return the configured correction, or ``None`` if every part is disabled."""
++        correction = cls(
++            imu_config.get("output_truncation_gyro_step_rad_s"),
++            imu_config.get("output_truncation_accel_step_mps2"),
++            imu_config.get("accel_calibration_bias_mps2"),
++            imu_config.get("accel_calibration_scale"),
++        )
++        if (correction.gyro_step == 0.0 and correction.accel_step == 0.0
++                and not correction.accel_bias.any() and not correction.accel_scale.any()):
++            return None
++        return correction
++
++    def apply(self, sample):
++        """Return a corrected copy of ``sample``; count samples that are off the grid."""
++        gyro, gyro_on_grid = undo_truncation(sample.angular_velocity, self.gyro_step)
++        accel, accel_on_grid = undo_truncation(sample.acceleration, self.accel_step)
++        if not (gyro_on_grid and accel_on_grid):
++            self.off_grid_samples += 1
++        accel = accel - (self.accel_bias + self.accel_scale * accel)
++        return ImuSample(sample.timestamp, accel, gyro)
++
++
+ @dataclass(frozen=True)
+ class InertialState:
+     """Body-to-world navigation state used for IMU-only propagation."""
+diff -ruN a/src/gelslam/gelslam/core/tracker.py b/src/gelslam/gelslam/core/tracker.py
+--- a/src/gelslam/gelslam/core/tracker.py
++++ b/src/gelslam/gelslam/core/tracker.py
+@@ -16,6 +16,7 @@
+ from gelslam.core.slam_packets import keyframe_update_row, readonly
+ from gelslam.core.inertial import (
+     ImuBuffer,
++    ImuOutputCorrection,
+     ImuSample,
+     InertialPropagator,
+     InertialState,
+@@ -109,6 +110,7 @@
+             if self.imu_enabled
+             else None
+         )
++        self.imu_output_correction = ImuOutputCorrection.from_config(self.imu_config)
+         self._recontact_imu_recovery_min_gap_s()  # Validate the recontact rule.
+         self.gelsight_T_imu = self._parse_gelsight_T_imu(
+             self.imu_config.get("gelsight_T_imu")
+@@ -2137,6 +2139,15 @@
+             return False
+         if not isinstance(sample, ImuSample):
+             raise TypeError("sample must be an ImuSample")
++        correction = getattr(self, "imu_output_correction", None)
++        if correction is not None:
++            # Static initialization, frontend and backend all read the corrected sample.
++            sample = correction.apply(sample)
++            if correction.off_grid_samples and not getattr(self, "_imu_off_grid_warned", False):
++                self._imu_off_grid_warned = True
++                self.logger.warning(
++                    "IMU sample is not on the configured output_truncation step grid; "
++                    "off-grid values are not truncation-corrected")
+         try:
+             self.imu_buffer.add(sample)
+         except ValueError:
+diff -ruN a/src/gelslam/test/test_inertial.py b/src/gelslam/test/test_inertial.py
+--- a/src/gelslam/test/test_inertial.py
++++ b/src/gelslam/test/test_inertial.py
+@@ -5,12 +5,14 @@
+ 
+ from gelslam.core.inertial import (
+     ImuBuffer,
++    ImuOutputCorrection,
+     ImuSample,
+     InertialPropagator,
+     InertialState,
+     gravity_from_world_R_imu,
+     gyro_to_rad_per_sec,
+     rotation_aligning_gravity_to_negative_z,
++    undo_truncation,
+ )
+ 
+ 
+@@ -187,3 +189,52 @@
+     assert [sample.timestamp for sample in buffer.samples_covering(1.0, 4.0)] == [
+         1.0, 2.0, 3.0, 4.0
+     ]
++
++
++def test_undo_truncation_maps_nonzero_levels_to_interval_centres():
++    step = 0.1
++    corrected, on_grid = undo_truncation([0.1, -0.2, 0.0], step)
++    assert on_grid
++    np.testing.assert_allclose(corrected, [0.15, -0.25, 0.0])
++    # Toward-zero truncation of true values; zero covers (-step, step).
++    true = np.linspace(-0.55, 0.55, 221)
++    truncated = np.trunc(true / step) * step
++    corrected, on_grid = undo_truncation(truncated, step)
++    assert on_grid
++    nonzero = truncated != 0
++    assert np.all(np.abs(corrected - true)[nonzero] <= step / 2 + 1e-12)
++    assert abs(np.mean(corrected - true)) < abs(np.mean(np.abs(truncated - true))) / 10
++
++
++def test_undo_truncation_keeps_off_grid_values_and_disabled_step():
++    corrected, on_grid = undo_truncation([0.123, 0.2, 0.0], 0.1)
++    assert not on_grid
++    np.testing.assert_allclose(corrected, [0.123, 0.25, 0.0])
++    corrected, on_grid = undo_truncation([0.123, 0.2, 0.0], 0.0)
++    assert on_grid
++    np.testing.assert_allclose(corrected, [0.123, 0.2, 0.0])
++
++
++def test_imu_output_correction_from_config():
++    assert ImuOutputCorrection.from_config({}) is None
++    assert ImuOutputCorrection.from_config({
++        "output_truncation_gyro_step_rad_s": None,
++        "accel_calibration_bias_mps2": [0.0, 0.0, 0.0],
++    }) is None
++    with pytest.raises(ValueError):
++        ImuOutputCorrection.from_config({"output_truncation_accel_step_mps2": -1.0})
++
++    correction = ImuOutputCorrection.from_config({
++        "output_truncation_gyro_step_rad_s": 0.01,
++        "output_truncation_accel_step_mps2": 0.5,
++        "accel_calibration_bias_mps2": [0.1, 0.0, -0.2],
++        "accel_calibration_scale": [0.0, 0.01, 0.0],
++    })
++    sample = correction.apply(ImuSample(2.0, (1.0, -2.0, 0.0), (0.02, 0.0, -0.01)))
++    assert sample.timestamp == 2.0
++    np.testing.assert_allclose(sample.angular_velocity, [0.025, 0.0, -0.015])
++    # Truncation correction first (1.25, -2.25, 0), then f - (bias + scale * f).
++    np.testing.assert_allclose(sample.acceleration, [1.15, -2.25 + 0.0225, 0.2])
++    assert correction.off_grid_samples == 0
++    correction.apply(ImuSample(2.1, (1.1, 0.0, 0.0), (0.0, 0.0, 0.0)))
++    assert correction.off_grid_samples == 1

@@ -150,25 +150,11 @@ def test_inertial_fit_rejects_missing_or_gapped_imu_history():
     assert h.seed(anchor,np.array([0.,0.,-9.81])) is None
 
 
-def test_tracker_never_uses_prediction_only_contact_states_as_pose_observations():
-    from test_tracker_inertial import make_coasting_tracker, header
-    from gelslam.core.gtsam_vi import GtsamVisualInertialSolver
-    tracker=make_coasting_tracker()
-    tracker.frontend_visual_inertial=GtsamVisualInertialSolver(dict(frontend_imu_prediction_only=True))
-    anchor,_=trajectory(h := history())
-    tracker._frontend_vi_state=anchor
-    tracker._contact_velocity_history=h
-    tracker._trial_index=0
-    tracker._record_tactile_pose(anchor.pose,header(1.))
-    assert not h.samples
-    assert tracker._coast_velocity_seed is None
-
-
 def test_tracker_history_records_navigation_origin_in_trial_axes():
     from test_tracker_inertial import make_coasting_tracker, header
-    from gelslam.core.gtsam_vi import GtsamVisualInertialSolver
+    from gelslam.core.gtsam_vi import create_frontend_solver
     tracker=make_coasting_tracker()
-    tracker.frontend_visual_inertial=GtsamVisualInertialSolver({})
+    tracker.frontend_visual_inertial=create_frontend_solver({})
     tracker._contact_velocity_history=h=history()
     tracker._trial_index=0
     navigation=state(1.,[.01,.02,.04])
@@ -180,11 +166,11 @@ def test_tracker_history_records_navigation_origin_in_trial_axes():
 
 def test_no_contact_seed_is_frozen_and_never_changes_accepted_state_or_prior():
     from test_tracker_inertial import make_coasting_tracker, header
-    from gelslam.core.gtsam_vi import GtsamVisualInertialSolver
+    from gelslam.core.gtsam_vi import create_frontend_solver
     from gelslam.core.marginal_prior import NavigationPrior
     from gelslam.core.tracker import TrackingMode
     tracker=make_coasting_tracker()
-    tracker.frontend_visual_inertial=GtsamVisualInertialSolver({})
+    tracker.frontend_visual_inertial=create_frontend_solver({})
     anchor,expected=trajectory(h := history())
     tracker._contact_velocity_history=h
     tracker._frontend_vi_state=anchor
@@ -207,26 +193,24 @@ def test_no_contact_seed_is_frozen_and_never_changes_accepted_state_or_prior():
     assert tracker._coast_velocity_seed is None
 
 
-@pytest.mark.parametrize('state_mode', ['pairwise', 'reference_marginalization'])
-def test_coast_seed_translates_prior_distribution_and_preserves_cross_information(state_mode):
+def test_coast_seed_translates_prior_distribution_and_preserves_cross_information():
     from gelslam.core.gtsam_vi import create_frontend_solver
     from gelslam.core.inertial import ImuSample
     from gelslam.core.marginal_prior import NavigationPrior
     from gelslam.core.retained_prior import state_blocks, state_values
     from gelslam.core.split_pose import split_pose_plus
 
-    solver = create_frontend_solver(dict(frontend_state_mode=state_mode))
+    solver = create_frontend_solver({})
     previous = state(1., [.1, -.2, .3], [.01, -.02, .03])
     previous.pose[:3, :3] = Rotation.from_rotvec([.2, -.1, .3]).as_matrix()
     solver.marginal_prior = NavigationPrior.initial(previous, np.ones(15))
-    if state_mode == 'reference_marginalization':
-        solver.set_reference(previous.timestamp, previous)
-        bootstrap = tuple(ImuSample(float(t), [0, 0, 9.81], [0, 0, .1])
-                          for t in np.linspace(1., 1.1, 11))
-        target, pim = solver.predict_current(previous, bootstrap, np.eye(4), force=True)
-        solver.marginal_prior = solver.propagate_prior(previous, target, pim)
-        previous = target
-        solver.set_reference(previous.timestamp, previous)
+    solver.set_reference(previous.timestamp, previous)
+    bootstrap = tuple(ImuSample(float(t), [0, 0, 9.81], [0, 0, .1])
+                      for t in np.linspace(1., 1.1, 11))
+    target, pim = solver.predict_current(previous, bootstrap, np.eye(4), force=True)
+    solver.marginal_prior = solver.propagate_prior(previous, target, pim)
+    previous = target
+    solver.set_reference(previous.timestamp, previous)
     samples = tuple(ImuSample(float(t), [0, 0, 9.81], [0, 0, .1])
                     for t in np.linspace(previous.timestamp, 1.2, 21))
     current, pim = solver.predict_current(previous, samples, np.eye(4), force=True)
@@ -246,28 +230,24 @@ def test_coast_seed_translates_prior_distribution_and_preserves_cross_informatio
     probe.velocity += perturbation[6:9]
     probe.accel_bias += perturbation[9:12]
     probe.gyro_bias += perturbation[12:15]
-    if state_mode == 'pairwise':
-        assert shifted.error(seed.apply(probe)) == pytest.approx(prior.error(probe), abs=1e-12)
-    else:
-        assert prior.layout.dimension == 21
-        assert np.linalg.norm(prior.information[:6, 6:]) > 0.
-        original_values = dict(prior.values)
-        original_values.update(state_values(probe))
-        shifted_values = dict(original_values)
-        shifted_values.update(state_values(seed.apply(probe)))
-        assert shifted.error_values(shifted_values) == pytest.approx(
-            prior.error_values(original_values), abs=1e-12)
-        assert shifted.absorbed_intervals == prior.absorbed_intervals
-        for block in prior.fixed_values:
-            np.testing.assert_array_equal(shifted.fixed_values[block], prior.fixed_values[block])
-        # The free retained reference is a distinct event from the target.
-        np.testing.assert_array_equal(shifted.values[state_blocks(previous.timestamp)[0]], previous.pose)
+    assert prior.layout.dimension == 21
+    assert np.linalg.norm(prior.information[:6, 6:]) > 0.
+    original_values = dict(prior.values)
+    original_values.update(state_values(probe))
+    shifted_values = dict(original_values)
+    shifted_values.update(state_values(seed.apply(probe)))
+    assert shifted.error_values(shifted_values) == pytest.approx(
+        prior.error_values(original_values), abs=1e-12)
+    assert shifted.absorbed_intervals == prior.absorbed_intervals
+    for block in prior.fixed_values:
+        np.testing.assert_array_equal(shifted.fixed_values[block], prior.fixed_values[block])
+    # The free retained reference is a distinct event from the target.
+    np.testing.assert_array_equal(shifted.values[state_blocks(previous.timestamp)[0]], previous.pose)
 
 
-@pytest.mark.parametrize('state_mode', ['pairwise', 'reference_marginalization'])
 @pytest.mark.parametrize('initialize_from_imu', [False, True])
 def test_imu_recovery_keeps_coast_state_and_prior_through_next_optimization(
-        monkeypatch, state_mode, initialize_from_imu):
+        monkeypatch, initialize_from_imu):
     import gelslam.core.tracker as tm
     from gelslam.core.gtsam_vi import create_frontend_solver
     from gelslam.core.marginal_prior import NavigationPrior
@@ -277,7 +257,6 @@ def test_imu_recovery_keeps_coast_state_and_prior_through_next_optimization(
 
     tracker, anchor = tracker_with_imu(monkeypatch)
     solver = create_frontend_solver(dict(
-        frontend_state_mode=state_mode,
         frontend_initialize_from_imu_preintegration=initialize_from_imu))
     tracker.frontend_visual_inertial = solver
     solver.marginal_prior = NavigationPrior.initial(anchor, solver.prior_sigmas)

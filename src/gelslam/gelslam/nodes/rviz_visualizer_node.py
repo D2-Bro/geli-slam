@@ -7,7 +7,6 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 import numpy as np
 import rclpy
-import yaml
 from geometry_msgs.msg import TransformStamped, Vector3Stamped
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -17,6 +16,7 @@ from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 from gelslam.core.frame import pose_of_frame_msg
 from gelslam.core.inertial import rotation_aligning_gravity_to_negative_z
+from gelslam.core.imu_mount_calibration import load_config
 from gelslam.core.keyframe import KeyFrameDB
 from gelslam.utils import Logger
 from gelslam.visualization.visible_coverage_meshes import (
@@ -108,8 +108,9 @@ class RvizVisualizerNode(Node):
         self.declare_parameter("config_path", "")
         config_path = self.get_parameter("config_path").value
         config_path = os.path.abspath(os.path.expanduser(config_path))
-        with open(config_path, encoding="utf-8") as stream:
-            config = yaml.safe_load(stream)
+        # IMU mounting slot of imu_config.gelsight_T_imu_calibration; "" keeps its slot.
+        self.declare_parameter("imu_slot", "")
+        config = load_config(config_path, self.get_parameter("imu_slot").value)
         self.ppmm = config["device_config"]["ppmm"]
         imu_config = config.get("imu_config", {})
         transform = imu_config.get("gelsight_T_imu")
@@ -165,14 +166,7 @@ class RvizVisualizerNode(Node):
                 ),
             )
         else:
-            gravity = (
-                imu_config.get(
-                    "frontend_gravity_mps2",
-                    (0.0, 0.0, -float(imu_config.get("gravity_mps2", 9.81))),
-                )
-                if frontend_vi_enabled
-                else (0.0, 0.0, -1.0)
-            )
+            gravity = (0.0, 0.0, -1.0)
             self.set_gravity_alignment(gravity)
 
         self.create_subscription(KeyFrameMsg, "keyframe", self.keyframe_callback, 10)

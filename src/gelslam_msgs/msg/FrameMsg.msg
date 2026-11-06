@@ -23,3 +23,10 @@ float32[] ref_t_curr
 string tracking_status "contact_tracking"
 bool pose_valid true
 float64 pose_timestamp
+
+# Frontend estimate of the reference keyframe (ref_kid) when this frame was
+# published, relative to that keyframe's published pose: inv(published) * estimate
+# (GelSight poses, 4x4 flattened). Empty: the estimate is the published pose.
+# Once the keyframe's keyframe_update reaches the backend, the final evaluation
+# resolves this frame on the keyframe's final pose through this estimate.
+float64[] published_t_ref_estimate

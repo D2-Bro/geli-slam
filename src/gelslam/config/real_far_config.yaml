@@ -25,8 +25,6 @@ imu_config:
   static_initialization:
     enabled: true
     gyro_bias_uncertainty_from_samples: true
-    # mode: "startup_duration"
-    # duration_s: 8.9
     # window_s: 1.0
     # min_samples: 50
     mode: "recorded_rest_event"
@@ -45,9 +43,6 @@ imu_config:
     velocity_sigma_mps: 0.0001
   enabled: true
   frontend_optimization: true
-  # Use reference_marginalization / pairwise for a variable reference + current 21D prior.
-  # Requires estimated biases/previous state and disabled GT state overrides.
-  frontend_state_mode: "reference_marginalization"
   # Previous 15D state in reference_marginalization (normal rows never touch it).
   # joint: GN over [reference, previous, current] (36D); IMU relinearized each iteration.
   # eliminate_first: eliminate previous from prior+IMU+bias once, GN over
@@ -60,24 +55,7 @@ imu_config:
   # Set false to start each contact-frame solve from the previous VI state.
   # IMU preintegration still supplies the IMU factor in the solve.
   # With true, initial shared points < 10 retries once from the previous State.
-  frontend_initialize_from_imu_preintegration: true
-  # Use the target-frame IMU prediction directly; skip contact optimization.
-  frontend_imu_prediction_only: false
-  # Fix the previous pose, velocity and both biases during each frontend solve.
-  # Overrides joint marginalization; no carried marginal prior is used.
-  frontend_fix_previous_state: false
-  # Independent diagnostic interventions. Bias and target initialization are unchanged.
-  frontend_gt_previous_state_test:
-    enabled: false
-    previous_pose_from_gt: true
-    previous_velocity_from_gt: true
-    reference_pose_from_gt: true
-    reset_marginal_prior: true
-    # Keep pose/velocity at one time when toggling either GT input independently.
-    previous_state_time: accepted_state
-  # Joint previous/target state solve. Marginalize the previous 15D state.
-  # The tracker commits the target prior only after its contact quality gate.
-  gtsam_vi_marginalization: true
+  frontend_initialize_from_imu_preintegration: false
   # Initial accepted-state uncertainty in SI units; used at each VI restart.
   # 0.005 rad and 0.01 m/s^2: smallest values consistent with GT tilt and vertical velocity
   # at first contact on thick-far trials 002-007 and 011 (recorded_rest_event, 2026-10-29).
@@ -120,15 +98,9 @@ imu_config:
     max_fit_rmse_m: 0.00005
     max_velocity_change_mps: 0.02
   gravity_mps2: 9.80665
-  # The bag's sensor_msgs/Imu angular_velocity follows the ROS rad/s contract.
-  gyro_input_unit: "rad_s"
   # The recorded gyro norm peaks at about 0.43 rad/s; retain margin while
   # rejecting the typical ~57x degree/radian mismatch.
   gyro_max_rate_rad_s: 5.0
-  # Used by legacy no-contact propagation when frontend VI is disabled.
-  # With frontend VI enabled, coasting uses frontend gravity and trial axes.
-  # It is not a legal input for a real estimator or accuracy claim.
-  # gravity_initialization: "ground_truth_initial_pose"
   ground_truth_gel_pose_topic: "/ground_truth/gel_pose"
   ground_truth_imu_pose_topic: "/ground_truth/imu_pose"
   initial_accel_bias_mps2: [0.0, 0.0, 0.0]
@@ -151,8 +123,11 @@ imu_config:
   dense_normalflow_samples: 500
   # Positive relative objective weights for the joint frontend solve.
   dense_normalflow_residual_weight: 1.0
-  # Shared objective weight for the separate IMU and bias factors.
+  # Objective weight of the 9D IMU preintegration factor.
   imu_residual_weight: 0.0001
+  # Objective weight of the 6D bias random-walk factor, set apart from
+  # imu_residual_weight (null would follow it). Larger: stiffer bias.
+  bias_residual_weight: 0.0001
   # Keep NormalFlow's original SCR/CCS loss-of-track gate independent of the
   # (smaller) optimization sample set.
   dense_normalflow_quality_samples: 500
@@ -186,6 +161,10 @@ gelslam_config:
     # Retain each rejected contact image as an IMU-predicted Frame for evaluation.
     # Requires a valid initialized VI state and continuous IMU coverage to the image.
     # Does not accept the prediction or add optimization keyframes. Default: false.
+    # The backend's final trajectory evaluation always includes the IMU recovery
+    # keyframe frames (imu_only). false leaves the other IMU-only frames
+    # (no_contact_coasting, imu_prediction) out; they are still published for display.
+    # true evaluates them; coast frames at their IMU prediction time (pose_timestamp).
     keep_imu_only_frames: true
     # Write/publish normal RGB, contact cloud and correspondence debug images.
     # false skips their construction; tracking and frame/keyframe output continue.

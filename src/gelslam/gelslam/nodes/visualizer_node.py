@@ -9,13 +9,13 @@ import time
 
 import numpy as np
 import rclpy
-import yaml
 from cv_bridge import CvBridge
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from gelslam.core.frame import center_of_frame_msg, frame_msg2mesh, pose_of_frame_msg
+from gelslam.core.imu_mount_calibration import load_config
 from gelslam.core.keyframe import KeyFrameDB
 from gelslam.utils import Logger
 from gelslam.visualization.visible_coverage_meshes import (
@@ -53,9 +53,10 @@ class VisualizerNode(Node):
             self.get_parameter("config_path").get_parameter_value().string_value
         )
         config_path = os.path.abspath(os.path.expanduser(config_path))
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
-            self.ppmm = config["device_config"]["ppmm"]
+        # IMU mounting slot of imu_config.gelsight_T_imu_calibration; "" keeps its slot.
+        self.declare_parameter("imu_slot", "")
+        config = load_config(config_path, self.get_parameter("imu_slot").value)
+        self.ppmm = config["device_config"]["ppmm"]
         # Get the save data directory
         self.declare_parameter("data_dir", "")
         data_dir = self.get_parameter("data_dir").get_parameter_value().string_value

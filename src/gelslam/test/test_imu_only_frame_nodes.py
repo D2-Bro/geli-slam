@@ -34,6 +34,7 @@ def prediction_tracker(monkeypatch, *, enabled=True, already_keyframe=True):
         accepted.pose = tracker.trial_T_ref @ tracker.ref_T_prev
         solver = tracker.frontend_visual_inertial
         solver.marginal_prior = NavigationPrior.initial(accepted, solver.prior_sigmas)
+        tracker._sync_reference_prior()
 
     def reject(*_args):
         raise tm.QualityGateError(np.eye(4))
@@ -77,6 +78,11 @@ def test_quality_wait_keeps_each_image_only_with_flag_and_preserves_anchor(
                 assert record['state_timestamp_s'] == pytest.approx(timestamp)
                 np.testing.assert_allclose(record['velocity'], expected.velocity)
         assert tracker._frontend_vi_state is anchor
+        assert solver.marginal_prior.matches(anchor)
+        if timestamp == 1.04 and not already_keyframe:
+            # Promotion of the accepted frame retains the prior on the new
+            # reference. Later predictions must not change it.
+            prior = solver.marginal_prior
         assert solver.marginal_prior is prior
         assert solver.pending_marginal_prior is None
         assert getattr(tracker, '_frontend_coast_state', None) is None
@@ -126,37 +132,13 @@ def test_invalid_imu_interval_does_not_create_an_evaluation_frame(monkeypatch, p
     assert tracker._frontend_vi_state is (None if problem == 'uninitialized' else anchor)
 
 
-def test_prediction_uses_corrected_backend_anchor_and_image_to_imu_offset(monkeypatch):
-    tracker, accepted = prediction_tracker(monkeypatch)
-    corrected = accepted.copy()
-    corrected.pose[0, 3] += .03
-    corrected.velocity += .1
-    tracker._backend_correction_anchor = corrected
-    tracker._backend_correction_trial = tracker._trial_index
-    tracker._backend_imu_buffer = tracker.imu_buffer
-    tracker.image_to_imu_time_offset_s = .02
-    expected, _ = tracker.frontend_visual_inertial.predict_current(
-        corrected, tracker.imu_buffer.samples_covering(1., 1.12),
-        tracker.gelsight_T_imu, force=True)
-    ret, (message, packets) = tracker.track(IMAGE, header(1.10))
-    assert ret and packets == []
-    assert message['pose_timestamp'] == pytest.approx(1.10)
-    np.testing.assert_allclose(tracker.trial_T_ref @ message['ref_T_curr'], expected.pose, atol=1e-7)
-    record = capture_state_velocity(tracker, SimpleNamespace(**message))
-    assert record['state_timestamp_s'] == pytest.approx(1.12)
-    assert record['image_timestamp_s'] == pytest.approx(1.10)
-    assert tracker._frontend_vi_state is accepted
-    assert tracker._backend_correction_anchor is corrected
-
-
 @pytest.mark.parametrize('already_keyframe', [False, True])
-@pytest.mark.parametrize('state_mode', ['pairwise', 'reference_marginalization'])
 def test_prediction_and_later_recovery_keep_coast_shift_through_reference_promotion(
-        monkeypatch, already_keyframe, state_mode):
+        monkeypatch, already_keyframe):
     from gelslam.core.contact_velocity import CoastVelocitySeed, ContactVelocityHistory
     from gelslam.core.gtsam_vi import create_frontend_solver
     tracker, anchor = prediction_tracker(monkeypatch, already_keyframe=already_keyframe)
-    solver = create_frontend_solver(dict(frontend_state_mode=state_mode))
+    solver = create_frontend_solver({})
     tracker.frontend_visual_inertial = solver
     solver.marginal_prior = NavigationPrior.initial(anchor, solver.prior_sigmas)
     tracker._sync_reference_prior()
@@ -186,10 +168,8 @@ def test_prediction_and_later_recovery_keep_coast_shift_through_reference_promot
         assert ok and len(packets) == (not already_keyframe and timestamp == 1.12)
         # Consumers reconstruct F_j from the published K_k observation, not
         # the live reference updated during reference promotion.
-        published_ref = tracker.trial_T_ref
-        if state_mode == 'reference_marginalization':
-            published_ref = getattr(tracker, '_published_keyframe_poses', {}).get(
-                message['ref_kid'], published_ref)
+        published_ref = getattr(tracker, '_published_keyframe_poses', {}).get(
+            message['ref_kid'], tracker.trial_T_ref)
         np.testing.assert_allclose(published_ref @ message['ref_T_curr'],
                                    gelsight_pose(expected.pose, tracker.gelsight_T_imu), atol=1e-7)
         np.testing.assert_allclose(tracker._frontend_frame_prediction.velocity, expected.velocity)
@@ -209,20 +189,12 @@ def test_prediction_and_later_recovery_keep_coast_shift_through_reference_promot
     assert tracker._coast_velocity_seed is None
 
 
-@pytest.mark.parametrize('mismatch', ['different_time', 'backend_anchor'])
-def test_prediction_does_not_apply_coast_shift_to_another_anchor(monkeypatch, mismatch):
+def test_prediction_does_not_apply_coast_shift_to_another_anchor(monkeypatch):
     from gelslam.core.contact_velocity import CoastVelocitySeed
     tracker, accepted = prediction_tracker(monkeypatch)
     tracker._coast_velocity_seed = CoastVelocitySeed(
-        accepted.timestamp if mismatch == 'backend_anchor' else accepted.timestamp-.1,
-        np.array([.004, -.003, .001]), 0., 8, .35)
+        accepted.timestamp-.1, np.array([.004, -.003, .001]), 0., 8, .35)
     anchor = accepted
-    if mismatch == 'backend_anchor':
-        anchor = accepted.copy()
-        anchor.velocity += .1
-        tracker._backend_correction_anchor = anchor
-        tracker._backend_correction_trial = tracker._trial_index
-        tracker._backend_imu_buffer = tracker.imu_buffer
     expected, _ = tracker.frontend_visual_inertial.predict_current(
         anchor, tracker.imu_buffer.samples_covering(anchor.timestamp, 1.12),
         tracker.gelsight_T_imu, force=True)

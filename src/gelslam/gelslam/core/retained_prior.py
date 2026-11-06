@@ -188,6 +188,32 @@ def compress_normal(H, g):
     return compressed, (vectors[:, active].T @ gs) / singular[active]
 
 
+def eliminate_normal(H, g, eliminate_columns, retain_columns):
+    """eliminate_rows(A, rhs, m, r) from H = A^T A and g = A^T rhs, as (H, g) on r.
+
+    Hrr - Hrm Hmm^- Hmr and gr - Hrm Hmm^- gm. Hmm^- inverts only the observable
+    subspace of the column-scaled Hmm (NORMAL_RANK_TOLERANCE), as rank_solve(Am)
+    does in eliminate_rows; Am Hmm^- Am^T is the same projector for any such inverse.
+    """
+    H, g = np.asarray(H, float), np.asarray(g, float)
+    if not np.isfinite(H).all() or not np.isfinite(g).all():
+        raise ValueError("marginalization rows must be finite")
+    m, r = np.asarray(eliminate_columns, int), np.asarray(retain_columns, int)
+    Hrr, gr = H[np.ix_(r, r)].copy(), g[r].copy()
+    if not len(m):
+        return Hrr, gr
+    Hmm, Hmr, gm = H[np.ix_(m, m)], H[np.ix_(m, r)], g[m]
+    scales, inactive, singular, vectors, _ = _scaled_normal_eigh(
+        Hmm, gm, lambda s: s <= np.finfo(float).eps * len(s) * max(float(s.max(initial=0.)), 1.))
+    active = singular > NORMAL_RANK_TOLERANCE * (singular[0] if len(singular) else 0.)
+    V = vectors[:, active]
+    rhs = np.column_stack((Hmr, gm)) / scales[:, None]
+    rhs[inactive] = 0.
+    solution = (V @ ((V.T @ rhs) / singular[active, None] ** 2)) / scales[:, None]
+    reduced = Hrr - Hmr.T @ solution[:, :-1]
+    return .5 * (reduced + reduced.T), gr - Hmr.T @ solution[:, -1]
+
+
 @dataclass
 class RetainedPrior:
     layout: VariableLayout

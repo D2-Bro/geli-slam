@@ -3,7 +3,6 @@ import pickle
 from bisect import bisect_left
 from collections import Counter
 from enum import Enum
-from time import monotonic
 
 import cv2
 import numpy as np
@@ -14,6 +13,7 @@ from normalflow.registration import LoseTrackError
 from normalflow.utils import Frame
 
 from gelslam.core.frame import create_frame_msg, create_keyframe_msg
+from gelslam.core.slam_packets import keyframe_update_row, readonly
 from gelslam.core.inertial import (
     ImuBuffer,
     ImuOutputCorrection,
@@ -28,17 +28,16 @@ from gelslam.core.numpy_vi import (
     DenseNormalResidual,
     NavigationState,
     normalflow_quality,
+    so3_exp,
 )
 from gelslam.core.gtsam_vi import create_frontend_solver, ImuPreintegrationAccumulator
-from gelslam.core.gt_state_diagnostic import (
-    GroundTruthImuStates, gt_state_test_needs_gt, resolve_gt_state_test,
-)
 from gelslam.core.imu_navigation import gelsight_pose, imu_pose
-from gelslam.core.marginal_prior import NavigationPrior
+from gelslam.core.imu_mount_calibration import require_resolved
 from gelslam.core.static_imu_initialization import (
     StaticImuInitializer, resolve_static_imu_config,
 )
 from gelslam.core.contact_velocity import ContactVelocityHistory
+from gelslam.core.imu_coupling import inflate_bias, make_coupling_schedule
 from gelslam.visualization.normal_correspondences import project_normal_correspondences
 
 
@@ -115,6 +114,7 @@ class Tracker:
         )
         self.imu_output_correction = ImuOutputCorrection.from_config(self.imu_config)
         self._recontact_imu_recovery_min_gap_s()  # Validate the recontact rule.
+        require_resolved(self.imu_config)
         self.gelsight_T_imu = self._parse_gelsight_T_imu(
             self.imu_config.get("gelsight_T_imu")
         )
@@ -127,7 +127,6 @@ class Tracker:
         )
         self._static_imu_collecting = True
         self._static_imu_collection_start = 0.0
-        self._imu_stream_start_time = None
         self._static_trial_seed = None
         self._static_imu_status_logged = None
         self._static_imu_contact_cutoff = None
@@ -150,33 +149,16 @@ class Tracker:
                     % (self._static_imu_settings["events_topic"],
                        "enabled" if self._static_imu_settings["motion_check"] else "disabled")
                 )
-            elif self._static_imu_settings["mode"] == "startup_duration":
-                self.logger.info(
-                    "IMU initialization uses the first %.3f s after the first accepted IMU measurement"
-                    % self._static_imu_settings["duration_s"]
-                )
+        self._imu_coupling = make_coupling_schedule(self.imu_config)
+        if self._imu_coupling is not None:
+            self.logger.info("Gradual frontend IMU coupling enabled: %s"
+                             % self._imu_coupling.settings)
         # Simulation-only GT samples can initialize each trial's gravity and,
         # when requested, the first trial's velocity.  GT poses are not factors.
         self.initial_ground_truth_world_R_gel = None
         self._ground_truth_gel_rotations = []
         self._ground_truth_gel_positions = []
         self._ground_truth_imu_positions = []
-        controls = resolve_gt_state_test(self.imu_config)
-        gt_test = controls['enabled']
-        if gt_test and not (self.imu_enabled
-                            and self.imu_config.get("frontend_optimization", False)
-                            and self.gelsight_T_imu is not None):
-            raise ValueError("GT previous-state test requires calibrated frontend VI")
-        self._gt_test_states = GroundTruthImuStates() if gt_state_test_needs_gt(controls) else None
-        self._gt_test_initial_state = None
-        self._gt_test_navigation_T_world = None
-        self._gt_test_last_image_timestamp = None
-        self._gt_test_previous_image_timestamp = None
-        self.latest_gt_state_test = None
-        if gt_test:
-            self.logger.warning(
-                "GT previous-state diagnostic controls: %s; bias remains estimated" % controls
-            )
         self._frontend_trial_start_timestamp = None
         self._trial_start_world_R_gel = None
         self.inertial_state = None
@@ -255,10 +237,14 @@ class Tracker:
             self._static_imu_initializer = StaticImuInitializer(settings, self.imu_config)
             self._static_imu_collection_start = timestamp
             initializer = self._static_imu_initializer
+        rest_events = getattr(self, "_recorded_rest_events", None)
+        # The operator repeated the rest before contact: discard the old interval.
+        if initializer.rest_sequence_replaced(rest_events):
+            self._static_imu_initializer = StaticImuInitializer(settings, self.imu_config)
+            initializer = self._static_imu_initializer
         initializer.observe(self.imu_buffer.samples_between(
             self._static_imu_collection_start, timestamp
-        ), stream_start_time=getattr(self, "_imu_stream_start_time", None),
-            rest_events=getattr(self, "_recorded_rest_events", None))
+        ), rest_events=rest_events)
 
     def add_rest_event(self, name, timestamp):
         """Record one operator rest event time in the selected IMU clock.
@@ -295,19 +281,62 @@ class Tracker:
         self._static_trial_seed = seed
         return True
 
-    def _make_frontend_solver(self, config):
+    def _make_frontend_solver(self, config, gravity=None):
         """Create the GTSAM frontend only when calibration is valid."""
         if not (
             bool(config.get("frontend_optimization", False))
             and self.gelsight_T_imu is not None
         ):
             return None
-        solver = create_frontend_solver(config)
-        if getattr(solver, "reference_marginalization", False):
-            self.logger.info("Frontend reference marginalization: retained 21D, solve 36D; "
-                             "first pose fixed: bootstrap 9D -> 24D solve -> 15D retained; "
-                             "later shared reference 30D solve; backend map only")
+        solver = self._attach_imu_coupling(create_frontend_solver(config, gravity=gravity))
+        self.logger.info("Frontend reference marginalization: retained 21D, solve 36D; "
+                         "first pose fixed: bootstrap 9D -> 24D solve -> 15D retained; "
+                         "later shared reference 30D solve; backend map only")
         return solver
+
+    def _attach_imu_coupling(self, solver):
+        """Share the tracker's staged-coupling schedule with an RM solver."""
+        schedule = getattr(self, "_imu_coupling", None)
+        if schedule is not None:
+            solver.coupling_schedule = schedule
+        return solver
+
+    def _start_imu_coupling(self, timestamp):
+        """Restart the attitude phase at a new trial's initialized contact state."""
+        schedule = getattr(self, "_imu_coupling", None)
+        if schedule is not None:
+            schedule.reset(timestamp)
+
+    def _after_frontend_commit(self, solver, timestamp, source):
+        """Check the coupling gate on the prior committed for the state at timestamp."""
+        schedule = getattr(self, "_imu_coupling", None)
+        if schedule is None or getattr(solver, "coupling_schedule", None) is not schedule:
+            return
+        prior = getattr(solver, "marginal_prior", None)
+        logger = getattr(self, "logger", None)
+        if prior is None:
+            return
+        try:
+            update = schedule.update(prior, timestamp)
+        except (ValueError, TypeError, np.linalg.LinAlgError) as error:
+            if logger is not None:
+                logger.warning("IMU coupling: sigma evaluation failed at %.6f (%s): %s"
+                               % (timestamp, source, error))
+            return
+        if update.reinflate:
+            settings = schedule.settings["bias_reinflation"]
+            solver.marginal_prior = inflate_bias(
+                prior, settings["accel_bias_sigma_mps2"], settings["gyro_bias_sigma_rps"])
+        if logger is None:
+            return
+        trial = getattr(self, "_trial_index", 0)
+        for event in update.events:
+            logger.info("IMU coupling trial %d: %s" % (trial, event))
+        logger.info(
+            "IMU coupling: t=%.6f trial=%d source=%s phase=%s c=%.6g sigma_v=%.6g "
+            "sigma_ba=%.6g sigma_bg=%.6g"
+            % (timestamp, trial, source, update.phase, update.scale, update.sigmas["velocity"],
+               update.sigmas["accel_bias"], update.sigmas["gyro_bias"]))
 
     def frontend_gravity_for_backend(self):
         """Return gravity in the public trial axes after VI initialization."""
@@ -510,79 +539,6 @@ class Tracker:
             velocity_world = (1 - fraction) * derivatives[0] + fraction * derivatives[1]
         return self.initial_ground_truth_world_R_gel.T @ velocity_world
 
-    def add_ground_truth_imu_pose(self, timestamp, world_R_imu, world_p_imu):
-        """Supply full GT IMU poses to the optional per-frame diagnostic."""
-        states = getattr(self, "_gt_test_states", None)
-        if states is not None and not states.add(timestamp, world_R_imu, world_p_imu):
-            return False
-        return self.add_ground_truth_imu_position(timestamp, world_p_imu)
-
-    def _set_gt_test_anchor(self):
-        if resolve_gt_state_test(self.imu_config)['enabled']:
-            self._gt_test_initial_state = self._frontend_vi_state.copy()
-            self._gt_test_navigation_T_world = None
-
-    def _gt_test_inputs(self, previous, previous_timestamp, reference_timestamp, reference_pose=None):
-        """Correct inputs in the fixed trial world, without using target GT."""
-        controls = resolve_gt_state_test(self.imu_config)
-        needs_previous = controls['previous_pose_from_gt'] or controls['previous_velocity_from_gt']
-        corrected = previous.copy()
-        if not gt_state_test_needs_gt(controls):
-            self.latest_gt_state_test = dict(
-                controls=controls, previous_timestamp=previous.timestamp,
-                reference_timestamp=reference_timestamp, prior_state_timestamp=previous.timestamp,
-                previous_pose=previous.pose.tolist(), previous_velocity=previous.velocity.tolist(),
-                visual_reference_pose=reference_pose.tolist(),
-            )
-            return corrected, reference_pose
-        states = getattr(self, "_gt_test_states", None)
-        anchor = getattr(self, "_gt_test_initial_state", None)
-        if states is None or anchor is None or (controls['reference_pose_from_gt'] and reference_timestamp is None):
-            raise RuntimeError("GT previous-state test lacks its trial anchor or visual reference time")
-        # The anchor can leave the bounded GT buffer during a long trial.
-        # Once fixed, the trial transform does not need the anchor samples again.
-        transform = self._gt_test_navigation_T_world
-        anchor_gt = states.at(anchor.timestamp) if transform is None else None
-        previous_gt = states.at(previous_timestamp) if needs_previous else None
-        reference_gt = states.at(reference_timestamp) if controls['reference_pose_from_gt'] else None
-        missing = []
-        if transform is None and anchor_gt is None:
-            missing.append('anchor %s' % anchor.timestamp)
-        if needs_previous and previous_gt is None:
-            missing.append('previous %s' % previous_timestamp)
-        if controls['reference_pose_from_gt'] and reference_gt is None:
-            missing.append('visual reference %s' % reference_timestamp)
-        if missing:
-            raise RuntimeError(
-                "GT previous-state test needs bracketing /ground_truth/imu_pose samples "
-                "for %s" % ', '.join(missing)
-            )
-        if transform is None:
-            transform = anchor.pose @ np.linalg.inv(anchor_gt[0])
-            self._gt_test_navigation_T_world = transform
-        if needs_previous:
-            if (abs(previous_timestamp - previous.timestamp) > 1e-9
-                    and not (controls['previous_pose_from_gt'] and controls['previous_velocity_from_gt'])):
-                raise RuntimeError(
-                    'Changing the previous IMU timestamp requires both GT pose and velocity; '
-                    'use previous_state_time: accepted_state for independent state ablations'
-                )
-            corrected.timestamp = previous_timestamp
-        if controls['previous_pose_from_gt']:
-            corrected.pose = transform @ previous_gt[0]
-        if controls['previous_velocity_from_gt']:
-            corrected.velocity = transform[:3, :3] @ previous_gt[1]
-        if controls['reference_pose_from_gt']:
-            reference_pose = gelsight_pose(transform @ reference_gt[0], self.gelsight_T_imu)
-        self.latest_gt_state_test = dict(
-            controls=controls, previous_timestamp=corrected.timestamp, reference_timestamp=reference_timestamp,
-            prior_state_timestamp=previous.timestamp,
-            previous_pose=corrected.pose.tolist(), previous_velocity=corrected.velocity.tolist(),
-            visual_reference_pose=reference_pose.tolist(),
-            accel_bias=corrected.accel_bias.tolist(), gyro_bias=corrected.gyro_bias.tolist(),
-        )
-        return corrected, reference_pose
-
     def _lock_gravity_to_first_trial(self, timestamp):
         """Freeze the GT attitude closest to the first trial anchor time."""
         if getattr(self, "initial_ground_truth_world_R_gel", None) is not None:
@@ -666,8 +622,6 @@ class Tracker:
             self.previous_tactile_header = getattr(self, "last_tactile_header", None)
         self.last_tactile_ref_T = pose
         self.last_tactile_header = header
-        self._last_tactile_frame = getattr(self, "prev_frame", None)
-        self._last_tactile_trial_pose = self.trial_T_ref @ pose
         self._contact_failure_since = None
         self._reference_is_imu_only = False
         # Contact acceptance clears the separate no-contact prediction. The
@@ -729,8 +683,7 @@ class Tracker:
                     )
         self._sync_reference_prior()
         history = getattr(self, "_contact_velocity_history", None)
-        if (history is not None and self._frontend_vi_state is not None
-                and not getattr(self.frontend_visual_inertial, "imu_prediction_only", False)):
+        if history is not None and self._frontend_vi_state is not None:
             samples = ()
             if (history.settings['model'] in {'inertial_quadratic', 'contact_kinematic'} and history.samples
                     and self.imu_buffer is not None
@@ -751,7 +704,7 @@ class Tracker:
         """Change visual reference only at a serialized accepted-state boundary."""
         solver = self.frontend_visual_inertial
         state = getattr(self, "_frontend_vi_state", None)
-        if not getattr(solver, "reference_marginalization", False) or state is None:
+        if solver is None or state is None:
             return
         timestamp = self._imu_timestamp(getattr(self, "ref_header", None))
         if timestamp is not None:
@@ -774,14 +727,14 @@ class Tracker:
             self.trial_T_ref = gelsight_pose(seed.state.pose, self.gelsight_T_imu)
             self.trial_T_ref[:3, 3] = 0.0
             self._trial_gravity_rotation = self.trial_T_ref[:3, :3].copy()
-            local_config = dict(self.imu_config, frontend_gravity_mps2=seed.gravity.tolist())
-            self.frontend_visual_inertial = self._make_frontend_solver(local_config)
+            self.frontend_visual_inertial = self._make_frontend_solver(
+                self.imu_config, gravity=seed.gravity)
             self.frontend_visual_inertial.marginal_prior = seed.prior
             self._frontend_vi_state = seed.state.copy()
+            self._start_imu_coupling(seed.state.timestamp)
             self._pending_frontend_initialization = None
             self._static_imu_collecting = False
             self._static_trial_seed = None
-            self._set_gt_test_anchor()
             self.logger.info(
                 "Static IMU trial %d: stationary anchor %.9f -> contact %.9f; "
                 "gravity in trial axes=%s; IMU-origin velocity=%s m/s; gyro bias=%s rad/s"
@@ -842,13 +795,8 @@ class Tracker:
                 self.imu_config.get("gravity_mps2", 9.81),
             )
         elif gravity_initialization == "fixed_world_z":
-            trial_gravity = np.asarray(
-                self.imu_config.get(
-                    "frontend_gravity_mps2",
-                    (0.0, 0.0, -float(self.imu_config.get("gravity_mps2", 9.81))),
-                ),
-                dtype=np.float64,
-            )
+            trial_gravity = np.array(
+                (0.0, 0.0, -float(self.imu_config.get("gravity_mps2", 9.81))), dtype=np.float64)
         else:
             raise ValueError(
                 "imu_config.frontend_gravity_initialization must be "
@@ -884,9 +832,9 @@ class Tracker:
         self._frontend_vi_state, trial_gravity, _ = self._align_initial_navigation(
             self._frontend_vi_state, trial_gravity,
         )
-        local_config = dict(self.imu_config, frontend_gravity_mps2=trial_gravity.tolist())
-        self.frontend_visual_inertial = self._make_frontend_solver(local_config)
-        self._set_gt_test_anchor()
+        self.frontend_visual_inertial = self._make_frontend_solver(
+            self.imu_config, gravity=trial_gravity)
+        self._start_imu_coupling(self._frontend_vi_state.timestamp)
         self._pending_frontend_initialization = None
         logger = getattr(self, "logger", None)
         if logger is not None:
@@ -988,12 +936,22 @@ class Tracker:
             if not is_new_trial and self.curr_kid in seeds:
                 anchor_kid = self.curr_kid
                 anchor_state = seeds[anchor_kid]
+            # K_k's re-estimate after its publication, relative to the basis sent
+            # as anchor_state. K_k stops being a reference at K_{k+1}.
+            estimates = getattr(self, "_keyframe_reference_estimates", {})
+            keyframe_update = (
+                keyframe_update_row(anchor_kid, anchor_state, estimates.get(anchor_kid))
+                if not is_new_trial and anchor_kid == self.curr_kid and anchor_state is not None
+                else [])
+            self._keyframe_reference_estimates = {
+                key: value for key, value in estimates.items() if key > self.curr_kid}
             if state is not None:
                 seeds[kid] = frozen_state(state)
             self._keyframe_seed_states = seeds
             message = replace(message, trial_id=getattr(self, "_trial_index", -1),
                               session_id=getattr(self, "_ros_session_id", ""),
                               anchor_kid=anchor_kid, anchor_state=anchor_state,
+                              keyframe_update=readonly(keyframe_update),
                               solution_revision=0 if snapshot is None else snapshot.revision)
         if timestamp is not None:
             self._last_keyframe_timestamp = timestamp
@@ -1008,20 +966,54 @@ class Tracker:
         self._published_keyframe_poses = published
         return message
 
+    def _record_reference_estimate(self, solver):
+        """Keep the frontend's latest estimate of the current reference keyframe K_k.
+
+        Reference marginalization re-estimates K_k's pose with each accepted frame;
+        a recovery reference also re-estimates its velocity and biases. The next
+        keyframe packet sends the change from K_k's anchor basis to this estimate,
+        and the backend applies it to K_k's stored seed.
+        """
+        from gelslam.core.shared_map import frozen_state
+        basis = getattr(self, "_keyframe_seed_states", {}).get(self.curr_kid)
+        if basis is None:
+            return
+        estimates = getattr(self, "_keyframe_reference_estimates", {})
+        state = getattr(solver, "last_reference_state", None)
+        if state is not None and abs(state.timestamp - basis.timestamp) < 1e-9:
+            estimate = state.copy()
+        else:
+            pose = getattr(solver, "last_reference_pose", None)
+            reference_id = getattr(solver, "reference_id", None)
+            if (pose is None or reference_id is None
+                    or abs(reference_id.timestamp - basis.timestamp) > 1e-9):
+                return
+            previous = estimates.get(self.curr_kid)
+            estimate = (previous if previous is not None else basis).copy()
+            estimate.pose = np.array(pose, dtype=np.float64, copy=True)
+        estimates[self.curr_kid] = frozen_state(estimate)
+        self._keyframe_reference_estimates = estimates
+
     def _make_frame_msg(self, frame, fid, ref_kid, ref_T_curr, header=None, **metadata):
         """Publish K_k -> F_j against K_k's transmitted, immutable pose.
 
         Reference marginalization can move the live frontend K_k estimate.
         Consumers still hold its original observation basis, so transport the
         relative pose without changing the accepted State or retained prior.
+        The frontend's K_k estimate at this frame, relative to the published
+        pose, travels with the frame: once K_k's keyframe_update reaches the
+        backend, the final evaluation re-resolves the frame on K_k's final pose.
         """
-        if getattr(self.frontend_visual_inertial, 'reference_marginalization', False):
+        published_T_ref_estimate = None
+        if self.frontend_visual_inertial is not None:
             published = getattr(self, '_published_keyframe_poses', {}).get(ref_kid)
             if published is not None and not np.array_equal(published, self.trial_T_ref):
                 ref_T_curr = np.linalg.solve(
                     published, self.trial_T_ref @ np.asarray(ref_T_curr))
+                published_T_ref_estimate = np.linalg.solve(published, self.trial_T_ref)
         return create_frame_msg(self.bridge, frame, fid=fid, ref_kid=ref_kid,
-                                ref_T_curr=ref_T_curr, header=header, **metadata)
+                                ref_T_curr=ref_T_curr, header=header,
+                                published_T_ref_estimate=published_T_ref_estimate, **metadata)
 
     def _keyframe_interval_s(self):
         value = self.track_config.get("keyframe_max_interval_s", 0.5)
@@ -1062,10 +1054,35 @@ class Tracker:
             return
         gap = current - previous
         if gap >= limit:
+            rotation = self._gap_rotation_deg(getattr(self, "prev_header", None), header)
             self.logger.info(
-                "%s -- Recontact after %.3f s without contact: skip cross-gap registration"
-                % (log_prefix, gap))
+                "%s -- Recontact after %.3f s without contact (IMU rotation %s): "
+                "skip cross-gap registration"
+                % (log_prefix, gap, "n/a" if rotation is None else "%.1f deg" % rotation))
             raise LoseTrackError("recontact_gap_%.3f_s_ge_recovery_limit" % gap)
+
+    def _gap_rotation_deg(self, previous_header, header):
+        """Gyro rotation angle over a no-contact gap, for the recontact log only.
+
+        The error a gap leaves grows with its duration and with the rotation
+        without contact (docs/recontact_gap_error_20261105.md). Bias from the
+        accepted frontend state; None when the IMU interval is not available.
+        """
+        start = self._imu_timestamp(previous_header)
+        end = self._imu_timestamp(header)
+        buffer = getattr(self, "imu_buffer", None)
+        if start is None or end is None or buffer is None or end <= start:
+            return None
+        samples = buffer.samples_covering(start, end)
+        if len(samples) < 2:
+            return None
+        state = getattr(self, "_frontend_vi_state", None)
+        bias = np.zeros(3) if state is None else np.asarray(state.gyro_bias, dtype=np.float64)
+        rotation = np.eye(3)
+        for first, second in zip(samples[:-1], samples[1:]):
+            rate = 0.5 * (np.asarray(first.angular_velocity) + np.asarray(second.angular_velocity)) - bias
+            rotation = rotation @ so3_exp(rate * (second.timestamp - first.timestamp))
+        return float(np.degrees(np.arccos(np.clip((np.trace(rotation) - 1.0) / 2.0, -1.0, 1.0))))
 
     def _maybe_add_timed_keyframe(self, frame, header, log_prefix, *, force=False):
         """Promote a valid contact target after the common keyframe deadline."""
@@ -1241,7 +1258,7 @@ class Tracker:
         if (not self.track_config.get("keep_imu_only_frames", False)
                 or self.curr_kid < 0 or getattr(self, "_restart_pending", False)):
             return None
-        previous, buffer, fixed_anchor = self._recovery_prediction_anchor()
+        previous, buffer = self._recovery_prediction_anchor()
         solver = self.frontend_visual_inertial
         timestamp = self._imu_timestamp(header)
         if (previous is None or solver is None or not self._imu_coasting_ready()
@@ -1255,8 +1272,7 @@ class Tracker:
             return None
         current, _ = prediction
         seed = getattr(self, "_coast_velocity_seed", None)
-        if (seed is not None and not fixed_anchor
-                and abs(seed.timestamp - previous.timestamp) < 1e-9):
+        if seed is not None and abs(seed.timestamp - previous.timestamp) < 1e-9:
             current = seed.apply(current)
         ref_T_current = (np.linalg.inv(self.trial_T_ref)
                          @ gelsight_pose(current.pose, self.gelsight_T_imu)).astype(np.float32)
@@ -1274,7 +1290,7 @@ class Tracker:
 
     def _recover_current_frame_with_imu(self, frame, header, log_prefix):
         """Make an IMU-predicted keyframe, inheriting any matching coast correction."""
-        previous, buffer, fixed_anchor = self._recovery_prediction_anchor()
+        previous, buffer = self._recovery_prediction_anchor()
         solver = self.frontend_visual_inertial
         timestamp = self._imu_timestamp(header)
         if not (
@@ -1314,10 +1330,9 @@ class Tracker:
             self._arm_restart(timestamp, missing_imu=True)
             return None
         current, pim = prediction
-        predicted_prior = solver.propagate_prior(previous, current, pim, fixed_anchor=fixed_anchor)
+        predicted_prior = solver.propagate_prior(previous, current, pim)
         seed = getattr(self, "_coast_velocity_seed", None)
-        if (seed is not None and not fixed_anchor
-                and abs(seed.timestamp - previous.timestamp) < 1e-9):
+        if seed is not None and abs(seed.timestamp - previous.timestamp) < 1e-9:
             # Propagate the original IMU distribution first, then push both
             # its target mean and correlated prior through the coast shift.
             # Applying the shift only to State leaves a prior that undoes it.
@@ -1342,7 +1357,7 @@ class Tracker:
         # Commit prediction uncertainty, never a rejected visual posterior.
         solver.discard_pending_prior()
         solver.marginal_prior = predicted_prior
-        self._backend_correction_anchor = None
+        self._after_frontend_commit(solver, current.timestamp, "imu_recovery")
         self._frontend_vi_state = current
         self._frontend_imu_preintegration = None
         self.curr_kid += 1
@@ -1424,8 +1439,6 @@ class Tracker:
             "low_scr_keyframes", "imu_recovery_keyframes",
             # Kept for log consumers; recovery alone no longer promotes a target.
             "recovered_contact_keyframes",
-            "imu_prediction_only_calls", "imu_prediction_only_accepted",
-            "imu_prediction_only_quality_rejected",
             # Legacy summary keys remain for log consumers; no path now
             # increments the removed tactile-only fallback counters.
             "normalflow_only_calls", "initial_shared_points_lt_10",
@@ -1456,142 +1469,20 @@ class Tracker:
         raise LoseTrackError("frontend tracking failed: " + reason)
 
     def apply_map_snapshot(self, snapshot, header):
-        """At the F_j boundary, read corrected K_k in this trial's axes.
+        """Keep the backend map snapshot for publication and seed rebasing.
 
-        Pure gravity-preserving frame corrections transport the retained prior.
-        Navigation updates require t_k -> t_j IMU for a fixed-K_k target solve.
+        Backend map estimates are correlated with these frontend measurements,
+        so they are not a second prior or an overwrite of a retained pose.
+        Returns False: the frontend state is never changed here.
         """
         self._tracking_map_snapshot = snapshot
-        if getattr(self.frontend_visual_inertial, "reference_marginalization", False):
-            # Backend map estimates remain available to publication and seed
-            # rebasing. They are correlated with these frontend measurements,
-            # so they are not a second prior or an overwrite of a retained pose.
-            self._tracking_anchor_kid = -1
-            self._tracking_anchor_state = None
-            self._backend_correction_anchor = None
-            return False
-        trial = getattr(self, "_trial_index", -1)
-        candidates = [packet for packet in snapshot.observations
-                      if packet.trial_id == trial and packet.kid <= self.curr_kid
-                      and packet.kid in snapshot.estimates
-                      and snapshot.estimates[packet.kid].state is not None]
         self._tracking_anchor_kid = -1
         self._tracking_anchor_state = None
-        if not candidates or self.frontend_visual_inertial is None:
-            return False
-        packet = candidates[-1]
-        estimate = snapshot.estimates[packet.kid]
-        self._tracking_anchor_kid = packet.kid
-        # This is the basis used by new seeds, not an additional measurement.
-        self._tracking_anchor_state = getattr(self, "_keyframe_seed_states", {}).get(packet.kid)
-        token = (snapshot.epoch, packet.kid, estimate.revision)
-        if token == getattr(self, "_backend_feedback_token", None):
-            return False
-        anchor = estimate.state
-        timestamp = self._imu_timestamp(header)
-        if timestamp is None or timestamp <= anchor.timestamp:
-            return False
-        basis = getattr(self, "_keyframe_seed_states", {}).get(packet.kid)
-        rigid_update = False
-        if basis is not None:
-            rotation = (anchor.pose @ np.linalg.inv(basis.pose))[:3, :3]
-            gravity = self.frontend_visual_inertial.gravity
-            rigid_update = (
-                np.allclose(anchor.velocity, rotation @ basis.velocity, rtol=0, atol=1e-10)
-                and np.allclose(anchor.accel_bias, basis.accel_bias, rtol=0, atol=1e-10)
-                and np.allclose(anchor.gyro_bias, basis.gyro_bias, rtol=0, atol=1e-10)
-                and np.allclose(rotation @ gravity, gravity, rtol=0, atol=1e-10))
-        global_navigation_update = not rigid_update
-        pgo_only = rigid_update
-        previous = getattr(self, "_frontend_vi_state", None)
-        if pgo_only:
-            if previous is None or previous.timestamp < anchor.timestamp:
-                return False
-        else:
-            buffer = getattr(self, "_backend_imu_buffer", None)
-            if buffer is None:
-                return False
-            samples = buffer.samples_covering(anchor.timestamp, timestamp)
-            max_gap = float(self.imu_config.get("backend_feedback_max_sample_gap_s", .05))
-            if len(samples) < 2 or np.any(np.diff([s.timestamp for s in samples]) > max_gap):
-                self._count_frontend_event("backend_feedback_interval_unavailable")
-                return False
-        ref = snapshot.estimates.get(self.curr_kid)
-        if ref is None:
-            return False
-        # An initial backend seed identical to the tracking anchor needs no reset.
-        old_anchor = getattr(self, "_backend_feedback_anchor", None)
-        basis = self._tracking_anchor_state
-        if basis is None and old_anchor is not None and old_anchor[0] == packet.kid:
-            basis = old_anchor[1]
-        # Compare with the seed actually sent for K_k, including its first
-        # feedback. Comparing only with a previous feedback treats an identity
-        # result as a correction and discards later tactile updates at F_i.
-        # Use the seed's calibrated pose, not a possibly float32 display pose.
-        unchanged = (basis is not None and abs(basis.timestamp - anchor.timestamp) < 1e-9
-                     and np.allclose(ref.trial_pose, gelsight_pose(basis.pose, self.gelsight_T_imu),
-                                     rtol=0, atol=1e-10)
-                     and all(np.allclose(getattr(basis, field), getattr(anchor, field),
-                                         rtol=0, atol=1e-10)
-                             for field in ('pose', 'velocity', 'accel_bias', 'gyro_bias')))
-        self._backend_feedback_token = token
-        self._backend_feedback_anchor = (packet.kid, anchor)
-        if unchanged:
-            self._count_frontend_event("backend_feedback_unchanged")
-            return False
-        reference_shift = ref.trial_pose @ np.linalg.inv(self.trial_T_ref)
-        last_tactile_pose = getattr(self, "_last_tactile_trial_pose", None)
-        if last_tactile_pose is not None:
-            self._last_tactile_trial_pose = reference_shift @ last_tactile_pose
-        self._tracking_anchor_state = anchor
-        self._keyframe_seed_states[packet.kid] = anchor
-        self.trial_T_ref = ref.trial_pose.copy()
-        self._backend_correction_anchor = None if pgo_only else anchor.copy()
-        self._backend_correction_is_global_navigation = global_navigation_update
-        self._backend_correction_trial = trial
-        self._clear_contact_velocity_history()
-        self._frontend_imu_preintegration = None
-        self._frontend_coast_state = None
-        # Preserve the accepted K_k -> F_i relative pose when K_k changes.
-        # This is a pose update, not IMU propagation of the accepted state.
-        # Pose and world velocity follow the correction; sensor biases stay in IMU axes.
-        # Pure frame feedback also transports F_i's retained uncertainty.
-        # Navigation feedback retains corrected K_k for the next fixed-anchor
-        # solve; its velocity/bias changes must not become a frame-only update.
-        if previous is not None and previous.timestamp >= anchor.timestamp:
-            corrected = previous.copy()
-            corrected.pose = reference_shift @ previous.pose
-            corrected.velocity = reference_shift[:3, :3] @ previous.velocity
-            if pgo_only or getattr(self, "_reference_is_imu_only", False):
-                # Transport retained covariance cross terms as well, including
-                # uncertain IMU-only references.
-                rotation, translation = reference_shift[:3, :3], reference_shift[:3, 3]
-                prior = self.frontend_visual_inertial.marginal_prior
-                if prior is not None and (pgo_only or prior.matches(previous)):
-                    self.frontend_visual_inertial.marginal_prior = prior.reframe(
-                        rotation, -rotation.T @ translation)
-            if pgo_only:
-                self.frontend_visual_inertial.discard_pending_prior()
-                self._count_frontend_event("backend_feedback_reframed")
-            self._frontend_vi_state = corrected
-            self.inertial_state = self.inertial_propagator = None
-            self._imu_integration_sample = None
-            self._coast_start_timestamp = None
-            self.ref_T_prev = (np.linalg.inv(self.trial_T_ref)
-                              @ gelsight_pose(corrected.pose, self.gelsight_T_imu)).astype(np.float32)
-        self.last_backend_feedback_delay_s = max(0., monotonic() - estimate.committed_at)
-        self._count_frontend_event("backend_feedback_applied")
-        return True
+        return False
 
     def _recovery_prediction_anchor(self):
-        anchor = getattr(self, "_backend_correction_anchor", None)
-        if (anchor is not None
-                and getattr(self, "_backend_correction_trial", None)
-                == getattr(self, "_trial_index", -1)
-                and (not getattr(self, "_reference_is_imu_only", False)
-                     or getattr(self, "_backend_correction_is_global_navigation", False))):
-            return anchor, self._backend_imu_buffer, True
-        return getattr(self, "_frontend_vi_state", None), self.imu_buffer, False
+        """Last accepted frontend state and the IMU buffer to predict from it."""
+        return getattr(self, "_frontend_vi_state", None), self.imu_buffer
 
     def _continuous_imu_samples(self, samples):
         limit = float(self.imu_config.get("max_sample_gap_s", np.inf))
@@ -1611,7 +1502,7 @@ class Tracker:
         if missing_imu and not self._restart_needs_static:
             from gelslam.core.static_imu_initialization import DEFAULTS
             settings = dict(DEFAULTS, **(getattr(self, "_static_imu_settings", None) or {}))
-            settings.update(mode="stationary_detection", start_time_s=None, end_time_s=None, duration_s=None,
+            settings.update(mode="stationary_detection", start_time_s=None, end_time_s=None,
                             motion_check=False)
             self._restart_initializer = StaticImuInitializer(settings, self.imu_config)
             self._restart_needs_static = True
@@ -1635,8 +1526,10 @@ class Tracker:
                     self.tracking_mode = TrackingMode.TACTILE_HOLD
                     return False, None
                 state, prior, gravity = seed.state, seed.prior, seed.gravity
+                # A new stationary seed discards the old bias information.
+                self._start_imu_coupling(state.timestamp)
             else:
-                previous, buffer, fixed_anchor = self._recovery_prediction_anchor()
+                previous, buffer = self._recovery_prediction_anchor()
                 samples = buffer.samples_covering(previous.timestamp, timestamp)
                 if not self._continuous_imu_samples(samples):
                     # A missing target endpoint can still arrive in the next callback.
@@ -1649,16 +1542,15 @@ class Tracker:
                 if predicted is None:
                     return False, None
                 state, pim = predicted
-                prior = solver.propagate_prior(previous, state, pim, fixed_anchor=fixed_anchor)
+                prior = solver.propagate_prior(previous, state, pim)
                 gravity = solver.gravity.copy()
                 origin = gelsight_pose(state.pose, self.gelsight_T_imu)[:3, 3]
                 state = state.reframe(np.eye(3), origin)
                 prior = prior.reframe(np.eye(3), origin)
-            staged_solver = create_frontend_solver(dict(
-                self.imu_config, frontend_gravity_mps2=gravity.tolist()))
+            staged_solver = self._attach_imu_coupling(
+                create_frontend_solver(self.imu_config, gravity=gravity))
             staged_solver.marginal_prior = prior
-            if getattr(staged_solver, "reference_marginalization", False):
-                staged_solver.set_reference(state.timestamp, state)
+            staged_solver.set_reference(state.timestamp, state)
             self._pending_segment_contact = (frame, header, self.curr_fid, state, staged_solver)
             self.tracking_mode = TrackingMode.REACQUIRE
             return False, None
@@ -1693,16 +1585,13 @@ class Tracker:
             staged_solver.discard_pending_prior()
             if timestamp - previous.timestamp >= float(self.track_config.get(
                     "contact_failure_keyframe_interval_s", 0.5)) - 1e-9:
-                if getattr(staged_solver, "reference_marginalization", False):
-                    # This reference has never been published as a trial's
-                    # first frame. Rebuild from the accepted old-trial prior
-                    # before choosing a different first-pose datum. Reusing
-                    # its already-conditioned candidate would accumulate hard
-                    # pose conditions from discarded bootstrap images.
-                    self._pending_segment_contact = None
-                    return self._restart_contact(frame, header)
-                staged_solver.marginal_prior = predicted_prior
-                self._pending_segment_contact = (frame, header, self.curr_fid, current, staged_solver)
+                # This reference has never been published as a trial's
+                # first frame. Rebuild from the accepted old-trial prior
+                # before choosing a different first-pose datum. Reusing
+                # its already-conditioned candidate would accumulate hard
+                # pose conditions from discarded bootstrap images.
+                self._pending_segment_contact = None
+                return self._restart_contact(frame, header)
             return False, None
         # Commit the new trial only now. No old-trial IMU or tactile edge crosses it.
         staged_solver.commit_marginal_prior(refined)
@@ -1711,12 +1600,11 @@ class Tracker:
         staged_solver.last_reference_state = staged_solver.last_reference_state.reframe(np.eye(3), origin)
         refined = refined.reframe(np.eye(3), origin)
         staged_solver.marginal_prior = staged_solver.marginal_prior.reframe(np.eye(3), origin)
+        self._after_frontend_commit(staged_solver, refined.timestamp, "restart")
         ref_pose = gelsight_pose(staged_solver.last_reference_state.pose, self.gelsight_T_imu)
         pose = gelsight_pose(refined.pose, self.gelsight_T_imu)
         self.frontend_visual_inertial = staged_solver
         self._trial_index = getattr(self, "_trial_index", -1) + 1
-        self._backend_correction_anchor = None
-        self._backend_feedback_token = None
         self._tracking_anchor_kid, self._tracking_anchor_state = -1, None
         self._frontend_trial_start_timestamp = self._camera_timestamp(ref_header)
         self._frontend_vi_state = staged_solver.last_reference_state
@@ -1743,39 +1631,16 @@ class Tracker:
         return True, (message, [first, second])
 
     def _track_contact(self, frame, header):
-        """Try each reference, including its seed retry; retain rejected anchors."""
-        try:
-            return self._refine_normalflow_with_imu(
-                self.ref_T_prev, header, self.ref_frame, frame)
-        except QualityGateError:
-            raise
-        except LoseTrackError as error:
-            if getattr(self.frontend_visual_inertial, "reference_marginalization", False):
-                # An alternate old tactile pose may no longer be retained.
-                # Use the normal IMU recovery/keyframe policy at this boundary.
-                raise
-            if any(reason in str(error) for reason in (
-                    "vi_unavailable", "imu_prediction_unavailable", "vi_refinement_failed_other")):
-                raise
-            reference = getattr(self, "_last_tactile_frame", self.prev_frame)
-            pose = getattr(self, "_last_tactile_trial_pose", None)
-            if pose is None and getattr(self, "last_tactile_ref_T", None) is not None:
-                pose = self.trial_T_ref @ self.last_tactile_ref_T
-            if reference is None or reference is self.ref_frame or pose is None:
-                raise
-            relative = self._refine_normalflow_with_imu(
-                (np.linalg.inv(pose) @ self.trial_T_ref @ self.ref_T_prev).astype(np.float32),
-                header, reference, frame, reference_pose=pose)
-            return (np.linalg.inv(self.trial_T_ref) @ pose @ relative).astype(np.float32)
+        """Track against the current reference; failures use the IMU recovery policy."""
+        return self._refine_normalflow_with_imu(self.ref_T_prev, header, self.ref_frame, frame)
 
     def _refine_normalflow_with_imu(self, ref_T_curr, header, reference_frame=None,
-                                    current_frame=None, reference_pose=None):
+                                    current_frame=None):
         """Solve NormalFlow rows and native GTSAM IMU residuals.
 
-        Pairwise mode fixes the visual reference. Reference marginalization
-        also optimizes it, aliasing its pose when it shares the previous time.
-        Prediction-only mode bypasses both the solve and SCR/CCS gate.
-        Only the VI optimization path uses visual quality for acceptance.
+        Reference marginalization optimizes the visual reference too, aliasing
+        its pose when it shares the previous time. Visual quality decides
+        acceptance.
         """
         self._count_frontend_event("refine_calls")
         self._quality_force_keyframe = False
@@ -1784,8 +1649,6 @@ class Tracker:
             if reference_frame is getattr(self, "ref_frame", None)
             else getattr(self, "prev_header", None)
         )
-        if reference_frame is not None and reference_frame is getattr(self, "_last_tactile_frame", None):
-            reference_header = self.last_tactile_header
         # Preserve this pair even if tracking later changes ref_frame or drops
         # the target. Do not draw a previous image's successful correspondences.
         self.latest_normal_correspondences = {
@@ -1795,10 +1658,7 @@ class Tracker:
             "reference_xy": np.empty((0, 2)), "current_xy": np.empty((0, 2)),
             "status": "Solve failed: no final pose",
         }
-        reference_pose = (
-            self.trial_T_ref if reference_pose is None
-            else np.asarray(reference_pose, dtype=np.float64)
-        )
+        reference_pose = self.trial_T_ref
         relative_pose = np.asarray(ref_T_curr, dtype=np.float64)
         if reference_pose.shape != (4, 4) or relative_pose.shape != (4, 4):
             raise ValueError("reference_pose and ref_T_curr must be 4x4 matrices")
@@ -1806,21 +1666,10 @@ class Tracker:
         solver = self.frontend_visual_inertial
         timestamp = self._imu_timestamp(header)
         previous = getattr(self, "_frontend_vi_state", None)
-        reference_marginalization = getattr(solver, "reference_marginalization", False)
-        if reference_marginalization and previous is not None:
+        if solver is not None and previous is not None:
             # The fallback reference is the last accepted state, so it is
             # still present. Remove the old reference instead of relabeling it.
             solver.set_reference(self._imu_timestamp(reference_header), previous)
-        correction_anchor = getattr(self, "_backend_correction_anchor", None)
-        if getattr(self, "_backend_correction_trial", None) != getattr(self, "_trial_index", -1):
-            correction_anchor = None
-        if (getattr(self, "_reference_is_imu_only", False)
-                and reference_frame is self.ref_frame and previous is not None
-                and self._imu_timestamp(reference_header) == previous.timestamp
-                and not getattr(self, "_backend_correction_is_global_navigation", False)):
-            correction_anchor = None
-        if correction_anchor is not None:
-            previous = correction_anchor
         if not (
             solver is not None
             and previous is not None
@@ -1832,25 +1681,7 @@ class Tracker:
             and current_frame is not None
         ):
             self._fail_frontend("vi_unavailable")
-        controls = resolve_gt_state_test(self.imu_config)
-        gt_test = controls['enabled']
-        if gt_test:
-            previous_timestamp = previous.timestamp
-            if (controls['previous_state_time'] == 'previous_image'
-                    and (controls['previous_pose_from_gt'] or controls['previous_velocity_from_gt'])):
-                previous_timestamp = getattr(self, "_gt_test_previous_image_timestamp", None) or previous.timestamp
-            previous, navigation_reference_pose = self._gt_test_inputs(
-                previous, previous_timestamp, self._imu_timestamp(reference_header), navigation_reference_pose,
-            )
-            if previous.timestamp >= timestamp:
-                raise RuntimeError("GT previous-state test requires an earlier input image")
-            self._frontend_vi_state = previous
-            if controls['reset_marginal_prior']:
-                solver.marginal_prior = None
-                solver.discard_pending_prior()
-            self._count_frontend_event("gt_previous_state_resets")
-        interval_buffer = self._backend_imu_buffer if correction_anchor is not None else self.imu_buffer
-        samples = interval_buffer.samples_covering(previous.timestamp, timestamp)
+        samples = self.imu_buffer.samples_covering(previous.timestamp, timestamp)
         if len(samples) >= 2 and not self._continuous_imu_samples(samples):
             self._arm_restart(timestamp, missing_imu=True)
             self._fail_frontend("imu_prediction_unavailable")
@@ -1866,39 +1697,26 @@ class Tracker:
         imu_predicted = (solver.predict_preintegrated(
             previous, preintegrated, timestamp, force=True)[0]
             if hasattr(solver, "predict_preintegrated") else current)
-        predicted_prior = (solver.propagate_prior(
-            previous, imu_predicted, preintegrated, fixed_anchor=correction_anchor is not None)
+        predicted_prior = (solver.propagate_prior(previous, imu_predicted, preintegrated)
                            if hasattr(solver, "propagate_prior") else None)
-        if gt_test:
-            self.latest_gt_state_test.update(
-                target_timestamp=timestamp, predicted_pose=current.pose.tolist(),
-                predicted_velocity=current.velocity.tolist(),
-            )
-        prediction_only = getattr(solver, "imu_prediction_only", False)
-        visual = (None if prediction_only else DenseNormalResidual(
+        visual = DenseNormalResidual(
             reference_frame, current_frame, self.ppmm,
             navigation_reference_pose, gelsight_pose(current.pose, self.gelsight_T_imu),
             max_samples=int(self.imu_config.get("dense_normalflow_samples", 3000)),
             residual_space=self.imu_config.get("dense_normalflow_residual_space", "vector"),
-        ))
-        self._count_frontend_event(
-            "imu_prediction_only_calls" if prediction_only else "vi_solve_calls"
         )
-        refine = solver.refine_from_keyframe if correction_anchor is not None else solver.refine_current
+        self._count_frontend_event("vi_solve_calls")
+        refine = solver.refine_current
         variable_reference = (
             getattr(self, "_reference_is_imu_only", False)
             and reference_frame is self.ref_frame
-            and self._imu_timestamp(reference_header) == previous.timestamp
-            and correction_anchor is None)
-        if variable_reference and not reference_marginalization:
-            refine = solver.refine_recovery_reference
+            and self._imu_timestamp(reference_header) == previous.timestamp)
         refined = refine(
             visual, navigation_reference_pose, previous, current, samples,
             self.gelsight_T_imu, preintegrated=preintegrated,
         )
         previous_state_retry = (
-            not prediction_only
-            and getattr(solver, "initialize_from_imu_preintegration", True)
+            getattr(solver, "initialize_from_imu_preintegration", True)
             and refined is None
             and getattr(solver, "last_refinement_failure", None)
             == "initial_shared_points_lt_10"
@@ -1928,8 +1746,6 @@ class Tracker:
                 visual, navigation_reference_pose, previous, current, samples,
                 self.gelsight_T_imu, preintegrated=preintegrated,
             )
-        if gt_test:
-            self.latest_gt_state_test['prior_source'] = getattr(solver, 'last_prior_source', None)
         if refined is None:
             reason = (
                 "initial_shared_points_lt_10"
@@ -1942,95 +1758,74 @@ class Tracker:
                 refined.pose, refined.velocity, refined.accel_bias, refined.gyro_bias)):
             self._fail_frontend("vi_refinement_failed_other")
         refined_pose = gelsight_pose(refined.pose, self.gelsight_T_imu)
-        if variable_reference or reference_marginalization:
-            navigation_reference_pose = gelsight_pose(
-                solver.last_reference_pose if reference_marginalization
-                else solver.last_reference_state.pose, self.gelsight_T_imu)
-        if gt_test:
-            self.latest_gt_state_test.update(
-                optimized_pose=refined.pose.tolist(), optimized_velocity=refined.velocity.tolist(),
-            )
-        if prediction_only:
-            # This diagnostic mode measures the uncorrected IMU trajectory.
-            # Do not let visual quality or overlap change State acceptance.
-            self.latest_normal_correspondences["status"] = (
-                "IMU prediction pose: accepted; SCR/CCS skipped"
-            )
-        else:
-            # The quality gate projects reference pixels into the current image.
-            scr, ccs = normalflow_quality(
-                reference_frame,
-                current_frame,
-                np.linalg.inv(refined_pose) @ navigation_reference_pose,
-                self.ppmm,
-                int(self.imu_config.get("dense_normalflow_quality_samples", 3000)),
-            )
-            finite = all(np.all(np.isfinite(value)) for value in (
-                refined.pose, refined.velocity, refined.accel_bias, refined.gyro_bias,
-                [scr, ccs]))
-            distance = (solver.prediction_pose_distance(imu_predicted, refined, predicted_prior)
-                        if finite and predicted_prior is not None else 0.0)
-            consistent = np.isfinite(distance) and distance <= 22.46
-            quality_failed = (not finite or not consistent
-                              or ccs < float(self.track_config["ccs_threshold"]))
-            self._quality_force_keyframe = (
-                not quality_failed and scr < float(self.track_config["scr_threshold"]))
-            self._record_normal_correspondences(
-                reference_frame, current_frame, np.linalg.inv(navigation_reference_pose) @ refined_pose,
-                "VI final pose: "
-                + ("quality rejected" if quality_failed else "accepted"),
-                visual=visual, reference_pose=navigation_reference_pose,
-                target_pose=refined_pose,
-            )
-            if quality_failed:
-                self._count_frontend_event("vi_quality_rejected")
-                self.logger.info(
-                    "Dense normal-flow quality failed: scr=%.3f (min %.3f), "
-                    "ccs=%.3f (min %.3f), IMU pose distance=%.6f (max 22.46)"
-                    % (
-                        scr,
-                        float(self.track_config["scr_threshold"]),
-                        ccs,
-                        float(self.track_config["ccs_threshold"]),
-                        distance,
-                    )
+        navigation_reference_pose = gelsight_pose(solver.last_reference_pose, self.gelsight_T_imu)
+        # The quality gate projects reference pixels into the current image.
+        scr, ccs = normalflow_quality(
+            reference_frame,
+            current_frame,
+            np.linalg.inv(refined_pose) @ navigation_reference_pose,
+            self.ppmm,
+            int(self.imu_config.get("dense_normalflow_quality_samples", 3000)),
+        )
+        finite = all(np.all(np.isfinite(value)) for value in (
+            refined.pose, refined.velocity, refined.accel_bias, refined.gyro_bias,
+            [scr, ccs]))
+        distance = (solver.prediction_pose_distance(imu_predicted, refined, predicted_prior)
+                    if finite and predicted_prior is not None else 0.0)
+        consistent = np.isfinite(distance) and distance <= 22.46
+        quality_failed = (not finite or not consistent
+                          or ccs < float(self.track_config["ccs_threshold"]))
+        self._quality_force_keyframe = (
+            not quality_failed and scr < float(self.track_config["scr_threshold"]))
+        self._record_normal_correspondences(
+            reference_frame, current_frame, np.linalg.inv(navigation_reference_pose) @ refined_pose,
+            "VI final pose: "
+            + ("quality rejected" if quality_failed else "accepted"),
+            visual=visual, reference_pose=navigation_reference_pose,
+            target_pose=refined_pose,
+        )
+        if quality_failed:
+            self._count_frontend_event("vi_quality_rejected")
+            self.logger.info(
+                "Dense normal-flow quality failed: scr=%.3f (min %.3f), "
+                "ccs=%.3f (min %.3f), IMU pose distance=%.6f (max 22.46)"
+                % (
+                    scr,
+                    float(self.track_config["scr_threshold"]),
+                    ccs,
+                    float(self.track_config["ccs_threshold"]),
+                    distance,
                 )
-                trial_T_curr = refined_pose
-                if hasattr(solver, "discard_pending_prior"):
-                    solver.discard_pending_prior()
-                if not np.all(np.isfinite(trial_T_curr)):
-                    raise LoseTrackError("dense normal-flow pose is not finite")
-                raise QualityGateError(
-                    trial_T_curr, refined, scr=scr, ccs=ccs,
-                    reason="nonfinite" if not finite else
-                    "imu_inconsistent" if not consistent else "ccs_below_threshold")
+            )
+            trial_T_curr = refined_pose
+            if hasattr(solver, "discard_pending_prior"):
+                solver.discard_pending_prior()
+            if not np.all(np.isfinite(trial_T_curr)):
+                raise LoseTrackError("dense normal-flow pose is not finite")
+            raise QualityGateError(
+                trial_T_curr, refined, scr=scr, ccs=ccs,
+                reason="nonfinite" if not finite else
+                "imu_inconsistent" if not consistent else "ccs_below_threshold")
         if hasattr(solver, "commit_marginal_prior"):
             solver.commit_marginal_prior(refined)
-        if reference_marginalization and reference_frame is self.ref_frame:
+            self._after_frontend_commit(solver, refined.timestamp, "contact")
+        if reference_frame is self.ref_frame:
             # Preserve even the original GelSight matrix's origin roundoff
             # while the exact first-contact datum is the visual reference.
             if solver.reference_id != solver.first_pose_id:
                 self.trial_T_ref = navigation_reference_pose.copy()
-            reference_pose = self.trial_T_ref
-        elif variable_reference:
-            # Recovery acceptance can keep this keyframe as the visual reference.
-            # Use the endpoint that passed quality checks for subsequent tracking.
-            self.trial_T_ref = navigation_reference_pose.copy()
+                self._record_reference_estimate(solver)
             reference_pose = self.trial_T_ref
         if variable_reference:
-            # The pair was validated at the optimized reference endpoint.
-            # Send that basis when initializing its successor in local VI.
-            from gelslam.core.shared_map import frozen_state
-            seeds = getattr(self, "_keyframe_seed_states", {})
-            seeds[self.curr_kid] = frozen_state(solver.last_reference_state)
-            self._keyframe_seed_states = seeds
-        self._count_frontend_event(
-            "imu_prediction_only_accepted" if prediction_only else "vi_accepted"
-        )
+            # The pair was validated at the optimized reference endpoint. Keep
+            # that full state as K_k's current estimate. The anchor basis in
+            # _keyframe_seed_states stays the state that the backend stores
+            # for K_k; the next keyframe packet sends the change between them.
+            self._record_reference_estimate(solver)
+        self._count_frontend_event("vi_accepted")
         if previous_state_retry:
             self._count_frontend_event("previous_state_retry_accepted")
-        if correction_anchor is not None or variable_reference:
-            self._backend_correction_anchor = None
+        if variable_reference:
             self._count_frontend_event("backend_feedback_target_accepted")
         self._frontend_vi_state = refined
         self._frontend_imu_preintegration = None
@@ -2185,7 +1980,6 @@ class Tracker:
         sample are available.
         """
         timestamp = self._imu_timestamp(header)
-        camera_timestamp = self._camera_timestamp(header)
         if not self._imu_coasting_ready() or timestamp is None:
             return False
         sample = self.imu_buffer.sample_at(timestamp)
@@ -2239,61 +2033,14 @@ class Tracker:
         )
         self._imu_integration_sample = sample
         gravity_magnitude = float(self.imu_config.get("gravity_mps2", 9.81))
-        gravity_initialization = str(
-            self.imu_config.get("gravity_initialization", "measured_acceleration")
-        )
-        if gravity_initialization == "fixed_world_z":
-            gravity = self.trial_T_ref[:3, :3].T @ np.array(
-                [0.0, 0.0, -gravity_magnitude]
-            )
-        elif gravity_initialization in {
-            "ground_truth_initial_pose", "ground_truth_gel_pose"
-        }:
-            anchor_timestamp = (
-                getattr(self, "_frontend_trial_start_timestamp", None)
-                or camera_timestamp
-            )
-            world_R_gel = self._trial_initial_gt_rotation(anchor_timestamp)
-            if world_R_gel is None:
-                self.inertial_state = None
-                return False
-            # Propagation uses the current reference keyframe as its local
-            # world.  Convert trial gravity into those reference axes.
-            trial_gravity = gravity_from_initial_world_R_gel(
-                world_R_gel, gravity_magnitude
-            )
-            gravity = self.trial_T_ref[:3, :3].T @ trial_gravity
-        elif gravity_initialization == "measured_acceleration":
-            gravity_window_s = float(
-                self.imu_config.get("gravity_initialization_window_s", 0.0)
-            )
-            samples = ()
-            if gravity_window_s > 0.0 and len(self.imu_buffer):
-                buffered_samples = self.imu_buffer.samples_between(0.0, timestamp)
-                first_timestamp = buffered_samples[0].timestamp
-                samples = self.imu_buffer.samples_between(
-                    first_timestamp,
-                    min(first_timestamp + gravity_window_s, timestamp),
-                )
-            measured_acceleration = (
-                np.mean([item.acceleration for item in samples], axis=0)
-                if samples
-                else sample.acceleration
-            )
-            measured_gravity = ref_T_imu[:3, :3] @ (
-                measured_acceleration - accel_bias
-            )
-            norm = np.linalg.norm(measured_gravity)
-            if norm <= 1e-9:
-                self.inertial_state = None
-                return False
-            gravity = -gravity_magnitude * measured_gravity / norm
-        else:
-            raise ValueError(
-                "imu_config.gravity_initialization must be "
-                "'measured_acceleration', 'fixed_world_z', or "
-                "'ground_truth_initial_pose'"
-            )
+        # Legacy propagation (frontend VI off): gravity from this sample's
+        # measured acceleration, expressed in the reference keyframe axes.
+        measured_gravity = ref_T_imu[:3, :3] @ (sample.acceleration - accel_bias)
+        norm = np.linalg.norm(measured_gravity)
+        if norm <= 1e-9:
+            self.inertial_state = None
+            return False
+        gravity = -gravity_magnitude * measured_gravity / norm
         self.inertial_propagator = InertialPropagator(gravity)
         # From here the image callback consumes each IMU sample once.  The
         # buffer keeps only the boundary sample and future measurements,
@@ -2433,8 +2180,6 @@ class Tracker:
             self.imu_buffer.add(sample)
         except ValueError:
             return False
-        if getattr(self, "_imu_stream_start_time", None) is None:
-            self._imu_stream_start_time = sample.timestamp
         # Frontend coasting prunes its own buffer. Preserve the independent
         # keyframe-to-keyframe interval until it has been serialized.
         if getattr(self, "_backend_imu_buffer", None) is None:
@@ -2468,8 +2213,7 @@ class Tracker:
         self._tracking_map_snapshot = None
         self._tracking_anchor_state = None
         self._keyframe_seed_states = {}
-        self._backend_correction_anchor = None
-        self._backend_feedback_anchor = None
+        self._keyframe_reference_estimates = {}
         self.logger = None
         self.bridge = None
         self.recon = None
@@ -2558,14 +2302,13 @@ class Tracker:
         )
         instance._static_imu_collecting = instance.curr_kid < 0
         instance._static_imu_collection_start = 0.0
-        if not hasattr(instance, "_imu_stream_start_time"):
-            instance._imu_stream_start_time = None
         if not hasattr(instance, "_recorded_rest_events"):
             instance._recorded_rest_events = None
         instance._static_trial_seed = None
         instance._static_imu_status_logged = None
         instance._static_imu_contact_cutoff = None
         instance._contact_velocity_history = ContactVelocityHistory.from_config(instance.imu_config)
+        instance._imu_coupling = make_coupling_schedule(instance.imu_config)
         instance._coast_velocity_seed = None
         instance._coast_velocity_anchor_timestamp = None
         instance.latest_coast_velocity_fit = None
@@ -2606,11 +2349,6 @@ class Tracker:
         if solver is not None:
             # Legacy files retain rows/RHS. Keep their anchor and information,
             # but apply the current zero-gradient stored-prior convention.
-            prior = getattr(solver, "marginal_prior", None)
-            if prior is not None and not getattr(solver, "reference_marginalization", False):
-                solver.marginal_prior = NavigationPrior.from_information(
-                    prior.anchor, prior.A.T @ prior.A
-                )
             solver.pending_marginal_prior = None
         if not hasattr(instance, "_frontend_vi_state"):
             instance._frontend_vi_state = None
@@ -2647,11 +2385,6 @@ class Tracker:
 
         self.latest_normal_correspondences = None
         self._frontend_frame_prediction = None
-        if resolve_gt_state_test(self.imu_config)['enabled']:
-            timestamp = self._imu_timestamp(header)
-            self._gt_test_previous_image_timestamp = self._gt_test_last_image_timestamp
-            self._gt_test_last_image_timestamp = timestamp
-            self.latest_gt_state_test = None
         if len(self.bg_images) < 10:
             self._observe_static_imu(header)
             # Collect background images

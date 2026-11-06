@@ -6,7 +6,7 @@ import pytest
 
 import gelslam.core.tracker as tm
 from gelslam.core.gtsam_vi import (
-    GtsamVisualInertialSolver, _bias_factor, _imu_factor, create_frontend_solver,
+    _bias_factor, _imu_factor, create_frontend_solver,
     navigation_factor_terms,
 )
 from gelslam.core.inertial import ImuSample
@@ -75,16 +75,13 @@ def reject_contact(*_args, **_kwargs):
 
 
 @pytest.mark.parametrize("initialize_from_imu", [False, True])
-@pytest.mark.parametrize("state_mode", ["pairwise", "reference_marginalization"])
 @pytest.mark.parametrize("scr,target_time,keyframes", [
     (.9, 1.24, 0), (.29, 1.24, 1), (.9, 1.70, 1),
 ])
 def test_recontact_without_shared_points_recovers_immediately_then_tracks(
-        monkeypatch, initialize_from_imu, state_mode, scr, target_time, keyframes):
+        monkeypatch, initialize_from_imu, scr, target_time, keyframes):
     tracker, anchor = tracker_with_imu(monkeypatch)
-    tracker.imu_config["frontend_state_mode"] = state_mode
     solver = create_frontend_solver(dict(
-        frontend_state_mode=state_mode,
         frontend_initialize_from_imu_preintegration=initialize_from_imu,
     ))
     tracker.frontend_visual_inertial = solver
@@ -144,10 +141,9 @@ def test_recontact_without_shared_points_recovers_immediately_then_tracks(
         assert tracker.curr_kid == message["ref_kid"] == recovery_kid
         assert tracker.ref_header is recovery_header
         assert solver.marginal_prior.matches(tracker._frontend_vi_state)
-        if state_mode == "reference_marginalization":
-            assert solver.reference_id.timestamp == pytest.approx(1.20)
-            assert solver.last_problem["solve_dimension"] == 36
-            assert solver.marginal_prior.layout.dimension == 21
+        assert solver.reference_id.timestamp == pytest.approx(1.20)
+        assert solver.last_problem["solve_dimension"] == 36
+        assert solver.marginal_prior.layout.dimension == 21
 
 
 def test_recontact_quality_rejection_does_not_start_a_new_half_second_wait(monkeypatch):
@@ -302,7 +298,7 @@ def test_real_imu_gap_requests_new_stationary_window_not_startup_interval(monkey
 
 
 def test_propagated_prior_matches_full_joint_gaussian_mean_and_covariance():
-    solver = GtsamVisualInertialSolver({
+    solver = create_frontend_solver({
         "accelerometer_noise_density": .8, "gyroscope_noise_density": .6,
         "accelerometer_bias_random_walk": .5, "gyroscope_bias_random_walk": .4,
         "gtsam_integration_sigma_m": .1,
@@ -311,23 +307,31 @@ def test_propagated_prior_matches_full_joint_gaussian_mean_and_covariance():
     rng = np.random.default_rng(25)
     A = np.eye(15) * 3 + rng.normal(0, .1, (15, 15))
     rhs = rng.normal(0, .02, 15)
-    solver.marginal_prior = original = NavigationPrior(previous.copy(), A, rhs)
+    solver.marginal_prior = NavigationPrior(previous.copy(), A, rhs)
+    solver.set_reference(previous.timestamp, previous)
+    accepted = solver.marginal_prior
     samples = [ImuSample(t, (0, 0, 9.81), (0, 0, 0)) for t in (1., 1.1)]
     current, pim = solver.predict_current(previous, samples, np.eye(4), force=True)
     propagated = solver.propagate_prior(previous, current, pim)
-    factors = [_imu_factor(pim), _bias_factor(pim, solver.config)]
-    rows = [navigation_factor_terms(f, previous, current) for f in factors]
-    joint = np.vstack([np.column_stack((A, np.zeros_like(A)))] +
-                      [np.column_stack((left, right)) for left, right, _ in rows])
+    # The first trial pose is the exact datum and also the reference. Condition
+    # on it (drop its columns at the anchor value), then marginalize the
+    # previous velocity and biases. The target State keeps all 15 columns.
+    assert [b.timestamp for b in propagated.layout.blocks] == [current.timestamp] * 4
+    factors = zip((_imu_factor(pim), _bias_factor(pim, solver.config)),
+                  solver.inertial_scales(), strict=True)
+    rows = [tuple(scale * term for term in navigation_factor_terms(f, previous, current))
+            for f, scale in factors]
+    joint = np.vstack([np.column_stack((A[:, 6:], np.zeros((15, 15))))] +
+                      [np.column_stack((left[:, 6:], right)) for left, right, _ in rows])
     target = np.concatenate([rhs] + [row[2] for row in rows])
     joint_mean = np.linalg.lstsq(joint, target, rcond=None)[0]
     joint_covariance = np.linalg.inv(joint.T @ joint)
     np.testing.assert_allclose(
-        np.linalg.solve(propagated.A.T @ propagated.A, propagated.A.T @ propagated.rhs),
-        joint_mean[15:], rtol=1e-7, atol=1e-9)
-    np.testing.assert_allclose(np.linalg.inv(propagated.A.T @ propagated.A),
-                               joint_covariance[15:, 15:], rtol=1e-7, atol=1e-9)
-    assert solver.marginal_prior is original
+        np.linalg.solve(propagated.information, propagated.A.T @ propagated.rhs),
+        joint_mean[9:], rtol=1e-7, atol=1e-9)
+    np.testing.assert_allclose(np.linalg.inv(propagated.information),
+                               joint_covariance[9:, 9:], rtol=1e-7, atol=1e-9)
+    assert solver.marginal_prior is accepted
     assert np.linalg.norm(propagated.rhs) > 0
 
 
@@ -347,63 +351,6 @@ def test_frame_status_survives_ros_serialization():
     restored = deserialize_message(serialize_message(to_ros(packet, CvBridge())), FrameMsg)
     assert restored.tracking_status == "imu_only" and not restored.pose_valid
     assert restored.pose_timestamp == 1.99 and restored.header.stamp.sec == 2
-
-
-def test_feedback_transports_imu_reference_prior_and_keeps_reference_variable(monkeypatch):
-    from time import monotonic
-    from scipy.spatial.transform import Rotation
-    tracker, initial = tracker_with_imu(monkeypatch)
-    solver = tracker.frontend_visual_inertial
-    tracker._reference_is_imu_only = True
-    tracker._last_tactile_trial_pose = initial.pose.copy()
-    tracker._backend_imu_buffer = tracker.imu_buffer
-    tracker._keyframe_seed_states = {tracker.curr_kid: initial.copy()}
-    prior = solver.marginal_prior
-    prior.rhs[:] = np.linspace(-.01, .01, len(prior.rhs))
-    correction = np.eye(4)
-    correction[:3, :3] = Rotation.from_euler("z", .1).as_matrix()
-    correction[:3, 3] = (.01, .02, 0)
-    corrected = initial.reframe(correction[:3, :3], -correction[:3, :3].T @ correction[:3, 3])
-    packet = SimpleNamespace(kid=tracker.curr_kid, trial_id=7)
-    estimate = SimpleNamespace(state=corrected, revision=1, trial_pose=corrected.pose,
-                               committed_at=monotonic())
-    snapshot = SimpleNamespace(epoch=0, observations=[packet], estimates={packet.kid: estimate}, revision=1)
-    assert tracker.apply_map_snapshot(snapshot, header(1.04))
-    assert solver.marginal_prior.matches(tracker._frontend_vi_state)
-    np.testing.assert_allclose(tracker._last_tactile_trial_pose, corrected.pose)
-    np.testing.assert_array_equal(solver.marginal_prior.rhs, prior.rhs)
-    np.testing.assert_allclose(tracker._frontend_vi_state.velocity, corrected.velocity)
-    monkeypatch.setattr(tm, "normalflow_quality", lambda *a: (.9, .9))
-    tracker._refine_normalflow_with_imu(np.eye(4), header(1.04), tracker.ref_frame, tracker.prev_frame)
-    assert solver.last_prior_source == "propagated_recovery_reference"
-    assert tracker._backend_correction_anchor is None
-    # The next packet must describe the reference endpoint used to validate
-    # this pair, including its optimized velocity and biases.
-    basis = tracker._keyframe_seed_states[tracker.curr_kid]
-    for field in ("pose", "velocity", "accel_bias", "gyro_bias"):
-        np.testing.assert_array_equal(getattr(basis, field),
-                                      getattr(solver.last_reference_state, field))
-    assert basis is not solver.last_reference_state
-
-
-def test_imu_recovery_uses_pending_backend_anchor_without_stale_visual_prior(monkeypatch):
-    tracker, initial = tracker_with_imu(monkeypatch)
-    solver = tracker.frontend_visual_inertial
-    samples = tracker.imu_buffer.samples_covering(1., 1.1)
-    accepted, pim = solver.predict_current(initial, samples, np.eye(4))
-    solver.marginal_prior = solver.propagate_prior(initial, accepted, pim)
-    tracker._frontend_vi_state = accepted
-    anchor = initial.copy()
-    anchor.pose[0, 3] += .02
-    tracker._backend_correction_anchor = anchor
-    tracker._backend_correction_trial = 7
-    tracker._backend_imu_buffer = tracker.imu_buffer
-    samples = tracker.imu_buffer.samples_covering(1., 1.54)
-    expected, _ = solver.predict_current(anchor, samples, np.eye(4), force=True)
-    assert tracker._recover_current_frame_with_imu(tracker.prev_frame, header(1.54), "test")[0]
-    np.testing.assert_allclose(tracker._frontend_vi_state.pose, expected.pose)
-    assert solver.marginal_prior.matches(tracker._frontend_vi_state)
-    assert tracker._backend_correction_anchor is None
 
 
 def test_backend_trajectory_uses_actual_pose_timestamp_and_skips_invalid_pose():

@@ -24,15 +24,6 @@ device_config:
 imu_config:
   # Reject discontinuous IMU intervals before contact optimization or recovery.
   max_sample_gap_s: 0.05
-  # Requires GT IMU PoseStamped input and calibrated frontend VI.
-  frontend_gt_previous_state_test:
-    enabled: false
-    previous_pose_from_gt: true
-    previous_velocity_from_gt: true
-    reference_pose_from_gt: true
-    reset_marginal_prior: true
-    # Keep pose/velocity at one time when toggling either GT input independently.
-    previous_state_time: accepted_state
   # The calibrated VI world always uses gravity along -Z and zero first-contact position.
   # Opt-in stationary initialization before the first contact of each trial.
   # Overrides GT/fixed gravity and GT velocity initialization while enabled.
@@ -49,9 +40,8 @@ imu_config:
     max_sample_gap_s: 0.05
     max_propagation_s: 5.0
     velocity_sigma_mps: 0.01
-  # "recorded_source" requires recorded_source_bag_path and paired timing topics.
+  # "recorded_source" requires the paired source timing topics.
   timestamp_source: "header"
-  recorded_source_bag_path: null
   # Positive relative objective weights for the joint frontend solve.
   dense_normalflow_residual_weight: 1.0
   # Huber threshold for each scaled three-component normal residual; 0 disables it.
@@ -63,8 +53,11 @@ imu_config:
   # Sigma of the mean measurement in metres (initial value: 0.1 mm).
   # Do not divide by sqrt(pixel count): integrated height errors are correlated.
   gtsam_vi_height_z_sigma_m: 0.0001
-  # Shared objective weight for the separate 9D IMU and 6D bias factors.
+  # Objective weight of the 9D IMU preintegration factor.
   imu_residual_weight: 1.0
+  # Objective weight of the 6D bias random-walk factor, set apart from
+  # imu_residual_weight (null would follow it). Larger: stiffer bias.
+  bias_residual_weight: 1.0
   gtsam_vi_max_iterations: 10
   gtsam_vi_min_iterations: 7
   # Original NormalFlow thresholds in reference GelSight IC coordinates.
@@ -80,11 +73,6 @@ imu_config:
   # Use a local normal-flow + native GTSAM IMU solve for each tracked frame.
   # It activates only after gelsight_T_imu is populated.
   frontend_optimization: true
-  # pairwise: fixed visual reference, 15D retained navigation prior (legacy).
-  # reference_marginalization: variable reference + 15D state, 21D retained/36D solve.
-  # First contact pose is fixed: 9D initialization, 24D bootstrap solve, 15D retained.
-  # After reference replacement: 15D retained/30D shared-pose solve. Backend map only.
-  frontend_state_mode: "pairwise"
   # Shared native preintegration: midpoint only (half-step attitude). It averages
   # adjacent accel/gyro samples and composes rotations.
   # Covers VI prediction, recovery, no-contact coast and backend IMU factors.
@@ -93,17 +81,6 @@ imu_config:
   # IMU preintegration still supplies the IMU factor in the solve.
   # With true, initial shared points < 10 retries once from the previous State.
   frontend_initialize_from_imu_preintegration: true
-  # Use the IMU-predicted State directly. Skip optimization and marginal prior.
-  # Skip SCR/CCS too; retain each valid IMU prediction for the next frame.
-  # Requires frontend_optimization. IMU failure still rejects the target.
-  # Overrides frontend_initialize_from_imu_preintegration and fixed/joint modes.
-  frontend_imu_prediction_only: false
-  # Fix the previous pose/velocity/bias and optimize only the target state.
-  # When true, bypass joint marginalization and its carried prior.
-  frontend_fix_previous_state: false
-  # Joint previous/target state solve. Marginalize the previous 15D state.
-  # The tracker commits the target prior only after its contact quality gate.
-  gtsam_vi_marginalization: true
   # Initial accepted-state uncertainty in SI units; used at each VI restart.
   gtsam_vi_prior_rotation_sigma_rad: 0.01
   gtsam_vi_prior_translation_sigma_m: 0.0001
@@ -125,8 +102,6 @@ imu_config:
     enabled: false
     model: "inertial_quadratic"
   gravity_mps2: 9.81
-  # ROS sensor_msgs/Imu defines angular_velocity in rad/s; only rad_s is accepted.
-  gyro_input_unit: "rad_s"
   # Reject a converted sample above this norm instead of integrating a likely
   # degree/radian mismatch. Set null only after validating the sensor range.
   gyro_max_rate_rad_s: 5.0
@@ -153,6 +128,10 @@ gelslam_config:
     # Retain each rejected contact image as an IMU-predicted Frame for evaluation.
     # Requires a valid initialized VI state and continuous IMU coverage to the image.
     # Does not accept the prediction or add optimization keyframes. Default: false.
+    # The backend's final trajectory evaluation always includes the IMU recovery
+    # keyframe frames (imu_only). false leaves the other IMU-only frames
+    # (no_contact_coasting, imu_prediction) out; they are still published for display.
+    # true evaluates them; coast frames at their IMU prediction time (pose_timestamp).
     keep_imu_only_frames: false
     # Write/publish normal RGB, contact cloud and correspondence debug images.
     # false skips their construction; tracking and frame/keyframe output continue.

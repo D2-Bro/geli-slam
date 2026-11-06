@@ -24,6 +24,7 @@ from nav_msgs.msg import Path
 
 from gelslam.core.coverage_graph import CoverageGraph, create_visible_coverage_graph_msg
 from gelslam.core.keyframe import compute_adjusted_pointcloud
+from gelslam.core.imu_mount_calibration import load_config
 from gelslam.core.topic_backend import TopicBackend
 from gelslam.core.backend_feedback import feedback_message
 from gelslam.core.slam_packets import keyframe_from_ros
@@ -33,6 +34,16 @@ from gelslam.core.trajectory_evaluation import (
 )
 from gelslam.utils import Logger, pointcloud2mesh
 from gelslam_msgs.msg import KeyFrameMsg, VisibleCoverageGraphMsg, BackendFeedbackMsg, FramePoseMsg
+
+# Frame poses made by IMU propagation alone (no tactile measurement at that image).
+IMU_ONLY_TRACKING_STATUSES = frozenset(
+    ("no_contact_coasting", "imu_coasting", "imu_only", "imu_prediction"))
+# imu_only is the IMU recovery keyframe's own frame: the final evaluation always keeps
+# it. The others are evaluated only with keep_imu_only_frames true.
+OPTIONAL_IMU_ONLY_STATUSES = IMU_ONLY_TRACKING_STATUSES - {"imu_only"}
+# Coast predictions end at the last IMU sample at or before the image, not at the image
+# time; the tracker marks them pose_valid false and sends that time as pose_timestamp.
+COAST_TRACKING_STATUSES = frozenset(("no_contact_coasting", "imu_coasting"))
 
 """
 ROS callbacks enqueue keyframes and record lightweight frame poses.
@@ -54,8 +65,9 @@ class PoseGraphNode(Node):
             self.get_parameter("config_path").get_parameter_value().string_value
         )
         config_path = os.path.abspath(os.path.expanduser(config_path))
-        with open(config_path, "r") as f:
-            self.config = yaml.safe_load(f)
+        # IMU mounting slot of imu_config.gelsight_T_imu_calibration; "" keeps its slot.
+        self.declare_parameter("imu_slot", "")
+        self.config = load_config(config_path, self.get_parameter("imu_slot").value)
         # Get the directory to save the pose graph states
         self.declare_parameter("data_dir", "")
         data_dir_parameter = self.get_parameter("data_dir").get_parameter_value().string_value
@@ -122,6 +134,17 @@ class PoseGraphNode(Node):
         )
         self.trajectory_lock = threading.Lock()
         self._trajectory_frames = []
+        # gelslam_config.track_config.keep_imu_only_frames (tracker default false).
+        # The final trajectory evaluation always keeps the IMU recovery keyframe
+        # frames (imu_only). false leaves out the coast and imu_prediction frames
+        # (still published); true evaluates them, coast frames at their prediction time.
+        keep = self.config.get("gelslam_config", {}).get("track_config", {}).get(
+            "keep_imu_only_frames", False)
+        if not isinstance(keep, bool):
+            raise ValueError("gelslam_config.track_config.keep_imu_only_frames must be a boolean")
+        self.keep_imu_only_frames = keep
+        self.excluded_imu_only_frames = 0
+        self.invalid_pose_frames = 0
         self._trajectory_ground_truth = []
         if self.rendering:
             self.visible_coverage_graph_pub = self.create_publisher(
@@ -146,6 +169,16 @@ class PoseGraphNode(Node):
                 1000,
             )
             self.logger.info("Recording frame and ground-truth poses for final SE(3) evaluation")
+            if self.keep_imu_only_frames:
+                self.logger.info("keep_imu_only_frames true: the final trajectory evaluation "
+                                 "includes IMU recovery keyframe frames (imu_only) and IMU-only "
+                                 "frames (%s); coast frames at their prediction time"
+                                 % ", ".join(sorted(OPTIONAL_IMU_ONLY_STATUSES)))
+            else:
+                self.logger.info("keep_imu_only_frames false: IMU-only frames (%s) are left out "
+                                 "of the final trajectory evaluation; IMU recovery keyframe "
+                                 "frames (imu_only) stay in"
+                                 % ", ".join(sorted(OPTIONAL_IMU_ONLY_STATUSES)))
 
         # Start the L thread: loop detection and pose graph optimization thread
         self.loop_closure_thread = threading.Thread(target=self.loop_closure,
@@ -246,16 +279,36 @@ class PoseGraphNode(Node):
         return pose if np.all(np.isfinite(pose)) else None
 
     def trajectory_frame_callback(self, frame_msg):
-        if not getattr(frame_msg, "pose_valid", True):
+        status = getattr(frame_msg, "tracking_status", "contact_tracking")
+        if (not getattr(self, "keep_imu_only_frames", True)
+                and status in OPTIONAL_IMU_ONLY_STATUSES):
+            with self.trajectory_lock:
+                self.excluded_imu_only_frames = getattr(self, "excluded_imu_only_frames", 0) + 1
             return
         timestamp = (getattr(frame_msg, "pose_timestamp", 0.0)
                      or self._header_timestamp(frame_msg.header))
+        if not getattr(frame_msg, "pose_valid", True):
+            # A coast pose is valid at pose_timestamp, its IMU prediction time, when
+            # that time is set and the prediction advanced past the previous record.
+            stamp = float(getattr(frame_msg, "pose_timestamp", 0.0) or 0.0)
+            with self.trajectory_lock:
+                last = self._trajectory_frames[-1][0] if self._trajectory_frames else -np.inf
+            if not (status in COAST_TRACKING_STATUSES and np.isfinite(stamp)
+                    and stamp > 0.0 and stamp > last):
+                with self.trajectory_lock:
+                    self.invalid_pose_frames = getattr(self, "invalid_pose_frames", 0) + 1
+                return
+            timestamp = stamp
         pose_values = np.asarray(frame_msg.ref_t_curr, dtype=np.float64)
         if timestamp is None or pose_values.size != 16 or not np.all(np.isfinite(pose_values)):
             return
+        estimate = np.asarray(getattr(frame_msg, "published_t_ref_estimate", ()), dtype=np.float64)
+        estimate = (estimate.reshape(4, 4) if estimate.size == 16 and np.all(np.isfinite(estimate))
+                    else np.eye(4))
         with self.trajectory_lock:
             self._trajectory_frames.append(
-                (timestamp, int(frame_msg.fid), int(frame_msg.ref_kid), pose_values.reshape(4, 4))
+                (timestamp, int(frame_msg.fid), int(frame_msg.ref_kid), pose_values.reshape(4, 4),
+                 estimate, status)
             )
 
     def trajectory_ground_truth_callback(self, pose_msg):
@@ -287,12 +340,29 @@ class PoseGraphNode(Node):
                 if index < len(final_poses)
                 and self.parent_groups_info.get_parent_group(index, self.keyframedb) == active_group
             }
-        final_frames = []
-        for timestamp, fid, ref_kid, ref_T_frame in frames:
+            # Frames were sent against each keyframe's published pose.
+            published_T_current = {
+                keyframe.kid: np.asarray(getattr(keyframe, 'published_T_current', np.eye(4)))
+                for keyframe in self.keyframedb.keyframes}
+        final_frames, moved_frames, final_statuses = [], 0, {}
+        for record in frames:
+            timestamp, fid, ref_kid, ref_T_frame = record[:4]
             kidx = kid_to_kidx.get(ref_kid)
             if kidx is None or ref_kid not in active_kids or kidx >= len(final_poses):
                 continue
-            final_frames.append((timestamp, fid, ref_kid, final_poses[kidx] @ ref_T_frame))
+            # A keyframe without an applied keyframe_update keeps its frames on the
+            # published pose. With one, each frame follows the keyframe from the
+            # frontend estimate it was tracked against (published_t_ref_estimate):
+            # frames tracked against the re-estimated keyframe do not move, frames
+            # tracked against an earlier estimate (e.g. the IMU recovery frame) do.
+            change = published_T_current[ref_kid]
+            basis = (record[4] if len(record) > 4 else np.eye(4)) if not np.array_equal(
+                change, np.eye(4)) else change
+            moved_frames += int(not np.allclose(basis, change, rtol=0., atol=1e-12))
+            final_frames.append((timestamp, fid, ref_kid,
+                                 final_poses[kidx] @ np.linalg.inv(basis) @ ref_T_frame))
+            status = record[5] if len(record) > 5 else "contact_tracking"
+            final_statuses[status] = final_statuses.get(status, 0) + 1
         if not final_frames:
             self.logger.warning("No recorded frames belong to the final active pose-graph component")
             return
@@ -307,6 +377,30 @@ class PoseGraphNode(Node):
         except (OSError, ValueError, ImportError) as error:
             self.logger.error("Failed to save final trajectory evaluation: %s" % error)
             return
+        excluded = getattr(self, "excluded_imu_only_frames", 0)
+        updated_keyframes = sum(not np.array_equal(change, np.eye(4))
+                                for change in published_T_current.values())
+        metrics.update(keep_imu_only_frames=getattr(self, "keep_imu_only_frames", True),
+                       excluded_imu_only_frames=excluded,
+                       invalid_pose_frames=int(getattr(self, "invalid_pose_frames", 0)),
+                       # Frames resolved on the final active component, before GT matching.
+                       final_frames_by_status=dict(sorted(final_statuses.items())),
+                       backend_optimization=bool(getattr(self, "backend_optimization_enabled", True)),
+                       keyframes_with_frontend_update=int(updated_keyframes),
+                       frames_moved_with_keyframe_update=int(moved_frames))
+        try:
+            with open(os.path.join(output_dir, "trajectory_metrics.json"), "w") as handle:
+                json.dump(metrics, handle, indent=2)
+        except OSError as error:
+            self.logger.error("Failed to update trajectory metrics: %s" % error)
+        if excluded:
+            self.logger.info("Final trajectory evaluation left out %d IMU-only frames "
+                             "(keep_imu_only_frames false)" % excluded)
+        self.logger.info("Final trajectory evaluation frames by tracking status: %s"
+                         % ", ".join("%s %d" % item for item in sorted(final_statuses.items())))
+        if updated_keyframes:
+            self.logger.info("Final trajectory evaluation: %d frames follow the frontend updates "
+                             "of %d keyframes" % (moved_frames, updated_keyframes))
         if metrics["status"] == "ok":
             self.logger.info(
                 "Saved %d SE(3)-aligned poses: translation RMSE %.6f m, rotation RMSE %.3f deg"

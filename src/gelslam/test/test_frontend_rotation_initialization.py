@@ -1,4 +1,4 @@
-"""Rotation-only IMU start: IMU rotation, previous GelSight origin, previous velocity and biases."""
+"""Previous-state start of the contact solve (frontend_initialize_from_imu_preintegration false)."""
 import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
@@ -28,21 +28,3 @@ def test_default_previous_state_start_is_unchanged():
     solver, previous, pim, _, _ = _setup()
     current, _ = solver.predict_preintegrated(previous, pim, 1.05)
     np.testing.assert_array_equal(current.pose, previous.pose)
-
-
-def test_rotation_only_start_keeps_the_gelsight_origin():
-    solver, previous, pim, transform, omega = _setup(frontend_initialize_rotation_from_imu=True)
-    current, _ = solver.predict_preintegrated(previous, pim, 1.05)
-    expected = previous.pose[:3, :3] @ Rotation.from_rotvec(omega * .05).as_matrix()
-    np.testing.assert_allclose(current.pose[:3, :3], expected, atol=1e-9)
-    gel = lambda pose: (pose @ np.linalg.inv(transform))[:3, 3]
-    np.testing.assert_allclose(gel(current.pose), gel(previous.pose), atol=1e-12)
-    np.testing.assert_array_equal(current.velocity, previous.velocity)
-    # The forced (physical) prediction is still the full IMU prediction.
-    forced, _ = solver.predict_preintegrated(previous, pim, 1.05, force=True)
-    assert np.linalg.norm(gel(forced.pose) - gel(previous.pose)) > 1e-4
-
-
-def test_rotation_only_flag_must_be_boolean():
-    with pytest.raises(ValueError, match='frontend_initialize_rotation_from_imu'):
-        GtsamVisualInertialSolver(dict(frontend_initialize_rotation_from_imu=1))

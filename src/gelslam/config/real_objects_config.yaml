@@ -49,47 +49,35 @@ imu_config:
     contact_velocity_sigma_mps: 1.0
   enabled: true
   frontend_optimization: true
-  # Use reference_marginalization / pairwise for a variable reference + current 21D prior.
-  # Requires estimated biases/previous state and disabled GT state overrides.
-  frontend_state_mode: "reference_marginalization"
   # Previous 15D state in reference_marginalization (normal rows never touch it).
   # joint: GN over [reference, previous, current] (36D); IMU relinearized each iteration.
   # eliminate_first: eliminate previous from prior+IMU+bias once, GN over
   # [reference, current] (21D); IMU fixed at the accepted previous state.
-  frontend_reference_previous_state: "eliminate_first"
-  # rows: stack all factor rows (~1500 x 21) and solve/compress with SVD.
-  # hessian: reduce them to the 21x21 H = A^T A first (eliminate_first only).
-  # Same states to 1e-12 on all 12 trials. Solve median, trial_001:
-  # vector residual 8.6 -> 6.2 ms; tangent residual 10.0 -> 8.6 ms.
+  frontend_reference_previous_state: "joint"
   frontend_reference_linear_system: "hessian"
+
+  gradual_coupling:
+    enabled: false
+    attitude_motion_sigma_scale: 10.0
+    min_attitude_s: 0.5
+    max_attitude_s: 5.0
+    accel_bias_sigma_mps2: null
+    gyro_bias_sigma_rps: null
+    velocity_sigma_mps: null
+    ramp_s: 0.0
+    # Once per trial, add sigma^2 to the committed bias marginal after the full
+    # phase has lasted after_full_s (DBA-Fusion reinit).
+    bias_reinflation:
+      enabled: false
+      after_full_s: 5.0
+      accel_bias_sigma_mps2: 0.05
+      gyro_bias_sigma_rps: 0.001
   # Shared native preintegration: midpoint only (half-step attitude). It averages
   # adjacent accel/gyro samples and composes rotations.
   # Covers VI prediction, recovery, no-contact coast and backend IMU factors.
   integration_method: "midpoint"
   # Set false to start each contact-frame solve from the previous VI state.
-  # IMU preintegration still supplies the IMU factor in the solve.
-  # With true, initial shared points < 10 retries once from the previous State.
-  # false: the IMU-origin velocity error (about 30-80 mm/s, lever arm 0.14 m) moved the
-  # IMU-predicted start 1-2 mm per frame, outside the dense normal-flow basin; about
-  # half of the solves failed CCS and IMU-only frames diverged.
   frontend_initialize_from_imu_preintegration: false
-  # Use the target-frame IMU prediction directly; skip contact optimization.
-  frontend_imu_prediction_only: false
-  # Fix the previous pose, velocity and both biases during each frontend solve.
-  # Overrides joint marginalization; no carried marginal prior is used.
-  frontend_fix_previous_state: false
-  # Independent diagnostic interventions. Bias and target initialization are unchanged.
-  frontend_gt_previous_state_test:
-    enabled: false
-    previous_pose_from_gt: true
-    previous_velocity_from_gt: true
-    reference_pose_from_gt: true
-    reset_marginal_prior: true
-    # Keep pose/velocity at one time when toggling either GT input independently.
-    previous_state_time: accepted_state
-  # Joint previous/target state solve. Marginalize the previous 15D state.
-  # The tracker commits the target prior only after its contact quality gate.
-  gtsam_vi_marginalization: true
   # Initial accepted-state uncertainty in SI units; used at each VI restart.
   # 0.005 rad and 0.01 m/s^2: smallest values consistent with GT tilt and vertical velocity
   # at first contact on thick-far trials 002-007 and 011 (recorded_rest_event, 2026-10-29).
@@ -110,7 +98,7 @@ imu_config:
   frontend_gravity_initialization: "ground_truth_initial_pose"
   gt_trial_attitude_max_age_s: 0.05
   # Initialize first-trial IMU-origin velocity from GT IMU position differences.
-  frontend_first_trial_velocity_from_gt: true
+  frontend_first_trial_velocity_from_gt: false
   # This bag's nonuniform ~30 Hz GT needs ~75 ms three-sample stencils.
   # Bound each stencil span and its distance from the original anchor in seconds.
   frontend_gt_velocity_window_s: 0.10
@@ -120,9 +108,13 @@ imu_config:
   frame_id: "ebimu_sensor"
   # T_SI is declared from the gel chart (gel_frame), not the optical frame.
   # Camera receipt is 52-84 ms (median 62.5 ms) after source_pts and IMU receipt about
-  # 1.6 ms after the device clock; source clocks keep that mean receipt latency.
-  # Use 0.0 with timestamp_source: header on bags rewritten to source time.
-  image_to_imu_time_offset_s: -0.0615
+  # 1.6 ms after the device clock; source clocks keep that mean receipt latency (-0.0615).
+  # The image itself is a further 22 ms later than source_pts relative to the IMU:
+  # the rotation test (scripts/estimate_camera_imu_time_offset.py) on the bags rewritten
+  # to source time gives +0.0222 / +0.0220 s (trial_002 / trial_006). Use +0.022 with
+  # timestamp_source: header on those bags. ROS replay, 12 trials, backend and feedback
+  # on: -0.0615 2.56 mm, -0.0395 2.29 mm (docs/recontact_gap_error_20261105.md).
+  image_to_imu_time_offset_s: -0.0395
   max_coast_duration_s: 3.0
   # contact_kinematic helped only while gtsam_integration_sigma_m was 0.01 (VI velocity
   # error 24 mm/s median). With 0.001 the VI velocity (6 mm/s) is better; keep it off.
@@ -137,18 +129,10 @@ imu_config:
     max_fit_rmse_m: 0.002
     max_velocity_change_mps: 1.0
   gravity_mps2: 9.80665
-  # The bag's sensor_msgs/Imu angular_velocity follows the ROS rad/s contract.
-  gyro_input_unit: "rad_s"
-  # The recorded gyro norm peaks at about 0.43 rad/s; retain margin while
-  # rejecting the typical ~57x degree/radian mismatch.
-  gyro_max_rate_rad_s: 5.0
-  # Used by legacy no-contact propagation when frontend VI is disabled.
-  # With frontend VI enabled, coasting uses frontend gravity and trial axes.
-  # It is not a legal input for a real estimator or accuracy claim.
-  # gravity_initialization: "ground_truth_initial_pose"
+  # gravity_mps2: 9.79757323
   ground_truth_gel_pose_topic: "/ground_truth/gel_pose"
   ground_truth_imu_pose_topic: "/ground_truth/imu_pose"
-  initial_accel_bias_mps2: [0.0, 0.0, 0.0]
+  initial_accel_bias_mps2: [0.0024124, -0.00147729, -0.00212325]
   # initial_gyro_bias_rps: [0.002555425, 0.000551925, 0.0004615445]
   # Keep the current conservative SI noise values explicit for this replay.
   # Frontend: 9D motion covariance and separate 6D bias random walk.
@@ -161,21 +145,17 @@ imu_config:
   accelerometer_bias_random_walk: 0.0026
   # EBIMU ASCII output truncates toward zero (gyro 0.1 deg/s, accel 0.001 g):
   # the zero level is two steps wide, so in motion each value reads half a step
-  # low and the rest-window gyro mean is biased by a session constant (up to
-  # about 1 mrad/s). Map nonzero levels to interval centres before buffering;
-  # static initialization then uses the corrected rest samples. null disables.
-  # Only for AGC-off EBIMU output (near rig with AGC on: no gain).
+  # low and the rest-window gyro mean is biased by a session constant. Map
+  # nonzero levels to interval centres before buffering; static initialization
+  # then uses the corrected rest samples. null disables.
+  # Frontend-only, 12 real-objects trials (docs/recontact_gap_error_20261105.md):
+  # truncation alone 7.94 -> 6.36 mm; with the calibration below 5.80 mm.
   output_truncation_gyro_step_rad_s: 0.0017453292519943296  # 0.1 deg/s
   output_truncation_accel_step_mps2: 0.00980665  # 0.001 g
   # Fixed EBIMU accelerometer calibration, f_corrected = f - (bias + scale * f),
-  # applied after the truncation correction. Fitted from the |f| - g residual of
-  # near-rig motion windows; checked on this rig and on 45 static
-  # rests (|f| error 0.019 -> 0.002..0.003 m/s^2). Isotropic scale is not
-  # identifiable, so the scale terms sum to 0.
+  # applied after the truncation correction (fitted on near-rig motion windows).
   accel_calibration_bias_mps2: [0.010146590820458705, -0.018299274385377835, -0.07040754072005488]
   accel_calibration_scale: [-1.5244874151686127e-05, -0.003497099531017146, 0.0035123444051688322]
-  # 2.2e-5 let the gyro z bias wander 2 mrad/s in 70 s (yaw RMSE 2.3 deg); rest
-  # means show a stable bias. 2.2e-6: yaw/rotation RMSE 2.27 -> 1.10 deg.
   gyroscope_bias_random_walk: 0.0000022
   buffer_max_samples: 6000
   # T_GI derived from this bag's /tf_static: IMU coordinates into gel_frame.
@@ -192,8 +172,9 @@ imu_config:
   dense_normalflow_residual_space: "tangent"
   # Positive relative objective weights for the joint frontend solve.
   dense_normalflow_residual_weight: 1.0
-  # Shared objective weight for the separate IMU and bias factors.
+  # Objective weight of the 9D IMU preintegration factor.
   imu_residual_weight: 0.0001
+  bias_residual_weight: 0.0001
   # Keep NormalFlow's original SCR/CCS loss-of-track gate independent of the
   # (smaller) optimization sample set.
   dense_normalflow_quality_samples: 500
@@ -211,26 +192,21 @@ imu_config:
   # Reference-map IC Jacobian; contacts, coordinate mapping and weights update each iteration.
   # Set target_relinearized to compare with current-target normal derivatives.
   gtsam_vi_normal_linearization: "inverse_compositional"
-  # Full undamped GN steps; IMU/bias/prior terms are relinearized each iteration.
-  # 0.01 left velocity unobserved (median error 24 mm/s, p90 78); 0.001 -> 6 mm/s.
   # 0.0003: offline 12 trials mean RMSE 8.70 -> 7.82 mm (near rig 8.59 -> 7.84 mm).
   # Not for bag_simulation_config: there 0.001 adds tactile rejections on long runs.
   gtsam_integration_sigma_m: 0.0003
   # Original NormalFlow thresholds in reference GelSight IC coordinates.
   # Z, velocity, bias and previous-state updates do not control convergence.
   gtsam_vi_rotation_stop_rad: 0.001
-  gtsam_vi_translation_stop_m: 0.0001  # XY norm, 0.01 mm
+  gtsam_vi_translation_stop_m: 0.00001  # XY norm, 0.01 mm
   gtsam_vi_normal_reference_z_from_imu: false
 contact_mask_config:
   color_dist_threshold: 15
-  height_threshold: 0.2
+  height_threshold: 0.1
 
 gelslam_config:
   track_config:
-    # Retain each rejected contact image as an IMU-predicted Frame for evaluation.
-    # Requires a valid initialized VI state and continuous IMU coverage to the image.
-    # Does not accept the prediction or add optimization keyframes. Default: false.
-    keep_imu_only_frames: true
+    keep_imu_only_frames: false
     # Write/publish normal RGB, contact cloud and correspondence debug images.
     # false skips their construction; tracking and frame/keyframe output continue.
     debug_visualization_enabled: false
@@ -253,12 +229,6 @@ gelslam_config:
     scr_threshold: 0.5
     ccs_threshold: 0.3
   pose_graph_config:
-    # 15D states: IMU pose, world velocity, accelerometer and gyroscope biases.
-    # Local VI uses tactile/IMU observations; tracker poses only initialize it.
-    # Separate global 15D PGO: full pose, world velocity and both IMU biases.
-    # Raw IMU/bias factors connect all temporal pairs; recovery pairs omit pose odometry.
-    # Odometry/registered-loop residuals remain 6D, with the sigmas below.
-    # Same relative-pose sigmas as gelslam-origin, converted from mm to metres.
     loop_pgo_rotation_sigma_rad: 0.01
     loop_pgo_translation_sigma_m: 0.0001
     # Minimum data-time gap between loop-search targets; 0 searches every KF.
@@ -275,12 +245,18 @@ gelslam_config:
     max_iterations: 10
     coverage_graph_overlap_threshold: 50
     min_sift_inliers: 8
-    scr_threshold: 0.3
-    ccs_threshold: 0.7
-    # Backend-only IMU integration sigma; the frontend keeps imu_config 0.001.
-    # Keyframe states from the frontend disagree with backend IMU factors by
-    # 4-6 mm per 0.53 s contact link, so 0.01 lets loops correct them.
-    imu_integration_sigma_m: 0.01
+    scr_threshold: 0.5
+    ccs_threshold: 0.3
+    # Backend-only IMU integration sigma (frontend: imu_config.gtsam_integration_sigma_m).
+    # Offline 12 real-objects trials with recovery odometry 1 mm (keyframe RMSE):
+    # 0.0003 2.64, 0.001 2.51, 0.003 2.51, 0.01 2.50 mm; without recovery odometry
+    # 0.01 gave 5.00 mm (docs/recontact_gap_error_20261105.md).
+    imu_integration_sigma_m: 0.003
+    # Odometry across an IMU recovery link (no tactile measurement at the target),
+    # from the frontend seeds. Without it a gap is linked by IMU only and keyframes
+    # of trials with few loops end worse than the frontend (2.81 -> 2.51 mm overall;
+    # 0.3 mm resists loop corrections, 3 mm is too weak). null: IMU only.
+    recovery_odometry_translation_sigma_m: 0.001
     # Huber kernel on registered-loop residuals; loop rotation errors of 1-5 deg
     # otherwise bend the trajectory. Odometry factors stay Gaussian.
     loop_pgo_loop_robust: huber

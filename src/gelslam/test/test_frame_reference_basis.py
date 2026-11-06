@@ -99,17 +99,6 @@ def test_prediction_packets_keep_the_published_reference_through_ros_roundtrip(m
         frozen @ np.asarray(decoded.ref_t_curr).reshape(4, 4), target, atol=2e-8)
 
 
-def test_pairwise_mode_keeps_its_existing_relative_pose_contract(monkeypatch):
-    tracker, _, _, frozen = published_reference(monkeypatch)
-    tracker.frontend_visual_inertial.reference_marginalization = False
-    reference, target = moved_reference_and_target(frozen)
-    tracker.trial_T_ref = reference
-    relative = np.linalg.inv(reference) @ target
-    message = tracker._make_frame_msg(
-        tracker.prev_frame, 5, tracker.curr_kid, relative, header=header(1.1))
-    np.testing.assert_array_equal(np.asarray(message.ref_t_curr).reshape(4, 4), relative)
-
-
 @pytest.mark.parametrize('force', (False, True), ids=('timed', 'low_scr'))
 def test_keyframe_promotion_keeps_one_publication_basis_for_both_endpoints(monkeypatch, force):
     tracker, accepted, old_keyframe, frozen = published_reference(monkeypatch)

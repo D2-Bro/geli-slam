@@ -41,6 +41,9 @@ class GelSlamNode(TrackerNode):
         self.add_keyframe_lock = threading.Lock()  # Publication/finalization only.
         self.trajectory_lock = threading.Lock()
         self._trajectory_frames, self._trajectory_ground_truth = [], []
+        # Same IMU-only frame selection as pose_graph_node (the tracker checks the type).
+        self.keep_imu_only_frames = self.config.get('gelslam_config', {}).get(
+            'track_config', {}).get('keep_imu_only_frames', False)
         self.trajectory_evaluation_config = self.config.get('trajectory_evaluation', {})
         self.trajectory_evaluation_enabled = bool(self.trajectory_evaluation_config.get('enabled', False))
         self.trajectory_output_dir = trajectory_output_dir(
@@ -88,14 +91,6 @@ class GelSlamNode(TrackerNode):
 
     def source_imu_timing_callback(self, message):
         return self.system.submit_input(TrackerNode.source_imu_timing_callback, self, message)
-
-    def _process_image(self, message):
-        before = getattr(self.tracker, '_frontend_tracking_counts', {}).get('backend_feedback_applied', 0)
-        TrackerNode._process_image(self, message)
-        delay = getattr(self.tracker, 'last_backend_feedback_delay_s', None)
-        after = getattr(self.tracker, '_frontend_tracking_counts', {}).get('backend_feedback_applied', 0)
-        if delay is not None and after > before:
-            self.system.metrics['feedback_delay_seconds'].append(delay)
 
     # Executor callbacks only enqueue data. The tracking worker owns all tracker mutations.
     def image_callback(self, message):

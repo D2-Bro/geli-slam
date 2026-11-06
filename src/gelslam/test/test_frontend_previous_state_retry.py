@@ -40,22 +40,16 @@ def run_target(tracker):
         tracker.ref_T_prev, header(1.04), tracker.ref_frame, tracker.prev_frame)
 
 
-@pytest.mark.parametrize("mode", ["ordinary", "fixed_keyframe", "recovery_reference"])
-def test_retry_rebuilds_target_seed_and_reuses_selected_vi_solver(monkeypatch, mode):
+@pytest.mark.parametrize("mode", ["ordinary", "recovery_reference"])
+def test_retry_rebuilds_target_seed_and_reuses_the_vi_solver(monkeypatch, mode):
     tracker, previous, solver, visuals, logs = retry_tracker(monkeypatch)
     original = previous.copy()
     samples = tracker.imu_buffer.samples_covering(previous.timestamp, 1.04)
     predicted, _ = solver.predict_current(previous, samples, tracker.gelsight_T_imu)
-    if mode == "fixed_keyframe":
-        tracker._trial_index = tracker._backend_correction_trial = 0
-        tracker._backend_correction_anchor = previous
-        tracker._backend_imu_buffer = tracker.imu_buffer
-        method = "refine_from_keyframe"
-    elif mode == "recovery_reference":
+    if mode == "recovery_reference":
+        # An IMU-only reference stays a variable of the same contact solve.
         tracker._reference_is_imu_only = True
-        method = "refine_recovery_reference"
-    else:
-        method = "refine_current"
+    method = "refine_current"
     solve = getattr(solver, method)
     attempts, consistency_predictions, commits = [], [], []
 

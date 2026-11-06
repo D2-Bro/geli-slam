@@ -8,6 +8,7 @@ from gelslam.core.parent_groups_info import ParentGroupsInfo
 from gelslam.core.coverage_graph import CoverageGraph
 from gelslam.core.shared_map import MapEstimate
 from gelslam.core.imu_navigation import gelsight_pose
+from gelslam.core.slam_packets import apply_keyframe_update
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,47 @@ class LocalMapping:
         self.solutions = self.graph.raw_solutions()
         self.epoch = 0
         self.accepted_pairs = set()
+
+    def _apply_keyframe_update(self, row):
+        """Replace an earlier keyframe's stored seed by the frontend's later estimate.
+
+        The frontend sends the change relative to the anchor basis that maps onto
+        this seed, so the change is applied to the stored seed directly (pose by
+        right multiplication, velocity in seed body axes). KeyFrame.published_T_current
+        records the change from the published pose; the final evaluation uses it to
+        tell updated keyframes and re-resolves their frames (pose_graph_node).
+        """
+        kid, timestamp = int(round(row[0])), float(row[1])
+        index = self.db.get_kid2kidx().get(kid)
+        keyframe = self.db[index] if index is not None else None
+        state = getattr(keyframe, 'navigation_state', None)
+        if state is None or abs(state.timestamp - timestamp) > 1e-9:
+            self.logger.warning('Local BA -- keyframe update for unknown or mismatched kid %d ignored' % kid)
+            return False
+        if keyframe.is_new_trial():
+            # A group root fixes its PGO anchor when added; keep it unchanged.
+            self.logger.info('Local BA -- keyframe update for group root kid %d not applied' % kid)
+            return False
+        published = np.asarray(keyframe.trial_T_curr, dtype=float)
+        keyframe.navigation_state = apply_keyframe_update(state, row)
+        keyframe.trial_T_curr = gelsight_pose(keyframe.navigation_state.pose, self.graph.gelsight_T_imu)
+        keyframe.published_T_current = (getattr(keyframe, 'published_T_current', np.eye(4))
+                                        @ np.linalg.solve(published, keyframe.trial_T_curr))
+        if index < len(self.graph.states) and self.graph.states[index] is not None:
+            updated = apply_keyframe_update(self.graph.states[index], row)
+            self.graph.states[index] = updated
+            self.graph.poses[index] = gelsight_pose(updated.pose, self.graph.gelsight_T_imu)
+            if index < len(self.graph.keyframes):
+                record = self.graph.keyframes[index]
+                record.trial_T_curr = np.asarray(keyframe.trial_T_curr).copy()
+                record.navigation_state = keyframe.navigation_state.copy()
+        elif index < len(self.graph.poses):
+            # Optimization disabled: the graph holds raw keyframe poses only.
+            self.graph.poses[index] = np.asarray(keyframe.trial_T_curr).copy()
+        change = keyframe.published_T_current
+        self.logger.info('Local BA -- keyframe %d seed updated by the frontend: %.4f mm from its published pose'
+                         % (kid, np.linalg.norm(change[:3, 3]) * 1e3))
+        return True
 
     def process(self, snapshot, candidates, shared_map):
         if self.epoch != snapshot.epoch:
@@ -84,6 +126,13 @@ class LocalMapping:
                     current.accel_bias += corrected.accel_bias - basis.accel_bias
                     current.gyro_bias += corrected.gyro_bias - basis.gyro_bias
                     keyframe.trial_T_curr = gelsight_pose(current.pose, self.graph.gelsight_T_imu)
+            # The frontend's later estimate of the previous keyframe, relative to
+            # the same anchor basis. Apply it after the rebasing above, which
+            # used the old seed with that basis. Also with optimization disabled:
+            # the raw keyframe poses then follow the frontend's final estimates.
+            update = np.asarray(getattr(packet, 'keyframe_update', ()), dtype=float)
+            if update.size:
+                self._apply_keyframe_update(update)
         size = self.db.size()
         self.graph.add_keyframes(self.db, old_size, size, build_factors=self.enabled)
         self.groups.update_wrt_new_keyframes(self.db, old_size, size)

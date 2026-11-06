@@ -184,9 +184,6 @@ def test_node_subscribes_to_source_topics_without_a_bag(tmp_path, monkeypatch, c
         frontend_visual_inertial=None, imu_config=imu_config, imu_buffer=ImuBuffer(),
         image_to_imu_time_offset_s=0.)
     monkeypatch.setattr(module, 'Tracker', lambda *args, **kwargs: tracker)
-    def no_database(*args, **kwargs):
-        pytest.fail('topic mode opened a bag database')
-    monkeypatch.setattr(module, 'RecordedSourceClock', no_database)
     rclpy.init(args=['--ros-args', '-p', 'config_path:='+str(path),
                     '-p', 'data_dir:='+str(tmp_path), '-p', 'backend_feedback:=false'])
     node = None
@@ -194,7 +191,6 @@ def test_node_subscribes_to_source_topics_without_a_bag(tmp_path, monkeypatch, c
         node = TrackerNode()
         topics = {subscription.topic_name for subscription in node.subscriptions}
         assert {camera_topic, device_topic, '/test/image', '/test/imu'} <= topics
-        assert node.recorded_source_clock is None
         assert isinstance(node.streaming_source_clock, StreamingSourceClock)
     finally:
         if node is not None:

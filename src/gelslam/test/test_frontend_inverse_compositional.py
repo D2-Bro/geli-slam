@@ -8,11 +8,9 @@ from scipy.linalg import lstsq
 from scipy.spatial.transform import Rotation
 
 import normalflow.registration as origin
-import gelslam.core.numpy_vi as normal
 from gelslam.core.gtsam_vi import GtsamVisualInertialSolver
 from gelslam.core.imu_navigation import gelsight_pose, gelsight_pose_jacobian
-from gelslam.core.inertial import ImuSample
-from gelslam.core.numpy_vi import DenseNormalResidual, NavigationState, adjoint
+from gelslam.core.numpy_vi import DenseNormalResidual, adjoint
 from gelslam.core.split_pose import split_pose_plus
 
 
@@ -151,59 +149,6 @@ def test_navigation_update_matches_origin_inverse_composition_to_first_order():
     # first order; their finite-step difference must shrink quadratically.
     assert errors[1] < .3 * errors[0]
     assert errors[0] < 2e-4
-
-
-@pytest.mark.parametrize('fixed_previous', [False, True])
-def test_ic_reuses_reference_j_but_updates_pose_and_prior(monkeypatch, fixed_previous):
-    image = frame()
-    initial = np.eye(4)
-    initial[0, 3] = .001
-    evaluations, jacobian_calls = [], []
-    original_get_j = normal.get_J
-
-    def get_j(*args):
-        jacobian_calls.append(1)
-        return original_get_j(*args)
-
-    monkeypatch.setattr(normal, 'get_J', get_j)
-    visual = DenseNormalResidual(image, image, 1., np.eye(4), initial, 1500)
-    cached = visual.candidate_normal_jacobian.copy()
-    evaluate = visual.evaluate_ic
-
-    def capture(reference, target):
-        evaluations.append(target.copy())
-        return evaluate(reference, target)
-
-    def unexpected(*args):
-        raise AssertionError('IC solve called the target-map derivative')
-
-    monkeypatch.setattr(visual, 'evaluate_ic', capture)
-    monkeypatch.setattr(visual, 'evaluate_relinearized', unexpected)
-    previous = NavigationState(0., np.eye(4), np.zeros(3), np.zeros(3), np.zeros(3))
-    current = previous.copy()
-    current.timestamp, current.pose = .1, initial.copy()
-    samples = [ImuSample(t, [0., 0., 9.81], [0., 0., 0.]) for t in np.linspace(0., .1, 11)]
-    solver = GtsamVisualInertialSolver({
-        'gtsam_vi_max_iterations': 3, 'dense_normalflow_residual_weight': 1e8,
-        'imu_residual_weight': 1e-8, 'gtsam_vi_normal_huber_delta': 0.,
-        'gtsam_vi_rotation_stop_rad': 1e-10, 'gtsam_vi_translation_stop_m': 1e-10,
-        'frontend_fix_previous_state': fixed_previous,
-    })
-    result = solver.refine_current(visual, np.eye(4), previous, current, samples, np.eye(4))
-    assert result is not None
-    assert abs(result.pose[0, 3]) < 1e-4
-    assert len(jacobian_calls) == 1
-    assert np.array_equal(visual.candidate_normal_jacobian, cached)
-    assert len(evaluations) == len(solver.last_optimization_trace) + (not fixed_previous)
-    assert not np.array_equal(evaluations[0], evaluations[1])
-    assert all(t['normal_jacobian_source'] == 'reference_normal_map_ic'
-               and t['normal_linearization'] == 'inverse_compositional'
-               for t in solver.last_optimization_trace)
-    if not fixed_previous:
-        assert np.array_equal(evaluations[-1], result.pose)
-        assert solver.pending_marginal_prior.matches(result)
-    else:
-        assert solver.pending_marginal_prior is None
 
 
 def test_ic_reselects_contact_and_maps_fixed_reference_j_at_each_pose():

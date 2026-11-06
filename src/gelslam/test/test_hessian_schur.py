@@ -1,18 +1,13 @@
 """Absolute Hessian cutoffs, state recovery, and zero-gradient prior semantics."""
-import pickle
-from types import SimpleNamespace
 
 import gtsam
 import numpy as np
 import pytest
 
-from gelslam.core.gtsam_vi import GtsamVisualInertialSolver
 from gelslam.core.marginal_prior import (
     NavigationPrior, information_rows, marginalize_rows_system, schur_complement,
 )
 from gelslam.core.numpy_vi import NavigationState
-from gelslam.core.tracker import Tracker
-import gelslam.core.tracker as tracker_module
 
 
 def state():
@@ -97,27 +92,3 @@ def test_dense_information_prior_has_zero_anchor_gradient_and_preserves_reframe_
     assert np.allclose(transformed.A.T @ transformed.A, transport.T @ H @ transport)
     assert np.linalg.norm((transformed.A.T @ transformed.A)[:6, 6:9]) > 1.
     assert transformed.error(transformed.anchor) == pytest.approx(0., abs=1e-25)
-
-
-def test_tracker_load_converts_legacy_rhs_and_drops_uncommitted_prior(tmp_path, monkeypatch):
-    tracker = object.__new__(Tracker)
-    tracker.bg_image = np.zeros((2, 2, 3))
-    tracker.curr_kid = -1
-    tracker.imu_config = {}
-    solver = GtsamVisualInertialSolver({})
-    tracker.frontend_visual_inertial = solver
-    rng = np.random.default_rng(99)
-    rows = rng.normal(size=(20, 15))
-    solver.marginal_prior = NavigationPrior(state(), rows, np.ones(20))
-    solver.pending_marginal_prior = NavigationPrior.initial(state(), np.ones(15))
-    with (tmp_path / 'tracker.pkl').open('wb') as file:
-        pickle.dump(tracker, file)
-    monkeypatch.setattr(tracker_module, 'Reconstructor',
-                        lambda _: SimpleNamespace(load_bg=lambda _: None))
-    restored = Tracker.load(tmp_path, 'unused', SimpleNamespace(info=lambda _: None))
-    prior = restored.frontend_visual_inertial.marginal_prior
-    assert prior.matches(solver.marginal_prior.anchor)
-    assert np.allclose(prior.A.T @ prior.A, rows.T @ rows)
-    assert prior.error(prior.anchor) == 0.
-    assert np.array_equal(prior.rhs, np.zeros(15))
-    assert restored.frontend_visual_inertial.pending_marginal_prior is None

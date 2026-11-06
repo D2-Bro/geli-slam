@@ -52,11 +52,8 @@ class SyncHarness:
         self.tracker.imu_config = {}
         self.tracker.timestamp_source = "header"
         self.tracker.image_to_imu_time_offset_s = offset
-        self.recorded_source_clock = None
-        self._unmatched_source_images = self._unmatched_source_imus = 0
         self._imu_dropped_samples = self._imu_invalid_gyro_samples = 0
         self.imu_frame_id = "imu_frame"
-        self.gyro_input_unit = "rad_s"
         self.gyro_max_rate_rad_s = 5.
         self.image_callback_group = object()
         self.logs, self.tracked = [], []
@@ -122,24 +119,6 @@ def test_new_image_replaces_pending_image_and_waits_for_its_own_time():
     node._imu_image_sync_guard.dispatch()
     assert node.tracked == [latest]
     assert node._image_imu_waits == 2 and node._image_imu_replacements == 1
-
-
-def test_wait_uses_recorded_camera_and_imu_clocks_with_image_offset():
-    node = SyncHarness(offset=.02)
-    node.tracker.timestamp_source = "recorded_source"
-    image_times, imu_times = deque([2.05]), deque([2.06, 2.08])
-    node.recorded_source_clock = SimpleNamespace(
-        image_timestamp=lambda _: image_times.popleft(),
-        imu_timestamp=lambda _: imu_times.popleft())
-    image = message_at(Image, 100.)
-    node.image_callback(image)
-    node.imu_callback(message_at(Imu, 101.))
-    node._imu_image_sync_guard.dispatch()
-    assert node.tracked == []  # Selected target is 2.05 + 0.02, not host 100.
-    node.imu_callback(message_at(Imu, 102.))
-    node._imu_image_sync_guard.dispatch()
-    assert node.tracked == [image] and not image_times and not imu_times
-    assert node.tracker._imu_timestamp(image.header) == pytest.approx(2.07)
 
 
 def test_rejected_imu_does_not_advance_or_release_pending_image():
@@ -230,9 +209,8 @@ def test_ros_guard_keeps_tracking_serial_and_allows_imu_during_tracking(tmp_path
             Node.__init__(self, "gelslam_image_imu_sync_test", context=context,
                           enable_rosout=False, start_parameter_services=False)
             harness = SyncHarness()
-            for name in ("tracker", "recorded_source_clock", "_unmatched_source_images",
-                         "_unmatched_source_imus", "_imu_dropped_samples",
-                         "_imu_invalid_gyro_samples", "imu_frame_id", "gyro_input_unit",
+            for name in ("tracker", "_imu_dropped_samples",
+                         "_imu_invalid_gyro_samples", "imu_frame_id",
                          "gyro_max_rate_rad_s", "logger"):
                 setattr(self, name, getattr(harness, name))
             self.image_callback_group = MutuallyExclusiveCallbackGroup()

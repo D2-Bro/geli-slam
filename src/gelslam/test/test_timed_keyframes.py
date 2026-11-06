@@ -1,12 +1,10 @@
-"""Time selection is common to frontend modes and preserves navigation State."""
+"""Timed keyframe selection changes the reference and preserves navigation State."""
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import gelslam.core.tracker as tm
-from gelslam.core.gtsam_vi import GtsamVisualInertialSolver
-from gelslam.core.marginal_prior import NavigationPrior
 from gelslam.core.numpy_vi import NavigationState
 from gelslam.core.tracker import Tracker
 
@@ -22,18 +20,27 @@ class Surface:
         self.N = self.C = self.H = self.L = np.zeros((1, 1))
 
 
-def make_tracker(monkeypatch, mode='joint'):
+class RecordingSolver:
+    """Record reference changes; keyframe selection does not solve."""
+
+    def __init__(self):
+        self.marginal_prior = object()
+        self.gravity = np.array([0., 0., -9.81])
+        self.references = []
+
+    def set_reference(self, timestamp, state):
+        self.references.append((timestamp, state.timestamp))
+
+
+def make_tracker(monkeypatch):
     t = object.__new__(Tracker)
     t.track_config = dict(contact_threshold=1, keyframe_max_interval_s=.5)
-    t.imu_config = dict(frontend_fix_previous_state=mode=='fixed',
-                        frontend_imu_prediction_only=mode=='prediction')
-    t.frontend_visual_inertial = GtsamVisualInertialSolver(t.imu_config)
+    t.imu_config = {}
+    t.frontend_visual_inertial = RecordingSolver()
     pose = np.eye(4)
     pose[0, 3] = .2
     t._frontend_vi_state = NavigationState(1., pose, np.array([.1, .2, .3]),
                                           np.ones(3)*.001, np.ones(3)*.0001)
-    t.frontend_visual_inertial.marginal_prior = NavigationPrior.initial(
-        t._frontend_vi_state, np.ones(15))
     t.trial_T_ref = pose.copy()
     t.ref_T_prev = np.eye(4, dtype=np.float32)
     t.ref_frame = t.prev_frame = Surface()
@@ -68,9 +75,8 @@ def make_tracker(monkeypatch, mode='joint'):
     return t
 
 
-@pytest.mark.parametrize('mode', ['joint', 'fixed', 'prediction'])
-def test_common_deadline_promotes_current_contact_without_resetting_state(monkeypatch, mode):
-    t = make_tracker(monkeypatch, mode)
+def test_common_deadline_promotes_current_contact_without_resetting_state(monkeypatch):
+    t = make_tracker(monkeypatch)
     prior = t.frontend_visual_inertial.marginal_prior
     initial = t._frontend_vi_state.copy()
     image = np.zeros((1, 1, 3), np.uint8)
@@ -90,10 +96,16 @@ def test_common_deadline_promotes_current_contact_without_resetting_state(monkey
             assert k['header'] is frame['header']
             assert not k['is_new_trial']
             assert np.allclose(k['trial_T_curr'], t._frontend_vi_state.pose)
-            assert np.array_equal(frame['ref_T_curr'], np.eye(4))
+            # The frame is expressed against the published keyframe pose,
+            # which is the accepted State pose up to float32 roundoff.
+            assert np.allclose(frame['ref_T_curr'], np.eye(4), rtol=0., atol=1e-9)
+            assert np.array_equal(t._published_keyframe_poses[t.curr_kid],
+                                  t._frontend_vi_state.pose)
             assert t.ref_frame is t.prev_frame is k['surface']
             assert t.prev_is_keyframe_flag
             assert t._last_keyframe_timestamp==time
+            # The new reference is the accepted State at the keyframe time.
+            assert t.frontend_visual_inertial.references[-1]==(time, time)
 
 
 @pytest.mark.parametrize('new_trial', [False, True])

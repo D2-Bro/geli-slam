@@ -8,3 +8,7 @@ float64[16] ref_t_curr
 string tracking_status "contact_tracking"
 bool pose_valid true
 float64 pose_timestamp
+
+# Frontend estimate of ref_kid at publication relative to its published pose,
+# inv(published) * estimate, 4x4 flattened; empty: the published pose (FrameMsg).
+float64[] published_t_ref_estimate

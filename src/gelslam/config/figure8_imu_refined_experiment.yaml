@@ -55,21 +55,11 @@ imu_config:
   enabled: true
   frame_id: imu_frame
   frontend_first_trial_velocity_from_gt: false
-  frontend_fix_previous_state: false
   frontend_gravity_initialization: static_imu
-  frontend_gt_previous_state_test:
-    enabled: false
-    previous_pose_from_gt: true
-    previous_state_time: accepted_state
-    previous_velocity_from_gt: true
-    reference_pose_from_gt: true
-    reset_marginal_prior: true
   frontend_gt_velocity_max_age_s: 0.05
   frontend_gt_velocity_window_s: 0.05
-  frontend_imu_prediction_only: false
   frontend_initialize_from_imu_preintegration: true
   frontend_optimization: true
-  frontend_state_mode: reference_marginalization
   gelsight_T_imu:
   - - 1.0
     - 0.0
@@ -87,7 +77,6 @@ imu_config:
     - 0.0
     - 0.0
     - 1.0
-  gravity_initialization: measured_acceleration
   gravity_mps2: 9.80665
   ground_truth_gel_pose_topic: /ground_truth/gel_pose
   ground_truth_imu_pose_topic: /ground_truth/imu_pose
@@ -95,7 +84,6 @@ imu_config:
   gtsam_integration_sigma_m: 0.01
   gtsam_vi_height_z_enabled: true
   gtsam_vi_height_z_sigma_m: 0.0001
-  gtsam_vi_marginalization: true
   gtsam_vi_max_iterations: 10
   gtsam_vi_min_iterations: 5
   gtsam_vi_normal_huber_delta: 0.4
@@ -114,6 +102,7 @@ imu_config:
   gyroscope_noise_density: 0.00016
   image_to_imu_time_offset_s: 0.0
   imu_residual_weight: 1.0
+  bias_residual_weight: 1.0
   initial_accel_bias_mps2:
   - 0.003199013336299
   - -0.001884809410931

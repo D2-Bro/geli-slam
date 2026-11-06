@@ -65,6 +65,9 @@ def keyframe_msg2keyframe(bridge, keyframe_msg, trial_group, new_trial_flag, ppm
         _header_timestamp(keyframe_msg.header), compute_features=compute_features,
     )
     keyframe.tracker_trial_T_group = np.array(tracker_trial_T_group if tracker_trial_T_group is not None else np.eye(4))
+    # Change of the stored pose since publication (frontend keyframe updates).
+    # Frames sent against this keyframe use the published pose.
+    keyframe.published_T_current = np.eye(4)
     keyframe.navigation_state = None
     keyframe.gravity = None
     keyframe.imu_samples = ()

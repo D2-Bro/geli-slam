@@ -11,12 +11,7 @@ from normalflow.utils import get_J, height2pointcloud, wide_remap
 
 from gelslam.core.gtsam_pose_graph import PoseGraph
 from gelslam.core.gtsam_vi import (
-    GtsamVisualInertialSolver,
-    _combined_imu_factor,
-    _imu_values,
-    _normal_huber_cost,
-    _normal_huber_linearization,
-    combined_imu_current_terms,
+    GtsamVisualInertialSolver, _combined_imu_factor, _imu_values, combined_imu_current_terms,
     preintegrate_combined,
 )
 from gelslam.core.inertial import (
@@ -64,66 +59,6 @@ class _MislinearizedVisual:
         return residual, jacobian, jacobian
 
 
-def test_joint_solver_applies_full_step_even_when_actual_cost_increases():
-    solver = GtsamVisualInertialSolver({
-        "gtsam_vi_max_iterations": 1,
-        "gtsam_vi_normal_huber_delta": 0.0,
-        "dense_normalflow_residual_weight": 1e8,
-        "imu_residual_weight": 1e-12,
-    })
-    result = solver.refine_current(
-        _MislinearizedVisual(0.1), np.eye(4), _state(0), _state(0.1),
-        _samples(), np.eye(4),
-    )
-    trace = solver.last_optimization_trace[0]
-    assert trace["attempts"][0]["cost"] > trace["base_cost"]
-    assert trace["accepted_scale"] == 1.
-    assert len(trace["attempts"]) == 1
-    assert trace["accepted_cost"] > trace["base_cost"]
-    assert result.pose[0, 3] == pytest.approx(10., abs=1e-4)
-
-
-def test_joint_solver_does_not_retry_or_roll_back_an_uphill_full_step():
-    solver = GtsamVisualInertialSolver({
-        "gtsam_vi_max_iterations": 1,
-        "gtsam_vi_normal_huber_delta": 0.0,
-        "dense_normalflow_residual_weight": 1e8,
-        "imu_residual_weight": 1e-12,
-    })
-    result = solver.refine_current(
-        _MislinearizedVisual(-1.0), np.eye(4), _state(0), _state(0.1),
-        _samples(), np.eye(4),
-    )
-    trace = solver.last_optimization_trace[0]
-    assert trace["accepted_scale"] == 1.
-    assert len(trace["attempts"]) == 1
-    assert trace["accepted_cost"] > trace["base_cost"]
-    assert result.pose[0, 3] == pytest.approx(-1., abs=1e-5)
-
-
-@pytest.mark.parametrize('damping', [1e-6, -1., np.nan, np.inf])
-def test_frontend_rejects_nonzero_or_invalid_legacy_damping(damping):
-    with pytest.raises(ValueError, match='does not support gtsam_vi_damping'):
-        GtsamVisualInertialSolver({'gtsam_vi_damping': damping})
-
-
-def test_joint_solver_accepts_zero_damping():
-    solver = GtsamVisualInertialSolver({
-        "gtsam_vi_damping": 0.0,
-        "gtsam_vi_max_iterations": 2,
-    })
-    initial = _state(0.1)
-    initial.pose[0, 3] = 0.001
-    result = solver.refine_current(
-        _FlatVisual(), np.eye(4), _state(0.0), initial,
-        _samples(), np.eye(4),
-    )
-    assert result is not None
-    assert solver.last_optimization_trace
-    assert np.all(np.isfinite(result.pose))
-    assert np.all(np.isfinite(result.velocity))
-
-
 def test_frontend_predicts_pose_and_velocity_from_the_same_imu_interval():
     previous = _state(0.0)
     previous.velocity = np.array([0.3, -0.1, 0.0])
@@ -148,34 +83,6 @@ def test_frontend_predicts_pose_and_velocity_from_the_same_imu_interval():
     assert np.isclose(preintegrated.deltaTij(), 0.1)
 
 
-def test_frontend_can_initialize_from_previous_state_with_imu_factor_retained():
-    previous = _state(0.0)
-    previous.pose[0, 3] = 0.4
-    previous.velocity[:] = [0.3, -0.1, 0.0]
-    previous.accel_bias[:] = [0.2, 0.0, 0.0]
-    previous.gyro_bias[:] = [0.0, 0.0, 0.1]
-    samples = _samples()
-    solver = GtsamVisualInertialSolver({
-        "frontend_initialize_from_imu_preintegration": False,
-    })
-
-    current, preintegrated = solver.predict_current(
-        previous, samples, np.eye(4)
-    )
-
-    assert np.isclose(current.timestamp, samples[-1].timestamp)
-    for field in ("pose", "velocity", "accel_bias", "gyro_bias"):
-        assert np.array_equal(getattr(current, field), getattr(previous, field))
-        assert not np.shares_memory(getattr(current, field), getattr(previous, field))
-    assert np.isclose(preintegrated.deltaTij(), 0.1)
-    refined = solver.refine_current(
-        _FlatVisual(), np.eye(4), previous, current, samples, np.eye(4),
-        preintegrated=preintegrated,
-    )
-    assert refined is not None
-    assert solver.last_optimization_trace
-
-
 def test_frontend_prediction_retains_stationary_imu_pose_with_rotated_mount():
     gelsight_T_imu = np.eye(4)
     gelsight_T_imu[:3, :3] = np.array([
@@ -196,86 +103,6 @@ def test_frontend_prediction_retains_stationary_imu_pose_with_rotated_mount():
 
     assert np.allclose(current.pose, gelsight_T_imu, atol=1e-8)
     assert np.allclose(current.velocity, np.zeros(3), atol=1e-8)
-
-
-def test_normal_huber_uses_three_component_blocks_and_true_candidate_cost():
-    residual = np.array((3.0, 4.0, 0.0, 0.06, 0.08, 0.0))
-    jacobian = np.eye(6)
-    weighted_jacobian, weighted_residual, cost, count = (
-        _normal_huber_linearization(residual, jacobian, 2.0, 1.0)
-    )
-    assert count == 1
-    assert np.allclose(weighted_residual[:3], residual[:3] * 2 / np.sqrt(20))
-    assert np.allclose(weighted_residual[3:], residual[3:] * 2 / np.sqrt(2))
-    assert np.allclose(np.diag(weighted_jacobian)[:3], 2 / np.sqrt(20))
-    assert np.allclose(np.diag(weighted_jacobian)[3:], 2 / np.sqrt(2))
-    assert np.isclose(cost, 9.52 / 2)
-    assert np.isclose(_normal_huber_cost(residual, 2.0, 0.0), 50.02 / 2)
-
-
-def test_mean_normal_cost_and_information_do_not_depend_on_point_duplication():
-    residual = np.array([3., 4., 0., .06, .08, 0.])
-    J = np.arange(36, dtype=float).reshape(6,6) / 36.
-    for delta in [0., 1.]:
-        A,b,cost,_ = _normal_huber_linearization(residual,J,2.,delta)
-        repeated_A,repeated_b,repeated_cost,_ = _normal_huber_linearization(
-            np.tile(residual,7),np.tile(J,(7,1)),2.,delta)
-        assert np.isclose(repeated_cost,cost)
-        assert np.allclose(repeated_A.T@repeated_A,A.T@A)
-        assert np.allclose(repeated_A.T@repeated_b,A.T@b)
-    assert np.isinf(_normal_huber_cost(np.empty(0),1.,.4))
-
-
-def test_losing_points_without_better_residual_does_not_reduce_candidate_cost():
-    class ConstantVisual:
-        last_active_rows = np.ones(10,dtype=bool)
-        def __len__(self):return 10
-        def evaluate(self,ref,pose):
-            return np.tile([1.,0.,0.],10),np.zeros((30,6)),np.zeros((30,6))
-        def residual_on_fixed_rows(self,ref,pose,rows):
-            return np.array([1.,0.,0.])  # Nine points left contact; same error.
-    solver = GtsamVisualInertialSolver({'gtsam_vi_max_iterations':1,'gtsam_vi_normal_huber_delta':0.})
-    result = solver.refine_current(ConstantVisual(),np.eye(4),_state(0),_state(.1),_samples(),np.eye(4))
-    assert result is not None
-    trace = solver.last_optimization_trace[0]
-    assert np.isclose(trace['base_normal_cost'],.5)
-    assert trace['accepted_scale'] == 1.
-    assert len(trace['attempts']) == 1
-    assert all(np.isclose(x['cost'],trace['base_cost']) for x in trace['attempts'])
-
-
-def test_normal_huber_limits_one_large_contact_outlier_in_joint_solve():
-    class Visual:
-        def __len__(self):
-            return 10
-
-        def evaluate(self, _reference, pose):
-            residual = np.zeros((10, 3))
-            residual[:9, 0] = pose[0, 3] - 0.001
-            residual[9, 0] = pose[0, 3] - 0.1
-            jacobian = np.zeros((30, 6))
-            jacobian[0::3, 3] = 1.0
-            return residual.ravel(), jacobian, jacobian
-
-    solver = GtsamVisualInertialSolver({
-        "gtsam_vi_max_iterations": 1,
-        "gtsam_vi_normal_huber_delta": 0.002,
-        "imu_residual_weight": 1e-12,
-    })
-    result = solver.refine_current(
-        Visual(), np.eye(4), _state(0), _state(0.1), _samples(), np.eye(4)
-    )
-    trace = solver.last_optimization_trace[0]
-    assert result is not None
-    assert trace["downweighted_normal_points"] == 1
-    assert np.isclose(trace["base_normal_cost"], 0.0002025 / 10)
-    final_residual = Visual().evaluate(np.eye(4), result.pose)[0]
-    assert np.isclose(
-        trace["accepted_normal_cost"],
-        _normal_huber_cost(final_residual, 1.0, 0.002),
-    )
-    assert trace["accepted_cost"] < trace["base_cost"]
-    assert np.isclose(result.pose[0, 3], 0.00122, atol=2e-5)
 
 
 def test_native_imu_factor_stationary_and_turning():
@@ -380,48 +207,6 @@ def test_combined_imu_residual_is_invariant_to_gravity_frame_alignment():
     )
 
 
-def test_joint_solver_uses_imu_and_does_not_apply_height_correction():
-    previous, current = _state(0.0), _state(0.1)
-    solver = GtsamVisualInertialSolver({"gtsam_vi_max_iterations": 2})
-    result = solver.refine_current(
-        _FlatVisual(), np.eye(4), previous, current, _samples(), np.eye(4)
-    )
-    assert result is not None
-    assert np.allclose(result.pose, np.eye(4), atol=1e-8)
-    assert solver.refine_current(
-        _FlatVisual(), np.eye(4), previous, current, [], np.eye(4)
-    ) is None
-
-
-def test_joint_solver_reduces_a_real_normal_warp_error():
-    height, width = 80, 80
-    yy, xx = np.mgrid[:height, :width]
-    normals = np.stack((
-        0.08 * np.sin(xx / 9), 0.08 * np.cos(yy / 11),
-        np.ones((height, width)),
-    ), axis=2).astype(np.float32)
-    normals /= np.linalg.norm(normals, axis=2, keepdims=True)
-    frame = SimpleNamespace(
-        N=normals,
-        C=np.ones((height, width), dtype=bool),
-        H=np.zeros((height, width), dtype=np.float32),
-        L=np.arange(height * width, dtype=np.float32).reshape(height, width),
-    )
-    seed = np.eye(4)
-    seed[0, 3] = 0.001
-    visual = DenseNormalResidual(frame, frame, 1.0, np.eye(4), seed, max_samples=1500)
-    result = GtsamVisualInertialSolver({
-        "gtsam_vi_max_iterations": 10,
-        "gtsam_vi_rotation_stop_rad": 1e-7,
-        "gtsam_vi_translation_stop_m": 1e-7,
-    }).refine_current(
-        visual, np.eye(4), _state(0), _state(0.1, seed),
-        _samples(), np.eye(4),
-    )
-    assert result is not None
-    assert abs(result.pose[0, 3]) < 1e-5
-
-
 def test_fixed_imu_reference_z_removes_normal_z_dependence_with_tilted_poses():
     height, width = 80, 80
     yy, xx = np.mgrid[:height, :width]
@@ -453,50 +238,6 @@ def test_fixed_imu_reference_z_removes_normal_z_dependence_with_tilted_poses():
     assert np.allclose(shifted_residual, base_residual, atol=1e-9)
     tangent_reference_z = target[:3, :3].T @ reference[:3, 2]
     assert np.linalg.norm(jacobian[:, 3:6] @ tangent_reference_z) < 1e-10
-
-
-def test_normal_reference_z_uses_native_imu_prediction():
-    previous = _state(0.0)
-    previous.velocity[2] = 0.02
-    current = _state(0.1)
-    visual = _FlatVisual()
-    visual.set_fixed_reference_z = lambda value: setattr(visual, "fixed_z", value)
-    solver = GtsamVisualInertialSolver({
-        "gtsam_vi_max_iterations": 1,
-        "gtsam_vi_normal_reference_z_from_imu": True,
-    })
-    result = solver.refine_current(
-        visual, np.eye(4), previous, current, _samples(), np.eye(4)
-    )
-    assert result is not None
-    assert np.isclose(visual.fixed_z, 0.002, atol=1e-10)
-    assert np.isclose(solver.last_fixed_normal_reference_z_m, 0.002, atol=1e-10)
-
-
-def test_zero_pose_z_jacobian_prevents_spurious_normal_z_step():
-    class Visual:
-        def __len__(self):
-            return 10
-
-        def evaluate(self, _reference, pose):
-            residual = np.full(30, pose[0, 3] - 0.001)
-            jacobian = np.zeros((30, 6))
-            jacobian[:, 3] = 1.0
-            jacobian[:, 5] = 1.0  # The residual has no Z dependence.
-            return residual, jacobian, jacobian
-
-    solver = GtsamVisualInertialSolver({
-        "gtsam_vi_max_iterations": 1,
-        "gtsam_vi_normal_zero_pose_z_jacobian": True,
-        "dense_normalflow_residual_weight": 1e8,
-        "imu_residual_weight": 1e-12,
-    })
-    result = solver.refine_current(
-        Visual(), np.eye(4), _state(0), _state(0.1), _samples(), np.eye(4)
-    )
-    assert result is not None
-    assert np.isclose(result.pose[0, 3], 0.001, atol=1e-7)
-    assert abs(result.pose[2, 3]) < 1e-7
 
 
 def test_normalflow_rows_and_pose_jacobian_follow_original_method():

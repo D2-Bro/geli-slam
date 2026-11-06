@@ -10,7 +10,7 @@ in the YAML passed as `config_path`:
 timestamp_source: recorded_source
 ```
 
-Without `recorded_source_bag_path`, the tracker subscribes to
+The tracker subscribes to
 `camera_timing_topic` (default `/gelsight/timing`, `std_msgs/String`) and
 `imu_device_time_topic` (default `/imu/device_time_ms`, `std_msgs/UInt32`).
 It uses camera `source_pts_ns` and unwrapped IMU device milliseconds for
@@ -33,13 +33,6 @@ This avoids moving previously used navigation times when later receipt jitter
 changes. Topic mode does not estimate long-term clock-rate drift. Pending
 queues are bounded; invalid clock transitions or overflow stop source timing
 with an error, without a header-time fallback.
-
-For deterministic offline pairing and full-recording clock-rate estimation,
-optionally set `recorded_source_bag_path: /absolute/path/to/bag_0.db3`.
-The tracker then reads the paired timing topics from that database at startup,
-matches replayed messages to their recorded partners, and fits separate robust
-affine source-to-host maps. This explicit database mode does not subscribe to
-the timing topics. An unmatched replayed message is dropped.
 
 In both modes, `image_to_imu_time_offset_s` is added to camera integration
 times. Published frame/keyframe headers retain the original ROS headers.
@@ -71,27 +64,6 @@ as an `ImuFactor`. When the setting is true, the same preintegration
 is used for prediction and optimization. Raw IMU measurements are integrated
 at the IMU origin. No sensor-to-body offset correction is applied to them.
 The calibrated transform is applied to tactile observations instead.
-
-Set `imu_config.frontend_imu_prediction_only: true` to use the existing IMU
-prediction as the contact target State without optimization. This optional
-boolean defaults to false and requires the frontend to be enabled and
-initialized. It overrides `frontend_initialize_from_imu_preintegration: false`
-and both fixed/joint optimization modes. Pose and world velocity are predicted
-from the last accepted navigation State through the target image time; both
-biases are copied from that State. No NormalFlow factor is built, no optimizer
-iteration runs, and carried/pending marginal priors are cleared. The existing
-SCR/CCS gate and normal-correspondence projection are bypassed as well.
-Each valid IMU prediction becomes the next navigation State, regardless of
-visual contact overlap or similarity. Missing IMU coverage or an invalid
-prediction still rejects the target without a GelSight-only registration.
-GT input controls, when enabled, still run before prediction. Startup, no-contact propagation,
-and backend behavior are unchanged. Statistics use `imu_prediction_only_calls`,
-`imu_prediction_only_accepted` instead of counting these predictions as VI
-optimization calls. The legacy `imu_prediction_only_quality_rejected` counter
-remains zero because this mode no longer evaluates visual quality.
-
-Bias estimation from motion requires joint state optimization
-(`frontend_fix_previous_state: false` and `gtsam_vi_marginalization: true`).
 
 `imu_config.integration_method` accepts only `midpoint` (default). It averages
 the two observations bounding each sample interval, subtracts the anchor biases,
@@ -144,19 +116,6 @@ and it is separate from accelerometer and gyroscope measurement densities.
 Changing it leaves the mean preintegration unchanged but changes its weight
 in optimization. A smaller value alone can worsen tracking; the reported
 experiments vary it together with the tactile observation weight.
-
-Set `imu_config.frontend_fix_previous_state: true` to hold the previous
-pose, world velocity, accelerometer bias, and gyro bias constant throughout
-each frontend optimization. Only the target state is optimized. This flag
-defaults to false and takes precedence over `gtsam_vi_marginalization`:
-the fixed-state mode bypasses joint marginalization, clears any carried
-prior, and does not create a new marginal prior. It fixes the previous
-navigation state supplied to the solve, not the visual reference frame.
-Existing GT input controls, if enabled, run before that state is fixed.
-The motion factor uses the fixed previous bias. Target bias is connected
-only by the bias random-walk factor, so its optimum equals the fixed
-previous bias. This mode does not estimate new biases from tactile motion.
-Prediction, the frame quality gate, and IMU recovery remain unchanged.
 
 Set `imu_config.gtsam_vi_height_z_enabled: true` to add a conditional height
 measurement to the contact frontend. It defaults to false; the bag simulation
@@ -296,27 +255,25 @@ imu_config:
   # jointly with the physical mount; zero is valid only for synchronized clocks.
   image_to_imu_time_offset_s: 0.0
   max_coast_duration_s: 1.0
-  # Optional gravity in the first GelSight trial frame.
-  frontend_gravity_mps2: [0.0, 0.0, -9.81]
   accelerometer_noise_density: 0.02
   gyroscope_noise_density: 0.002
   accelerometer_bias_random_walk: 0.0002
   gyroscope_bias_random_walk: 0.00002
 ```
 
-When `frontend_gravity_mps2` is set directly, express it in the trial's first
-GelSight frame. The frontend uses that vector without rotating its pose or
-velocity. An absent value with `fixed_world_z` uses -Z. Published tracker and
-keyframe poses use the same trial frame. The
-four noise fields are continuous-time SI noise values and should be replaced
+With `fixed_world_z` the frontend uses -Z gravity (`gravity_mps2`) in the
+trial's first GelSight frame. Published tracker and keyframe poses use the
+same trial frame. The four noise fields are continuous-time SI noise values and should be replaced
 by the calibrated sensor values.
 
 `frontend_optimization` enables the tracker-local solve. Each iteration
 selects the current shared contact pixels and calculates the original
 NormalFlow normal residuals and Jacobians. GTSAM linearizes its native
-`CombinedImuFactor` at the same state. A `GaussianFactorGraph` solves both
-sets of rows with the previous navigation state fixed. A successful joint
-solve keeps its optimized Z pose. The frontend no longer has a standalone
+`ImuFactor` and a separate bias random-walk factor at the same state. The
+reference-marginalization solver optimizes both sets of rows together with
+the reference pose and the previous navigation State (see
+`docs/frontend_reference_marginalization.txt`). A successful joint solve
+keeps its optimized Z pose. The frontend no longer has a standalone
 visual-only NormalFlow fallback.
 
 After a successful joint update, the tracker keeps the solved velocity and
@@ -328,28 +285,6 @@ The configured IMU noise, gravity direction, and sensor transform must match
 the native factor's conventions.
 
 ## Stationary IMU initialization before contact
-
-To use the first few seconds of IMU measurements, set:
-
-```yaml
-imu_config:
-  static_initialization:
-    enabled: true
-    mode: startup_duration
-    duration_s: 5.0
-```
-
-`startup_duration` starts at the first accepted IMU measurement in the selected
-IMU clock. `duration_s` is the length of that startup interval in seconds.
-The node's startup time and the first processed image do not set this origin.
-The sensor must be stationary during this interval. `real_far_config.yaml`
-uses the first 5 seconds for `far-agc-off-pilot-20261015/trial_004`.
-The tracker uses only IMU data up to the current image time to complete the
-interval. It sets zero velocity at the interval end, then predicts from that
-anchor to the first contact. It does not detect a later stationary interval
-or reset the origin when the propagation deadline expires. Missing start
-coverage requires replay from the beginning. Do not set `start_time_s` or
-`end_time_s` in this mode. Existing `fixed_time` settings remain absolute.
 
 To use the operator rest events recorded on `/geli/events`, set:
 
@@ -381,6 +316,32 @@ The zero-velocity anchor then moves to `motion_pre_peak_margin_s` (default
 integration from GO. Without such a sample, the anchor stays at GO.
 `max_propagation_s` limits the time from the zero-velocity anchor to the first
 contact.
+
+Live operation (`launch/live_vi_launch.py`, `live_thick_far_config.yaml`) uses
+the same `recorded_rest_event` settings as `real_objects_config.yaml`. The
+launch starts `rest_event_node` (`rest_events:=true`, `rest_duration_s:=5.0`),
+which opens the window "GelSLAM rest events". After the tracker background is
+confirmed, press SPACE in that window. The node publishes
+`recorded_rest_started`, shows a countdown of `rest_duration_s` (default 5 s,
+the real-objects recording value), and checks that the IMU samples cover the
+rest interval. Then it publishes `recorded_rest_completed` and `trial_ready`,
+and shows `GO`. If the check fails, the node does not publish GO. Before the
+first contact, press SPACE again to repeat the rest; the tracker discards the
+earlier rest interval. The event times come from the host wall clock, which is
+the axis of the live IMU and image header stamps. A segment restart after an
+IMU gap does not use rest events; it uses stationary detection.
+
+The live configuration does not store T_GI. It names a calibration file in
+`imu_config.gelsight_T_imu_calibration` (`path`, default `slot`, and `slots`,
+which maps a slot name to an `imu_slots` key of the file). At startup each node
+reads `imu_slots.<key>.T_G_I<key>` (IMU coordinates into GelSight coordinates)
+and uses it as `gelsight_T_imu`. Select the slot with
+`ros2 launch gelslam live_vi_launch.py imu_slot:=near` or `imu_slot:=far`
+(`far` is the file key `top`). Without `imu_slot`, the default `slot` applies.
+The tracker log shows the selected entry and the IMU origin in the GelSight
+frame. A configuration must not give both `gelsight_T_imu` and the calibration
+block. The tracker and the backend stop with an error if the block is not
+resolved.
 
 Set `imu_config.static_initialization.enabled: true` to initialize from a
 stationary, no-contact IMU interval. The hardware and real-bag configurations
@@ -430,7 +391,6 @@ The previous automatic detector remains available as an explicit alternative:
 imu_config:
   enabled: true
   frontend_optimization: true
-  gtsam_vi_marginalization: true
   # Supply the calibrated 4x4 gelsight_T_imu transform in this same section.
   static_initialization:
     enabled: true
@@ -506,9 +466,8 @@ endpoint interpolation, must not exceed `max_sample_gap_s`. The image-to-IMU
 time offset and recorded-source clock selection apply before these checks.
 Stationary detection never uses samples later than the current image time.
 
-While enabled, this mode takes precedence over `frontend_gravity_initialization`,
-`frontend_gravity_mps2`, `gravity_initialization`, and
-`frontend_first_trial_velocity_from_gt`. The tracker logs superseded fields
+While enabled, this mode takes precedence over `frontend_gravity_initialization`
+and `frontend_first_trial_velocity_from_gt`. The tracker logs superseded fields
 and does not subscribe to GT for initialization. `gravity_mps2`, sensor biases,
 noise, mounting calibration, timing and residual weights keep their stated
 roles. Startup uncertainty propagation uses physical IMU noise without the
@@ -526,70 +485,6 @@ requires a new no-contact rest interval; a successful short-gap reacquisition
 continues the accepted VI state without reinitialization.
 
 ## Simulation GT initialization
-
-The diagnostic accepts independent controls under `imu_config`:
-
-```yaml
-frontend_gt_previous_state_test:
-  enabled: true
-  previous_pose_from_gt: true
-  previous_velocity_from_gt: true
-  reference_pose_from_gt: false
-  reset_marginal_prior: false
-  previous_state_time: accepted_state
-```
-
-This example changes only the previous IMU pose/velocity. Toggle each field
-independently. For a reference-only test, disable both previous-state fields
-and enable `reference_pose_from_gt`. For a prior-only test, disable all GT
-fields and enable `reset_marginal_prior`. Pose-only and velocity-only tests are
-also supported. `enabled: false` disables all interventions, regardless of
-subfield values. Existing boolean `true` remains the original all-on diagnostic
-with `previous_state_time: previous_image`; boolean `false` remains off.
-The supplied preset's enabled value is preserved when expanding its controls.
-
-Use `accepted_state` for independent ablations: it retains the previously
-accepted navigation state's timestamp, so preintegration boundaries stay fixed
-and the old prior refers to the same physical state. The shipped mapping configs
-use this policy so changing only pose or velocity remains valid after an image
-is rejected. `previous_image` selects
-the immediately preceding input image, including rejected images. If that moves
-the timestamp, both pose and velocity must come from GT. An old marginal prior
-cannot constrain a different IMU time; reset it or choose `accepted_state`.
-Reference-only and prior-only controls leave the previous state/time unchanged.
-
-Enabled GT fields use full `/ground_truth/imu_pose` messages (or
-`ground_truth_imu_pose_topic`). Positions use linear interpolation, rotations
-SLERP, and velocity native central differences plus linear interpolation.
-There is no smoothing or extrapolation. Missing required GT coverage stops the
-test explicitly. Prior-only and all-false controls require no diagnostic GT.
-
-One fixed transform from the trial's initial IMU state expresses GT in the
-existing navigation world. This transform is retained until the next trial;
-the initial anchor GT is not queried again after it leaves the bounded buffer.
-The current target still uses the existing frontend
-initializer and joint optimizer. Target GT is not an optimizer input. Biases
-remain estimated. No-contact-only predictions keep their existing path.
-Unavailable VI inputs or a failed solve reject the target without a visual-only
-fallback. The previous GT state is a starting value, not a hard
-constraint; joint optimization can change it.
-
-With `reset_marginal_prior: true`, the old posterior is discarded and the solver
-creates its usual initial prior. With it false, the same-time frozen prior's
-anchor, matrix and residual gradient remain unchanged, even if its mean differs
-from the GT starting value. It is linearized at that starting value. A missing
-prior still uses the usual initial prior. If the accepted state jumped to a
-different time after ordinary tracking/recovery, the invalid old-time prior
-uses the normal initial-prior path, recorded as `initial_timestamp_change`.
-This mandatory restart is separate from a requested per-frame reset. With the
-diagnostic disabled, the original automatic prior selection remains unchanged.
-
-`latest_gt_state_test` records controls, timestamps, corrected/predicted/optimized
-states and `prior_source` (`initial`, `retained`, `initial_timestamp_change` or `none`). A prior toggle has no
-effect when marginalization is disabled. Use a common time policy and compare
-one field/group at a time, then combinations to check interactions. Good
-prediction followed by larger optimization error narrows the investigation to
-the optimization/measurement path; it does not alone prove an optimizer bug.
 
 For simulation only, set `frontend_gravity_initialization` to
 `ground_truth_initial_pose`. One `/ground_truth/gel_pose` orientation near the
@@ -620,8 +515,8 @@ Once the first trial has a complete accepted state, the tracker spin owner
 stops callback dispatch and drains all submitted executor work. It then deletes
 only the initialization GT IMU subscription and clears its position buffer.
 A new executor resumes the same node, state, IMU buffer and marginal prior.
-Subscription deletion does not run in a timer or sensor callback. Continuous
-GT diagnostics and the separate GT velocity-evaluation subscription remain active.
+Subscription deletion does not run in a timer or sensor callback. The separate
+GT velocity-evaluation subscription remains active.
 The experimental single-process adapter also places retirement after its queued
 tracking inputs and waits for that worker before resuming ROS dispatch.
 
@@ -661,11 +556,11 @@ navigation State's pose, velocity, and both biases into the target's initial
 guess, sets its timestamp to the target image's IMU time, and rebuilds the
 initial visual correspondences. The reference, anchor-to-target IMU samples,
 preintegration, and physical IMU prediction used by the consistency gate stay
-the same. The retry uses the selected ordinary, fixed-keyframe, or recovery
-reference VI solver. It must pass the existing SCR/CCS and IMU consistency
+the same. The retry calls the same VI solve, also for an IMU-only recovery
+reference. It must pass the existing SCR/CCS and IMU consistency
 checks before the tracker accepts its State and commits its marginal prior.
 An initializer already configured to use the previous State does not repeat
-the same attempt. IMU prediction-only mode does not use this retry.
+the same attempt.
 
 `previous_state_retry_calls` counts these additional solver calls.
 `previous_state_retry_accepted` counts retries accepted by all quality checks.
@@ -688,9 +583,8 @@ remain as legacy summary keys; new execution paths never increment them.
 `vi_solve_calls`, `vi_accepted`, and `vi_quality_rejected` report the VI path.
 An accepted VI result means the outer SCR/CCS gate also passed.
 
-These are call counts, not distinct image counts. Reacquisition can try a
-keyframe and then the last tactile image for the same target image. Each
-attempt counts separately. A VI result rejected by SCR/CCS is not counted
+These are call counts, not distinct image counts. A previous-state retry
+adds a second solver call for the same target image. A VI result rejected by SCR/CCS is not counted
 as `frontend_failed_calls`. The counters do not change pose estimation.
 
 ## Image/IMU input synchronization

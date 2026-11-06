@@ -8,12 +8,12 @@ import argparse
 import cv2
 import numpy as np
 import open3d as o3d
-import yaml
 from cv_bridge import CvBridge
 from std_msgs.msg import Header
 
 from gelslam.core.coverage_graph import CoverageGraph, create_visible_coverage_graph_msg
 from gelslam.core.frame import center_of_frame_msg, frame_msg2mesh, pose_of_frame_msg
+from gelslam.core.imu_mount_calibration import load_config
 from gelslam.core.keyframe import KeyFrameDB, compute_adjusted_pointcloud
 from gelslam.core.parent_groups_info import ParentGroupsInfo
 from gelslam.core.pose_graph import PoseGraph, PoseGraphSolutions
@@ -66,9 +66,8 @@ def main():
     args = parser.parse_args()
 
     # Load configuration
-    with open(args.config_path, "r") as f:
-        config = yaml.safe_load(f)
-        ppmm = config["device_config"]["ppmm"]
+    config = load_config(args.config_path)
+    ppmm = config["device_config"]["ppmm"]
 
     # Get the calibration model path
     calib_model_path = config["device_config"]["calibration_model_path"]

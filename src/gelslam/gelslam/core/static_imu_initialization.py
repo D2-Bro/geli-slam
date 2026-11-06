@@ -26,7 +26,6 @@ DEFAULTS = {
     "mode": "stationary_detection",
     "start_time_s": None,
     "end_time_s": None,
-    "duration_s": None,
     "window_s": 1.0,
     "min_samples": 50,
     "accel_std_threshold_mps2": 0.05,
@@ -80,9 +79,9 @@ def resolve_static_imu_config(config, gelsight_T_imu):
     if not isinstance(settings['gyro_bias_uncertainty_from_samples'], bool):
         raise ValueError('static_initialization.gyro_bias_uncertainty_from_samples must be a boolean')
     mode = settings["mode"]
-    if mode not in {"stationary_detection", "fixed_time", "startup_duration", "recorded_rest_event"}:
-        raise ValueError("static_initialization.mode must be 'stationary_detection', 'fixed_time', "
-                         "'startup_duration' or 'recorded_rest_event'")
+    if mode not in {"stationary_detection", "fixed_time", "recorded_rest_event"}:
+        raise ValueError("static_initialization.mode must be 'stationary_detection', 'fixed_time' "
+                         "or 'recorded_rest_event'")
     if not isinstance(settings["motion_check"], bool):
         raise ValueError("static_initialization.motion_check must be a boolean")
     if settings["motion_check"] and mode != "recorded_rest_event":
@@ -102,21 +101,13 @@ def resolve_static_imu_config(config, gelsight_T_imu):
             raise ValueError("static_initialization.end_time_s must be after start_time_s")
     elif any(settings[name] is not None for name in ("start_time_s", "end_time_s")):
         raise ValueError("static_initialization start_time_s/end_time_s require mode: fixed_time")
-    if mode == "startup_duration":
-        value = settings["duration_s"]
-        if (value is None or isinstance(value, bool)
-                or not np.isfinite(float(value)) or float(value) <= 0):
-            raise ValueError("static_initialization.duration_s must be positive and finite")
-        settings["duration_s"] = float(value)
-    elif settings["duration_s"] is not None:
-        raise ValueError("static_initialization.duration_s requires mode: startup_duration")
     detection_options = {
         "window_s", "accel_std_threshold_mps2", "gyro_std_threshold_rps",
         "gyro_mean_threshold_rps", "accel_mean_change_threshold_mps2",
         "gravity_norm_tolerance_mps2",
     }
     for name, value in settings.items():
-        if (name in {"enabled", "mode", "start_time_s", "end_time_s", "duration_s", "min_samples",
+        if (name in {"enabled", "mode", "start_time_s", "end_time_s", "min_samples",
                      "gyro_bias_uncertainty_from_samples", "events_topic", "motion_check",
                      "contact_velocity_sigma_mps"}
                 or (mode != "stationary_detection" and name in detection_options)
@@ -136,8 +127,7 @@ def resolve_static_imu_config(config, gelsight_T_imu):
     if (mode == "stationary_detection"
             and settings["max_propagation_s"] < settings["window_s"] * 0.5):
         raise ValueError("static_initialization.max_propagation_s must cover at least half window_s")
-    for name, default in (("enabled", False), ("frontend_optimization", False),
-                          ("gtsam_vi_marginalization", True)):
+    for name, default in (("enabled", False), ("frontend_optimization", False)):
         if config.get(name, default) is not True:
             raise ValueError("static_initialization requires imu_config.%s: true" % name)
     if gelsight_T_imu is None:
@@ -163,14 +153,10 @@ def resolve_static_imu_config(config, gelsight_T_imu):
             raise ValueError("imu_config.%s must be a finite three-vector" % name)
     overrides = []
     for name, value in (("frontend_gravity_initialization", "static_imu"),
-                        ("gravity_initialization", "measured_acceleration"),
                         ("frontend_first_trial_velocity_from_gt", False)):
         if name in effective and effective[name] != value:
             overrides.append(name)
         effective[name] = value
-    if "frontend_gravity_mps2" in effective:
-        overrides.append("frontend_gravity_mps2")
-        del effective["frontend_gravity_mps2"]
     return effective, settings, tuple(overrides)
 
 
@@ -210,8 +196,6 @@ class StaticImuInitializer:
             if settings["mode"] == "fixed_time"
             else "waiting for a stationary no-contact IMU window"
         )
-        if settings["mode"] == "startup_duration":
-            self.status = "waiting for the first %.3f s of IMU measurements" % settings["duration_s"]
         self._go_time = None
         if settings["mode"] == "recorded_rest_event":
             self.status = "waiting for %s events on %s" % ("/".join(REST_EVENTS), settings["events_topic"])
@@ -228,6 +212,11 @@ class StaticImuInitializer:
             return False
         self._fixed_start_time, self._fixed_end_time, self._go_time = start, end, go
         return True
+
+    def rest_sequence_replaced(self, rest_events):
+        """True when a new recorded_rest_started follows the resolved sequence."""
+        return (self._go_time is not None
+                and (rest_events or {}).get("recorded_rest_started") != self._fixed_start_time)
 
     @staticmethod
     def _statistics(samples):
@@ -256,20 +245,12 @@ class StaticImuInitializer:
         walk = float(self.config.get('gyroscope_bias_random_walk', .00002))**2 * np.sum(dt*(np.arange(1,count)/count)**2)
         self.stationary_gyro_sigma_rps = float(np.sqrt(white+walk))
 
-    def observe(self, samples, *, stream_start_time=None, rest_events=None):
-        """Collect a fixed startup interval or select a past stationary window."""
+    def observe(self, samples, *, rest_events=None):
+        """Collect a fixed or recorded-rest interval, or select a past stationary window."""
         if (self.settings["mode"] == "recorded_rest_event" and self._go_time is None
                 and not self._resolve_rest_events(rest_events)):
             # Keep samples unconsumed; the caller resends them from its collection start.
             return
-        if self.settings["mode"] == "startup_duration" and self._fixed_start_time is None:
-            samples = tuple(samples)
-            if stream_start_time is None:
-                if not samples:
-                    return
-                stream_start_time = samples[0].timestamp
-            self._fixed_start_time = stream_start_time
-            self._fixed_end_time = stream_start_time + self.settings["duration_s"]
         if self.settings["mode"] != "stationary_detection":
             self._observe_fixed_interval(samples)
             return
@@ -376,8 +357,6 @@ class StaticImuInitializer:
                 self.stationary = (self._go_time, mean_accel, mean_gyro)
                 self.status = ("recorded rest interval ready: %.9f -> %.9f; GO=%.9f; samples=%d"
                                % (start, end, self._go_time, len(interval)))
-            elif self.settings["mode"] == "startup_duration":
-                self.status = "startup IMU interval ready: first %.3f s; samples=%d" % (self.settings["duration_s"], len(interval))
             else:
                 self.status = "fixed absolute IMU interval ready: %.9f -> %.9f; samples=%d" % (start, end, len(interval))
             return

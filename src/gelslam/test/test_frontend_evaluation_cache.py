@@ -5,9 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from gelslam.core import gtsam_vi as gv
 from gelslam.core import numpy_vi as nv
-from gelslam.core.inertial import ImuSample
 
 
 def visual_pair(dtype=np.float32):
@@ -151,52 +149,3 @@ def test_ic_rows_remain_independent_and_refresh_after_reference_edits(replace_ar
         actual = visual.evaluate_ic(reference, target)
         for value, wanted in zip(actual, expected):
             np.testing.assert_array_equal(value, wanted)
-
-
-@pytest.mark.parametrize('fixed_previous', [False, True])
-def test_native_values_are_shared_per_state_and_refreshed_after_updates(
-        monkeypatch, fixed_previous):
-    previous = nv.NavigationState(0., np.eye(4), np.array([.1, -.2, .3]),
-                                  np.zeros(3), np.zeros(3))
-    samples = [ImuSample(t, [0., 0., 9.81], [0., 0., .1])
-               for t in np.linspace(0., .1, 11)]
-    solver = gv.GtsamVisualInertialSolver({
-        'frontend_fix_previous_state': fixed_previous,
-        'gtsam_vi_min_iterations': 7, 'gtsam_vi_max_iterations': 7})
-    target, pim = solver.predict_current(previous, samples, np.eye(4))
-    target.pose[0, 3] += .001
-    target.accel_bias += .01
-    constructed, consumed = [], []
-    original_values, original_terms = gv._imu_values, gv.navigation_factor_terms
-    def values(*args):
-        result = original_values(*args)
-        constructed.append(result)
-        return result
-    def terms(factor, anchor, current, *, values=None):
-        assert values is not None
-        for key, expected in ((gv.POSE_I, anchor.pose), (gv.POSE_J, current.pose)):
-            np.testing.assert_array_equal(values.atPose3(key).matrix(), expected)
-        for key, expected in ((gv.VELOCITY_I, anchor.velocity),
-                              (gv.VELOCITY_J, current.velocity)):
-            np.testing.assert_array_equal(values.atVector(key), expected)
-        for key, state in ((gv.BIAS_I, anchor), (gv.BIAS_J, current)):
-            bias = values.atConstantBias(key)
-            np.testing.assert_array_equal(bias.accelerometer(), state.accel_bias)
-            np.testing.assert_array_equal(bias.gyroscope(), state.gyro_bias)
-        consumed.append(values)
-        return original_terms(factor, anchor, current, values=values)
-    class FlatVisual:
-        def __len__(self):
-            return 10
-        def evaluate(self, *_):
-            return np.zeros(30), np.zeros((30, 6)), np.zeros((30, 6))
-    monkeypatch.setattr(gv, '_imu_values', values)
-    monkeypatch.setattr(gv, 'navigation_factor_terms', terms)
-    result = solver.refine_current(FlatVisual(), np.eye(4), previous, target,
-                                   samples, np.eye(4), preintegrated=pim)
-    assert result is not None
-    assert len(solver.last_optimization_trace) == 7
-    assert len(constructed) == 8
-    assert all(consumed[i] is consumed[i + 1] for i in range(0, len(consumed), 2))
-    if not fixed_previous:
-        assert consumed[-1] is constructed[-1]  # Retained-prior linearization.

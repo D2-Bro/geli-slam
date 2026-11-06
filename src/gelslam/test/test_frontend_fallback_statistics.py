@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from gelslam.core.gtsam_vi import GtsamVisualInertialSolver
+from gelslam.core.gtsam_vi import create_frontend_solver
 from gelslam.core.inertial import ImuBuffer, ImuSample
 from gelslam.core.numpy_vi import NavigationState
 from gelslam.core.tracker import Tracker, QualityGateError, LoseTrackError
@@ -28,15 +28,16 @@ class FlatVisual:
 
 
 def test_low_shared_points_reason_uses_actual_gate_and_resets_on_next_solve():
-    solver = GtsamVisualInertialSolver({"gtsam_vi_max_iterations": 1})
+    solver = create_frontend_solver({"gtsam_vi_max_iterations": 1})
     samples = [ImuSample(t, (0, 0, 9.81), (0, 0, 0)) for t in (1.0, 1.1)]
     args = (np.eye(4), state(1.0), state(1.1), samples, np.eye(4))
     assert solver.refine_current(FlatVisual(9), *args) is None
     assert solver.last_refinement_failure == "initial_shared_points_lt_10"
     assert solver.refine_current(FlatVisual(10), *args) is not None
     assert solver.last_refinement_failure is None
+    # Without a visual residual there is no solve; it reports the same gate.
     assert solver.refine_current(None, *args) is None
-    assert solver.last_refinement_failure is None
+    assert solver.last_refinement_failure == "initial_shared_points_lt_10"
 
 
 def make_tracker(monkeypatch):
@@ -56,6 +57,10 @@ def make_tracker(monkeypatch):
     tracker.frontend_visual_inertial = SimpleNamespace(
         predict_current=lambda *_args: (state(1.1), object()),
         refine_current=lambda *_args, **_kwargs: None,
+        set_reference=lambda *_args: None,
+        last_reference_pose=np.eye(4),
+        reference_id=0,
+        first_pose_id=0,
         last_refinement_failure="initial_shared_points_lt_10",
     )
     monkeypatch.setattr(tm, "DenseNormalResidual", lambda *_args, **_kwargs: FlatVisual())
@@ -89,7 +94,7 @@ def test_failure_reasons_reject_without_a_tactile_only_fallback(monkeypatch, rea
     counts = tracker.frontend_tracking_statistics()
     assert counts[reason] == counts["frontend_failed_calls"] == counts["refine_calls"] == 1
     assert counts["normalflow_only_calls"] == counts["normalflow_only_accepted"] == 0
-    assert counts["vi_accepted"] == counts["imu_prediction_only_accepted"] == 0
+    assert counts["vi_accepted"] == 0
     reasons = ("vi_unavailable", "imu_prediction_unavailable",
                "initial_shared_points_lt_10", "vi_refinement_failed_other")
     assert sum(counts[key] for key in reasons) == 1
@@ -149,6 +154,7 @@ def test_counts_survive_solver_replacement_and_summary_includes_zeros(monkeypatc
     tracker.frontend_visual_inertial = SimpleNamespace(
         predict_current=lambda *_args: (state(1.1), object()),
         refine_current=lambda *_args, **_kwargs: None,
+        set_reference=lambda *_args: None,
         last_refinement_failure="initial_shared_points_lt_10",
     )
     with pytest.raises(LoseTrackError):

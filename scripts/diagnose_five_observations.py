@@ -22,20 +22,92 @@ os.environ['OPENBLAS_NUM_THREADS'] = '1'
 import numpy as np
 import torch
 import yaml
+from bisect import bisect_left
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
 from rclpy.serialization import deserialize_message
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 from sensor_msgs.msg import Image, Imu
 
 import gelslam.core.gtsam_vi as gv
 import gelslam.core.reference_tracking as rt
 import gelslam.core.tracker as tm
-from gelslam.core.gt_state_diagnostic import GroundTruthImuStates
 from gelslam.core.imu_navigation import gelsight_pose
 from gelslam.core.inertial import ImuSample
 from gelslam.core.numpy_vi import NavigationState
-from gelslam.core.split_pose import split_pose_coordinates
+from gelslam.core.split_pose import split_pose_coordinates, split_pose_plus
+
+
+class GroundTruthImuStates:
+    """Bounded native poses; interpolate position, rotation and central velocity."""
+
+    def __init__(self, max_samples=10000):
+        self.samples = []
+        self.max_samples = max_samples
+
+    def add(self, timestamp, rotation, position):
+        rotation, position = np.asarray(rotation), np.asarray(position)
+        if (not np.isfinite(timestamp) or rotation.shape != (3, 3)
+                or position.shape != (3,) or not np.all(np.isfinite(rotation))
+                or not np.all(np.isfinite(position))):
+            return False
+        pose = np.eye(4)
+        pose[:3, :3], pose[:3, 3] = rotation, position
+        index = bisect_left([t for t, _ in self.samples], timestamp)
+        if index < len(self.samples) and self.samples[index][0] == timestamp:
+            self.samples[index] = (float(timestamp), pose)
+        else:
+            self.samples.insert(index, (float(timestamp), pose))
+        if len(self.samples) > self.max_samples:
+            del self.samples[:-self.max_samples]
+        return True
+
+    def at(self, timestamp):
+        """Return a world IMU pose and velocity; never extrapolate GT."""
+        if not np.isfinite(timestamp) or not self.samples:
+            return None
+        times = [t for t, _ in self.samples]
+        right = bisect_left(times, timestamp)
+        if right == len(times):
+            return None
+        centers = (right,) if times[right] == timestamp else (right - 1, right)
+        velocities = []
+        for center in centers:
+            if center < 1 or center + 1 >= len(times):
+                return None
+            before, current, after = self.samples[center - 1:center + 2]
+            left_dt, right_dt = current[0] - before[0], after[0] - current[0]
+            left = (current[1][:3, 3] - before[1][:3, 3]) / left_dt
+            right_slope = (after[1][:3, 3] - current[1][:3, 3]) / right_dt
+            velocities.append((right_dt * left + left_dt * right_slope) / (left_dt + right_dt))
+        if len(centers) == 1:
+            return self.samples[right][1].copy(), velocities[0]
+        left = right - 1
+        fraction = (timestamp - times[left]) / (times[right] - times[left])
+        a, b = self.samples[left][1], self.samples[right][1]
+        pose = np.eye(4)
+        pose[:3, 3] = (1 - fraction) * a[:3, 3] + fraction * b[:3, 3]
+        pose[:3, :3] = Slerp(
+            [times[left], times[right]], Rotation.from_matrix([a[:3, :3], b[:3, :3]])
+        )([timestamp]).as_matrix()[0]
+        velocity = (1 - fraction) * velocities[0] + fraction * velocities[1]
+        return pose, velocity
+
+
+def navigation_plus(state, step):
+    result = NavigationState(
+        state.timestamp, split_pose_plus(state.pose, step[:6]),
+        state.velocity.copy(), state.accel_bias.copy(), state.gyro_bias.copy(),
+    )
+    result.velocity += step[6:9]
+    result.accel_bias += step[9:12]
+    result.gyro_bias += step[12:15]
+    return result
+
+
+def normal_huber_cost(residual, scale, delta, dim=3):
+    norms = np.linalg.norm(np.asarray(residual).reshape(-1, dim) * scale, axis=1)
+    return gv._normal_huber_cost_from_norms(norms, delta)
 
 
 def stamp(message):
@@ -93,7 +165,7 @@ class IterationObserver:
                 solver = values['self']
                 val_dict = values['values']
                 cand_dict = values['candidate']
-                layout = values['layout']
+                layout = values.get('solve_layout', values.get('layout'))
                 prior = values['prior']
                 factors = values['factors']
                 reference_id = values['reference_id']
@@ -108,7 +180,6 @@ class IterationObserver:
                 normal_cost = values['normal_cost']
                 rank = values['rank']
                 singular = values['singular']
-                rhs = values['rhs']
                 pose_steps = values['pose_steps']
 
                 prev_blocks = rt.state_blocks(prev_time)
@@ -122,12 +193,12 @@ class IterationObserver:
                                     if prev_blocks[0] in layout.slices else values['previous'])
                 curr_state_after = rt.navigation_state(cand_dict, curr_time)
 
-                curr_delta = layout.expanded_step(curr_blocks, step)
+                curr_delta = rt._expanded_step(layout, curr_blocks, step)
                 pose_step = curr_delta[:6]
                 velocity_step = curr_delta[6:9]
                 bias_step = curr_delta[9:15]
 
-                dp = (layout.expanded_step(prev_blocks, step)
+                dp = (rt._expanded_step(layout, prev_blocks, step)
                       if prev_blocks[0] in layout.slices else np.zeros(15))
 
                 ref_world = val_dict[reference_id]
@@ -140,9 +211,10 @@ class IterationObserver:
                 Jr, Jt = solver._normal_pose_rows(visual, ref_pose_gelsight, cur_pose_gelsight, Jr, Jt)
                 gel_J = values['gel_J']
                 normal_scale = np.sqrt(solver.visual_weight)
+                dim = gv._normal_dim(visual)
                 normal_A, normal_b, _, _ = gv._normal_huber_linearization(
                     residual, np.column_stack((Jr @ gel_J, Jt @ gel_J)),
-                    normal_scale, solver.normal_huber_delta_at(iteration))
+                    normal_scale, solver.normal_huber_delta_at(iteration), dim)
 
                 imu_terms = gv.navigation_factor_terms(factors[0], prev_state_before, curr_state_before)
                 bias_terms = gv.navigation_factor_terms(factors[1], prev_state_before, curr_state_before)
@@ -155,7 +227,12 @@ class IterationObserver:
                     prior_vals[reference_id] = ref_world
                 prior_cost = float(prior.error_values(prior_vals))
 
-                base_cost = float(rhs @ rhs / 2)
+                if 'squared_norm' in values:
+                    base_cost = float(values['squared_norm'] / 2)
+                elif 'rhs' in values:
+                    base_cost = float(values['rhs'] @ values['rhs'] / 2)
+                else:
+                    base_cost = normal_cost + imu_cost + bias_cost + prior_cost
                 active_rows = visual.last_active_rows
 
                 raw_norms_dict = dict(
@@ -356,8 +433,9 @@ def costs(record, previous, current, reference=None, oracle_z=False):
                                            gelsight_pose(current.pose, record['extrinsic']))[2,3])
     residual = visual.residual_on_fixed_rows(
         reference, gelsight_pose(current.pose, record['extrinsic']), record['active_rows'])
-    normal = None if residual is None else gv._normal_huber_cost(
-        residual, record['normal_scale'], solver.normal_huber_delta_at(record['iteration']))
+    dim = gv._normal_dim(visual)
+    normal = None if residual is None else normal_huber_cost(
+        residual, record['normal_scale'], solver.normal_huber_delta_at(record['iteration']), dim)
     values = gv._imu_values(previous,current)
     imu = solver.imu_weight * float(record['imu_factor'].error(values))
     bias = solver.imu_weight * float(record['bias_factor'].error(values))
@@ -420,8 +498,8 @@ def describe_iteration(record, truth, extrinsic, reference_time, path):
                       prior_frozen_rhs=record['prior'].rhs)
     derivative_sweep = []
     for epsilon in (1e-4,1e-3,1e-2,.1):
-        plus = costs(record,gv._navigation_plus(previous,dp*epsilon),gv._navigation_plus(current,delta*epsilon))
-        minus = costs(record,gv._navigation_plus(previous,-dp*epsilon),gv._navigation_plus(current,-delta*epsilon))
+        plus = costs(record, navigation_plus(previous,dp*epsilon), navigation_plus(current,delta*epsilon))
+        minus = costs(record, navigation_plus(previous,-dp*epsilon), navigation_plus(current,-delta*epsilon))
         derivative_sweep.append(dict(epsilon=epsilon,derivative={
             k:None if plus[k] is None or minus[k] is None else (plus[k]-minus[k])/(2*epsilon)
             for k in ('normal','imu','bias','prior','total')}))
@@ -430,7 +508,7 @@ def describe_iteration(record, truth, extrinsic, reference_time, path):
     for alpha in np.linspace(-.5,1.5,41):
         # Pose-only slice. All other variables and the shared rows are fixed.
         candidate = current.copy()
-        candidate.pose = gv.split_pose_plus(current.pose, correction*alpha)
+        candidate.pose = split_pose_plus(current.pose, correction*alpha)
         profile.append(dict(alpha=float(alpha),costs=costs(record,previous,candidate)))
     reference_gt = gelsight_pose(truth.at(reference_time).pose,extrinsic)
     points=record['visual'].candidate_points[record['active_rows']]
@@ -511,8 +589,12 @@ def replay(inputs, config, output, truth, observed, analysis_start, observations
                                                         [m.angular_velocity.x,m.angular_velocity.y,m.angular_velocity.z]))
                     else:
                         p=pose(m)
-                        add=tracker.add_ground_truth_gel_pose if name=='/ground_truth/gel_pose' else tracker.add_ground_truth_imu_pose
-                        add(stamp(m),p[:3,:3],p[:3,3])
+                        if name=='/ground_truth/gel_pose':
+                            tracker.add_ground_truth_gel_pose(stamp(m),p[:3,:3],p[:3,3])
+                        elif hasattr(tracker, 'add_ground_truth_imu_pose'):
+                            tracker.add_ground_truth_imu_pose(stamp(m),p[:3,:3],p[:3,3])
+                        elif hasattr(tracker, 'add_ground_truth_imu_position'):
+                            tracker.add_ground_truth_imu_position(stamp(m),p[:3,3])
                     index+=1
                 indices[name]=index
             before=state(tracker._frontend_vi_state);event_calls.clear()
@@ -533,7 +615,7 @@ def replay(inputs, config, output, truth, observed, analysis_start, observations
                                    calls=list(event_calls),reference_time=tracker._imu_timestamp(tracker.ref_header),
                                    mode=tracker.tracking_mode.value,
                                    after_error=truth.error(tracker._frontend_vi_state,tracker.gelsight_T_imu),
-                                   diagnostic=copy.deepcopy(tracker.latest_gt_state_test)))
+                                   diagnostic=copy.deepcopy(getattr(tracker, 'latest_gt_state_test', None))))
                 if not all_images and len(events)==observations:
                     break
     finally:

@@ -1,44 +1,30 @@
 """Frontend solve with separate 9D IMU and 6D bias random-walk factors."""
 
 import copy
-from contextlib import nullcontext
 
 import gtsam
 import numpy as np
 
-from gelslam.core.numpy_vi import NavigationState, adjoint, gelsight_z_pose_jacobian
-from gelslam.core.marginal_prior import (
-    NavigationPrior, marginalize_rows, marginalize_rows_system,
-)
-from gelslam.core.split_pose import solve_gaussian_qr, split_pose_plus
-from gelslam.core.imu_navigation import gelsight_pose, gelsight_pose_jacobian
-from gelslam.core.gt_state_diagnostic import resolve_gt_state_test
+from gelslam.core.numpy_vi import NavigationState, gelsight_z_pose_jacobian
 
 
 POSE_I, VELOCITY_I, POSE_J, VELOCITY_J, BIAS_I, BIAS_J = range(1, 7)
 _WIDTHS = (6, 3, 6, 3, 6, 6)
 
 
-def create_frontend_solver(config):
-    """Select the legacy pairwise or correlated reference/current frontend."""
-    mode = config.get("frontend_state_mode", "pairwise")
-    if mode == "reference_marginalization":
-        from gelslam.core.reference_tracking import ReferenceMarginalizationSolver
-        return ReferenceMarginalizationSolver(config)
-    if mode != "pairwise":
-        raise ValueError("frontend_state_mode must be pairwise or reference_marginalization")
-    return GtsamVisualInertialSolver(config)
+def create_frontend_solver(config, gravity=None):
+    """Create the reference/current marginalization frontend.
+
+    gravity: trial-axes gravity vector from the tracker's initialization;
+    None uses (0, 0, -gravity_mps2).
+    """
+    from gelslam.core.reference_tracking import ReferenceMarginalizationSolver
+    return ReferenceMarginalizationSolver(config, gravity)
 
 
 def _normal_dim(visual):
     """Residual rows per normal point: 3 (vector) or 2 (tangent)."""
     return int(getattr(visual, "residual_dim", 3))
-
-
-def _normal_huber_cost(residual, scale, delta, dim=3):
-    """Mean Huber cost per valid normal-point residual block."""
-    norms = np.linalg.norm(np.asarray(residual).reshape(-1, dim) * scale, axis=1)
-    return _normal_huber_cost_from_norms(norms, delta)
 
 
 def _normal_huber_cost_from_norms(norms, delta):
@@ -72,22 +58,6 @@ def _normal_huber_linearization(residual, jacobian, scale, delta, dim=3):
         _normal_huber_cost_from_norms(norms, delta),
         int(np.count_nonzero(outliers)),
     )
-
-
-def _normalflow_step_norms(reference_pose, target_pose, gel_from_imu_increment, pose_step,
-                           *, reference_inverse=None):
-    """Measure the target update in the reference GelSight IC coordinates.
-
-    For T = target_T_reference, T_new = T inv(dT). The IC correction is
-    dp = Ad(inv(T)) eta_gel to first order. Its XY components, not IMU-local
-    or world XY, are the planar update tested by original NormalFlow.
-    """
-    if reference_inverse is None:
-        reference_inverse = np.linalg.inv(reference_pose)
-    reference_T_target = reference_inverse @ target_pose
-    correction = adjoint(reference_T_target) @ gel_from_imu_increment @ pose_step
-    return dict(rotation_rad=float(np.linalg.norm(correction[:3])),
-                translation_xy_m=float(np.linalg.norm(correction[3:5])))
 
 
 def _bias(state):
@@ -317,6 +287,31 @@ def navigation_factor_terms(factor, previous, current, *, values=None):
     return previous_A, current_A, rhs
 
 
+# ImuFactor residual order is [rotation 0:3, position 3:6, velocity 6:9].
+_MOTION_FIRST = np.r_[3:9, 0:3]
+
+
+def split_rotation_motion_rows(factor, previous_A, current_A, rhs):
+    """Split whitened ImuFactor rows into (motion, rotation) row groups.
+
+    The factor whitens e = [e_R, e_p, e_v] with the upper-triangular U of its
+    noise model (U^T U = Sigma^-1). With Q0 R0 = U[:, (p, v, R)], Q0^T is
+    orthogonal and Q0^T U e = R0 [e_p; e_v; e_R]. Its last three rows are the
+    rotation marginal (gyroscope only: R_i, R_j and gyroscope bias). The first
+    six are position/velocity conditioned on rotation. Both groups together
+    have the same squared norm, so scaling only the motion rows keeps the
+    rotation information exact.
+    """
+    U = np.asarray(factor.noiseModel().R(), dtype=np.float64)
+    if U.shape != (9, 9) or len(rhs) != 9:
+        raise ValueError("rotation/motion split requires a 9D ImuFactor")
+    orthogonal, _ = np.linalg.qr(U[:, _MOTION_FIRST])
+    rows = orthogonal.T @ np.column_stack((previous_A, current_A, rhs))
+    width = previous_A.shape[1]
+    groups = rows[:6], rows[6:]
+    return tuple((g[:, :width], g[:, width:-1], g[:, -1]) for g in groups)
+
+
 def inertial_current_terms(pim, previous, current, config):
     """Stack separate IMU/bias rows for fixed-anchor diagnostics."""
     factors = (_split_imu_factor(pim), _bias_factor(pim, config))
@@ -347,17 +342,6 @@ def combined_imu_current_terms(pim, previous, current, factor=None):
     return blocks, rhs
 
 
-def _navigation_plus(state, step):
-    result = NavigationState(
-        state.timestamp, split_pose_plus(state.pose, step[:6]),
-        state.velocity.copy(), state.accel_bias.copy(), state.gyro_bias.copy(),
-    )
-    result.velocity += step[6:9]
-    result.accel_bias += step[9:12]
-    result.gyro_bias += step[12:15]
-    return result
-
-
 def _navigation_step_norms(step):
     """Unscaled navigation increments, with a separate norm for each SI unit."""
     return {name: float(np.linalg.norm(step[start:start + 3]))
@@ -369,13 +353,12 @@ def _navigation_step_norms(step):
 class GtsamVisualInertialSolver:
     """Solve normal/IMU rows with 9D fixed-bias or 15D navigation updates."""
 
-    def __init__(self, config):
+    def __init__(self, config, gravity=None):
         self.config = dict(config or {})
         configured_integration_method(self.config)
-        configured_gravity = self.config.get("frontend_gravity_mps2")
-        if configured_gravity is None:
-            configured_gravity = (0.0, 0.0, -float(self.config.get("gravity_mps2", 9.81)))
-        self.gravity = np.asarray(configured_gravity, dtype=np.float64)
+        if gravity is None:
+            gravity = (0.0, 0.0, -float(self.config.get("gravity_mps2", 9.81)))
+        self.gravity = np.asarray(gravity, dtype=np.float64)
         self.max_iterations = int(self.config.get("gtsam_vi_max_iterations", 10))
         self.min_iterations = self.config.get("gtsam_vi_min_iterations", 7)
         self.normal_huber_iterations = self.config.get("gtsam_vi_normal_huber_iterations", 5)
@@ -384,7 +367,6 @@ class GtsamVisualInertialSolver:
                 ("gtsam_vi_normal_huber_iterations", self.normal_huber_iterations, 0)):
             if type(value) is not int or value < minimum:
                 raise ValueError(name + " must be an integer >= " + str(minimum))
-        self.normal_sigma = float(self.config.get("dense_normalflow_normal_sigma", 1.0))
         self.visual_weight = float(self.config.get("dense_normalflow_residual_weight", 1.0))
         self.normal_huber_delta = float(self.config.get("gtsam_vi_normal_huber_delta", 0.4))
         self.normal_linearization = self.config.get(
@@ -398,6 +380,13 @@ class GtsamVisualInertialSolver:
                 "or target_relinearized"
             )
         self.imu_weight = float(self.config.get("imu_residual_weight", 1.0))
+        # Bias random-walk factor weight. Null or absent: use imu_residual_weight.
+        # Shipped configs set it explicitly, so a change of imu_residual_weight
+        # does not change the bias stiffness.
+        bias_weight = self.config.get("bias_residual_weight")
+        self.bias_weight = self.imu_weight if bias_weight is None else float(bias_weight)
+        if not np.isfinite(self.bias_weight) or self.bias_weight <= 0:
+            raise ValueError("bias_residual_weight must be positive and finite or null")
         self.height_z_enabled = self.config.get("gtsam_vi_height_z_enabled", False)
         if not isinstance(self.height_z_enabled, bool):
             raise ValueError("gtsam_vi_height_z_enabled must be a boolean")
@@ -407,8 +396,6 @@ class GtsamVisualInertialSolver:
             raise ValueError("gtsam_vi_height_z_sigma_m must be positive and finite")
         # Keep a zero-valued diagnostic attribute for older audit scripts.
         self.damping = 0.0
-        if float(self.config.get("gtsam_vi_damping", 0.0)) != 0.0:
-            raise ValueError("frontend Gauss-Newton does not support gtsam_vi_damping")
         self.rotation_stop = float(
             self.config.get("gtsam_vi_rotation_stop_rad", 1e-4)
         )
@@ -421,29 +408,12 @@ class GtsamVisualInertialSolver:
         self.initialize_from_imu_preintegration = self.config.get(
             "frontend_initialize_from_imu_preintegration", True
         )
-        # With initialize_from_imu_preintegration false: start the solve at the IMU
-        # rotation but keep the previous GelSight origin (zero relative translation).
-        self.initialize_rotation_from_imu = self.config.get("frontend_initialize_rotation_from_imu", False)
-        if not isinstance(self.initialize_rotation_from_imu, bool):
-            raise ValueError("frontend_initialize_rotation_from_imu must be a boolean")
-        self.fix_previous_state = self.config.get("frontend_fix_previous_state", False)
-        if not isinstance(self.fix_previous_state, bool):
-            raise ValueError("frontend_fix_previous_state must be a boolean")
-        self.imu_prediction_only = self.config.get("frontend_imu_prediction_only", False)
-        if not isinstance(self.imu_prediction_only, bool):
-            raise ValueError("frontend_imu_prediction_only must be a boolean")
         self.normal_reference_z_from_imu = bool(self.config.get(
             "gtsam_vi_normal_reference_z_from_imu", False
-        ))
-        self.normal_zero_pose_z_jacobian = bool(self.config.get(
-            "gtsam_vi_normal_zero_pose_z_jacobian", False
         ))
         self.last_optimization_trace = []
         self.last_fixed_normal_reference_z_m = None
         self.last_refinement_failure = None
-        self.marginalization_enabled = bool(self.config.get(
-            "gtsam_vi_marginalization", True
-        ))
         self.prior_sigmas = np.repeat([
             float(self.config.get("gtsam_vi_prior_rotation_sigma_rad", 0.01)),
             float(self.config.get("gtsam_vi_prior_translation_sigma_m", 0.0001)),
@@ -458,7 +428,7 @@ class GtsamVisualInertialSolver:
         if (self.gravity.shape != (3,) or not np.all(np.isfinite(self.gravity)) or
                 self.max_iterations < 1 or
                 not isinstance(self.initialize_from_imu_preintegration, bool) or
-                self.normal_sigma <= 0 or self.visual_weight <= 0 or
+                self.visual_weight <= 0 or
                 not np.isfinite(self.normal_huber_delta) or self.normal_huber_delta < 0 or
                 self.imu_weight <= 0 or
                 self.rotation_stop <= 0 or self.translation_stop <= 0):
@@ -475,32 +445,9 @@ class GtsamVisualInertialSolver:
     def discard_pending_prior(self):
         self.pending_marginal_prior = None
 
-    def propagate_prior(self, previous, current, pim, *, fixed_anchor=False):
-        """Transport the accepted 15D uncertainty through one IMU interval.
-
-        This is a candidate prior. The caller commits it only when it accepts
-        the corresponding prediction. Rejected visual rows never enter it.
-        """
-        factors = (_split_imu_factor(pim), _bias_factor(pim, self.config))
-        rows = [navigation_factor_terms(factor, previous, current) for factor in factors]
-        scale = np.sqrt(self.imu_weight)
-        if fixed_anchor:
-            return NavigationPrior(
-                current.copy(), np.vstack([row[1] * scale for row in rows]),
-                np.concatenate([row[2] * scale for row in rows]))
-        prior = self.marginal_prior
-        if prior is None:
-            prior = NavigationPrior.initial(previous, self.prior_sigmas)
-        elif abs(prior.anchor.timestamp - previous.timestamp) > 1e-9:
-            raise ValueError("IMU propagation prior belongs to a different timestamp")
-        Ap, bp = prior.linearize(previous)
-        reduced = marginalize_rows_system(
-            np.vstack([Ap] + [row[0] * scale for row in rows]),
-            np.vstack([np.zeros_like(Ap)] + [row[1] * scale for row in rows]),
-            np.concatenate([bp] + [row[2] * scale for row in rows]),
-        )
-        A, rhs = reduced.rows()
-        return NavigationPrior(current.copy(), A, rhs)
+    def inertial_scales(self):
+        """Row scales for the (IMU, bias random-walk) factor pair, in that order."""
+        return np.sqrt(self.imu_weight), np.sqrt(self.bias_weight)
 
     def prediction_pose_distance(self, predicted, candidate, prior):
         """Squared pose distance after marginalizing velocity and both biases."""
@@ -513,114 +460,12 @@ class GtsamVisualInertialSolver:
         information = np.linalg.pinv(covariance[:6, :6], rcond=1e-12)
         return float(delta @ information @ delta)
 
-    def refine_recovery_reference(self, visual, reference_pose, previous, current,
-                                  samples, gelsight_T_imu, preintegrated=None):
-        """Optimize both endpoints when the reference is an IMU-only keyframe."""
-        self.discard_pending_prior()
-        self.last_refinement_failure = None
-        self.last_optimization_trace = []
-        self.last_prior_source = "propagated_recovery_reference"
-        if visual is None or len(visual) < 10:
-            self.last_refinement_failure = "initial_shared_points_lt_10"
-            return None
-        prior = self.marginal_prior
-        if prior is None or not prior.matches(previous):
-            self.last_refinement_failure = "recovery_prior_mismatch"
-            return None
-        previous, current = previous.copy(), current.copy()
-        pim = preintegrated or preintegrate_imu(
-            samples, previous, self.config, gelsight_T_imu, self.gravity)
-        if pim is None:
-            return None
-        factors = (_split_imu_factor(pim), _bias_factor(pim, self.config))
-        gel_J = gelsight_pose_jacobian(gelsight_T_imu)
-        method = ("evaluate_ic" if self.normal_linearization == "inverse_compositional"
-                  else "evaluate_relinearized")
-        evaluate = getattr(visual, method, visual.evaluate)
-        width = 15
-
-        def rows_at(left, right, delta):
-            ref = gelsight_pose(left.pose, gelsight_T_imu)
-            tar = gelsight_pose(right.pose, gelsight_T_imu)
-            evaluated = evaluate(ref, tar)
-            if evaluated is None:
-                return None
-            residual, Jr, Jt = evaluated
-            if len(residual) < 10 * _normal_dim(visual):
-                return None
-            A, b, _, _ = _normal_huber_linearization(
-                residual, np.column_stack((Jr @ gel_J, Jt @ gel_J)),
-                np.sqrt(self.visual_weight), delta, _normal_dim(visual))
-            Ap, Ac, rhs = self._joint_rows(factors, prior, left, right)
-            normal_p, normal_c = np.zeros((len(b), width)), np.zeros((len(b), width))
-            normal_p[:, :6], normal_c[:, :6] = A[:, :6], A[:, 6:]
-            Ap, Ac, rhs = np.vstack((Ap, normal_p)), np.vstack((Ac, normal_c)), np.r_[rhs, -b]
-            height = self._height_z_linearization(visual, ref, tar, gel_J)
-            if height is None:
-                return None
-            if self.height_z_enabled:
-                Ht, hb, _ = height
-                # Relative target-local Z row, transported to the reference chart.
-                Hr = -self._height_z_jacobian(np.eye(6)) @ adjoint(np.linalg.inv(tar) @ ref) @ gel_J
-                Hp, Hc = np.zeros((1, width)), np.zeros((1, width))
-                Hp[:, :6], Hc[:, :6] = Hr, Ht
-                Ap, Ac, rhs = np.vstack((Ap, Hp)), np.vstack((Ac, Hc)), np.r_[rhs, -hb]
-            if not all(np.isfinite(v).all() for v in (Ap, Ac, rhs)):
-                return None
-            return Ap, Ac, rhs
-
-        for iteration in range(self.max_iterations):
-            delta = self.normal_huber_delta_at(iteration)
-            rows = rows_at(previous, current, delta)
-            if rows is None:
-                self.last_refinement_failure = "invalid_recovery_residual"
-                return None
-            reduced = marginalize_rows_system(*rows)
-            A, rhs = reduced.rows()
-            step, _, rank, _ = np.linalg.lstsq(A, rhs, rcond=1e-12)
-            if rank < width or not np.isfinite(step).all():
-                self.last_refinement_failure = "singular_recovery_system"
-                return None
-            previous_step = reduced.recover_previous(step)
-            previous = _navigation_plus(previous, previous_step)
-            current = _navigation_plus(current, step)
-            self.last_optimization_trace.append(dict(
-                iteration=iteration, variable_reference=True,
-                active_rows=getattr(visual, "last_active_rows", np.ones(10)).sum(),
-                base_cost=float(rows[2] @ rows[2] / 2)))
-            if (iteration + 1 >= self.min_iterations
-                    and max(np.linalg.norm(step[:3]), np.linalg.norm(previous_step[:3])) < self.rotation_stop
-                    and max(np.linalg.norm(step[3:6]), np.linalg.norm(previous_step[3:6])) < self.translation_stop):
-                break
-        rows = rows_at(previous, current, delta)
-        if rows is None:
-            return None
-        A, rhs = marginalize_rows_system(*rows).rows()
-        self.pending_marginal_prior = NavigationPrior(current.copy(), A, rhs)
-        self.last_reference_state = previous
-        return current
-
     def normal_huber_delta_at(self, iteration):
         """Use Huber only on normal rows in the first configured GN iterations.
 
         iteration is zero based; the default five-step phase is indices 0..4.
         """
         return self.normal_huber_delta if iteration < self.normal_huber_iterations else 0.0
-
-    def _joint_rows(self, factors, prior, previous, current, *, values=None):
-        # Huber is restricted to the normal measurements. IMU, bias and prior
-        # retain their ordinary whitened least-squares rows in every iteration.
-        Ap, bp = (np.empty((0, 15)), np.empty(0)) if prior is None else prior.linearize(previous)
-        if values is None:
-            values = _imu_values(previous, current)
-        rows = [navigation_factor_terms(factor, previous, current, values=values)
-                for factor in factors]
-        scale = np.sqrt(self.imu_weight)
-        previous_A = np.vstack([Ap] + [row[0] * scale for row in rows])
-        current_A = np.vstack([np.zeros((len(bp), 15))]
-                              + [row[1] * scale for row in rows])
-        return (previous_A, current_A,
-                np.concatenate([bp] + [row[2] * scale for row in rows]))
 
     def _height_z_jacobian(self, gel_from_imu_increment):
         return gelsight_z_pose_jacobian(gel_from_imu_increment, self.height_z_sigma)
@@ -663,22 +508,9 @@ class GtsamVisualInertialSolver:
         if (timestamp <= previous.timestamp or not np.isclose(
                 pim.deltaTij(), timestamp - previous.timestamp, rtol=0., atol=1e-9)):
             return None
-        if (not force and not self.initialize_from_imu_preintegration
-                and not self.imu_prediction_only):
+        if not force and not self.initialize_from_imu_preintegration:
             current = previous.copy()
             current.timestamp = timestamp
-            if self.initialize_rotation_from_imu:
-                try:
-                    rotation = np.asarray(pim.predict(
-                        gtsam.NavState(gtsam.Pose3(previous.pose), previous.velocity),
-                        _bias(previous)).pose().rotation().matrix(), dtype=np.float64)
-                except (RuntimeError, ValueError):
-                    return current, pim
-                transform = np.asarray(self.config.get("gelsight_T_imu", np.eye(4)), dtype=np.float64)
-                gel_in_imu = -transform[:3, :3].T @ transform[:3, 3]
-                gel_origin = previous.pose[:3, :3] @ gel_in_imu + previous.pose[:3, 3]
-                current.pose[:3, :3] = rotation
-                current.pose[:3, 3] = gel_origin - rotation @ gel_in_imu
             return current, pim
         try:
             predicted = pim.predict(
@@ -698,403 +530,3 @@ class GtsamVisualInertialSolver:
             ),
             pim,
         )
-
-    def refine_current(self, visual, reference_pose, previous, current, samples,
-                       gelsight_T_imu, preintegrated=None, *, fixed_anchor=False):
-        """Optimize IMU states; evaluate tactile observations with GelSight poses.
-
-        reference_pose is the fixed GelSight reference pose in the navigation world.
-        Each iteration builds the selected normal model and relinearizes the
-        inertial/prior terms, then applies the full undamped Gauss-Newton step.
-        Normal rows use Huber for the first five steps by default, then ordinary
-        least squares. Only the target's reference-IC rotation and XY correction
-        control convergence, starting at the seventh step. The maximum iteration
-        limit and invalid measurements can terminate the solve earlier.
-        Increasing finite cost does not reject a step or trigger a retry.
-        Prediction-only mode returns the supplied IMU prediction without a solve.
-        """
-        cache = getattr(visual, "cache_projections", None)
-        with cache() if cache is not None else nullcontext():
-            return self._refine_current(
-                visual, reference_pose, previous, current, samples,
-                gelsight_T_imu, preintegrated=preintegrated, fixed_anchor=fixed_anchor)
-
-    def refine_from_keyframe(self, *args, **kwargs):
-        """Condition on corrected K_k and form a fresh prior for target F_j."""
-        return self.refine_current(*args, **kwargs, fixed_anchor=True)
-
-    def _refine_current(self, visual, reference_pose, previous, current, samples,
-                        gelsight_T_imu, preintegrated=None, fixed_anchor=False):
-        """Run the solve while its image-pair projection cache is active."""
-        self.last_optimization_trace = []
-        self.last_fixed_normal_reference_z_m = None
-        self.last_refinement_failure = None
-        self.pending_marginal_prior = None
-        if self.imu_prediction_only:
-            # The tracker supplies predict_current()'s State. Keep the complete
-            # prediction. The tracker also bypasses SCR/CCS in this mode.
-            self.last_prior_source = 'imu_prediction_only'
-            self.marginal_prior = None
-            return current.copy()
-        fixed_previous = self.fix_previous_state or fixed_anchor
-        self.last_prior_source = ('backend_keyframe' if fixed_anchor else
-                                  'fixed_previous' if fixed_previous else 'none')
-        if fixed_previous and not fixed_anchor:
-            # The anchor is a constant, not an uncertain state to eliminate.
-            # Do not retain a posterior from a prior joint solve or startup seed.
-            self.marginal_prior = None
-        if visual is None or len(samples) < 2 or gelsight_T_imu is None:
-            return None
-        pim = preintegrated
-        if pim is None:
-            pim = preintegrate_imu(
-                samples, previous, self.config, gelsight_T_imu, self.gravity
-            )
-        if pim is None:
-            return None
-        reference_inverse = None
-        if self.normal_reference_z_from_imu:
-            predicted = pim.predict(
-                gtsam.NavState(gtsam.Pose3(previous.pose), previous.velocity),
-                _bias(previous),
-            )
-            reference_inverse = np.linalg.inv(reference_pose)
-            relative = (reference_inverse
-                        @ gelsight_pose(predicted.pose().matrix(), gelsight_T_imu))
-            self.last_fixed_normal_reference_z_m = float(relative[2, 3])
-            visual.set_fixed_reference_z(self.last_fixed_normal_reference_z_m)
-        if len(visual) < 10:
-            self.last_refinement_failure = "initial_shared_points_lt_10"
-            return None
-        imu_T_gelsight = np.linalg.inv(gelsight_T_imu)
-        if reference_inverse is None:
-            reference_inverse = np.linalg.inv(reference_pose)
-        nonlinear_imu_factor = _split_imu_factor(pim)
-        nonlinear_bias_factor = _bias_factor(pim, self.config)
-        inertial_factors = (nonlinear_imu_factor, nonlinear_bias_factor)
-        current = current.copy()
-        previous = previous.copy()
-        prior = None
-        if self.marginalization_enabled and not fixed_previous:
-            prior = self.marginal_prior
-            # A new trial or a tactile-only fallback has no continuous VI
-            # posterior. Initialize at that accepted state, not an old time.
-            controls = resolve_gt_state_test(self.config)
-            keep_prior = controls['enabled'] and not controls['reset_marginal_prior']
-            different_time = (prior is not None
-                              and abs(prior.anchor.timestamp - previous.timestamp) > 1e-9)
-            if (different_time and keep_prior
-                    and controls['previous_state_time'] == 'previous_image'):
-                raise RuntimeError(
-                    'Cannot retain a marginal prior at a different IMU timestamp; '
-                    'use previous_state_time: accepted_state or reset_marginal_prior: true'
-                )
-            if prior is None or different_time or (not keep_prior and not prior.matches(previous)):
-                prior = NavigationPrior.initial(previous, self.prior_sigmas)
-                self.last_prior_source = 'initial_timestamp_change' if different_time else 'initial'
-            else:
-                # Its frozen mean/gradient remain unchanged. Only linearize at
-                # the diagnostic starting value; do not silently recenter it.
-                self.last_prior_source = 'retained'
-        normal_scale = np.sqrt(self.visual_weight)
-        imu_scale = np.sqrt(self.imu_weight)
-        gel_from_imu_increment = gelsight_pose_jacobian(gelsight_T_imu)
-        height_jacobian = (self._height_z_jacobian(gel_from_imu_increment)
-                           if self.height_z_enabled else None)
-        # Select once so the solve and retained marginal prior use the same
-        # normal model. Generic residual providers continue to supply their J.
-        method, source = (
-            ("evaluate_ic", "reference_normal_map_ic")
-            if self.normal_linearization == "inverse_compositional" else
-            ("evaluate_relinearized", "target_normal_map")
-        )
-        normal_evaluator = getattr(visual, method, None)
-        normal_jacobian_source = source if normal_evaluator is not None else "residual_model"
-        if normal_evaluator is None:
-            normal_evaluator = visual.evaluate
-        values = None
-        height_terms = None
-        inertial_costs = None
-        target_gelsight_pose = current.pose @ imu_T_gelsight
-        for iteration in range(self.max_iterations):
-            normal_huber_delta = self.normal_huber_delta_at(iteration)
-            evaluated = normal_evaluator(
-                reference_pose, target_gelsight_pose)
-            if evaluated is None:
-                return None
-            residual, _, normal_jacobian = evaluated
-            if (len(residual) < 10 * _normal_dim(visual) or not np.all(np.isfinite(residual))
-                    or not np.all(np.isfinite(normal_jacobian))):
-                return None
-            if self.normal_zero_pose_z_jacobian:
-                normal_jacobian = normal_jacobian.copy()
-                normal_jacobian[:, 5] = 0.0
-            normal_jacobian = normal_jacobian @ gel_from_imu_increment
-            normal_A, normal_b, normal_cost, downweighted = (
-                _normal_huber_linearization(
-                    residual, normal_jacobian, normal_scale, normal_huber_delta,
-                    _normal_dim(visual),
-                )
-            )
-            normal_factor = gtsam.JacobianFactor(
-                POSE_J, normal_A, -normal_b,
-                gtsam.noiseModel.Isotropic.Sigma(len(residual), 1.0),
-            )
-            if height_terms is None:
-                height_terms = self._height_z_linearization(
-                    visual, reference_pose, target_gelsight_pose,
-                    gel_from_imu_increment, jacobian=height_jacobian,
-                )
-            if height_terms is None:
-                self.last_refinement_failure = "invalid_height_residual"
-                return None
-            height_A, height_b, height_cost = height_terms
-            if values is None:
-                values = _imu_values(previous, current)
-            joint_rows = None
-            if prior is not None:
-                joint_rows = self._joint_rows(
-                    inertial_factors, prior, previous, current, values=values)
-                Ap, Ac, rhs = joint_rows
-                reduced_system = marginalize_rows_system(Ap, Ac, rhs)
-                reduced_A, imu_rhs = reduced_system.rows()
-                imu_blocks = {POSE_J: reduced_A[:, :6],
-                              VELOCITY_J: reduced_A[:, 6:9],
-                              BIAS_J: reduced_A[:, 9:15]}
-                if imu_scale != 1.0:
-                    # Preserve the existing rounding for non-unit weights.
-                    imu_blocks = {key: (block / imu_scale) * imu_scale
-                                  for key, block in imu_blocks.items()}
-                    imu_rhs = (imu_rhs / imu_scale) * imu_scale
-            if inertial_costs is None:
-                imu_cost = self.imu_weight * float(
-                    nonlinear_imu_factor.error(values)
-                )
-                bias_cost = self.imu_weight * float(
-                    nonlinear_bias_factor.error(values)
-                )
-                prior_cost = 0.0 if prior is None else prior.error(previous)
-            else:
-                imu_cost, bias_cost, prior_cost = inertial_costs
-            base_cost = normal_cost + imu_cost + bias_cost + prior_cost + height_cost
-            if not np.isfinite(base_cost):
-                return None
-            graph = gtsam.GaussianFactorGraph()
-            graph.add(normal_factor)
-            if self.height_z_enabled:
-                graph.add(gtsam.JacobianFactor(
-                    POSE_J, height_A, -height_b, gtsam.noiseModel.Unit.Create(1),
-                ))
-            if prior is not None:
-                # Elimination couples the target pose, velocity and bias.
-                graph.add(gtsam.JacobianFactor(
-                    POSE_J, imu_blocks[POSE_J],
-                    VELOCITY_J, imu_blocks[VELOCITY_J],
-                    BIAS_J, imu_blocks[BIAS_J],
-                    imu_rhs,
-                    gtsam.noiseModel.Isotropic.Sigma(len(imu_rhs), 1.0),
-                ))
-            else:
-                # Fixed previous state: motion has no target-bias column.
-                _, motion_A, motion_rhs = navigation_factor_terms(
-                    nonlinear_imu_factor, previous, current, values=values
-                )
-                _, bias_A, bias_rhs = navigation_factor_terms(
-                    nonlinear_bias_factor, previous, current, values=values
-                )
-                graph.add(gtsam.JacobianFactor(
-                    POSE_J, motion_A[:, :6] * imu_scale,
-                    VELOCITY_J, motion_A[:, 6:9] * imu_scale,
-                    motion_rhs * imu_scale, gtsam.noiseModel.Unit.Create(9),
-                ))
-                graph.add(gtsam.JacobianFactor(
-                    BIAS_J, bias_A[:, 9:15] * imu_scale,
-                    bias_rhs * imu_scale, gtsam.noiseModel.Unit.Create(6),
-                ))
-            try:
-                solution = solve_gaussian_qr(graph)
-                pose_step = np.asarray(solution.at(POSE_J))
-                velocity_step = np.asarray(solution.at(VELOCITY_J))
-                bias_step = np.asarray(solution.at(BIAS_J))
-            except (RuntimeError, ValueError):
-                return None
-            if not all(np.all(np.isfinite(step)) for step in
-                       (pose_step, velocity_step, bias_step)):
-                return None
-            current_step = np.concatenate((pose_step, velocity_step, bias_step))
-            previous_step = None
-            if joint_rows is not None:
-                previous_step = reduced_system.recover_previous(current_step)
-                if not np.all(np.isfinite(previous_step)):
-                    return None
-            active_rows = getattr(visual, "last_active_rows", None)
-            raw_step_norms = {
-                'target': _navigation_step_norms(current_step),
-                'previous': (None if previous_step is None else
-                             _navigation_step_norms(previous_step)),
-            }
-            # Match original NormalFlow's target rotation/planar check. The
-            # other state updates remain optimized and reported, but cannot
-            # delay convergence after the minimum number of full steps.
-            convergence_step_norms = _normalflow_step_norms(
-                reference_pose, target_gelsight_pose, gel_from_imu_increment, pose_step,
-                reference_inverse=reference_inverse)
-            step_converged = (
-                iteration + 1 >= self.min_iterations
-                and convergence_step_norms['rotation_rad'] < self.rotation_stop
-                and convergence_step_norms['translation_xy_m'] < self.translation_stop)
-            trace = {
-                "iteration": iteration,
-                "update_rule": "full_gauss_newton",
-                "normal_linearization": self.normal_linearization,
-                "normal_jacobian_source": normal_jacobian_source,
-                "normal_huber_delta": normal_huber_delta,
-                "normal_huber_active": normal_huber_delta > 0.0,
-                "active_rows": len(residual) // _normal_dim(visual),
-                "base_cost": base_cost,
-                "base_normal_cost": normal_cost,
-                "height_z_enabled": self.height_z_enabled,
-                "base_height_cost": height_cost,
-                "downweighted_normal_points": downweighted,
-                "base_imu_cost": imu_cost,
-                "base_bias_cost": bias_cost,
-                "base_prior_cost": prior_cost,
-                # Keep these report fields for readers of older diagnostics.
-                # There is exactly one full step; cost never selects its scale.
-                "attempts": [],
-                "accepted_scale": None,
-                "accepted_cost": None,
-                "raw_step_norms": raw_step_norms,
-                "stopping_rule": "reference_ic_rotation_xy",
-                "minimum_iterations": self.min_iterations,
-                "convergence_step_norms": convergence_step_norms,
-                "step_converged": step_converged,
-                "stop_reason": None,
-            }
-            self.last_optimization_trace.append(trace)
-            scale = 1.0
-            candidate = _navigation_plus(current, current_step)
-            candidate_previous = (previous if previous_step is None else
-                                  _navigation_plus(previous, previous_step))
-            if not all(np.all(np.isfinite(value)) for state in
-                       (candidate_previous, candidate) for value in
-                       (state.pose, state.velocity, state.accel_bias, state.gyro_bias)):
-                self.last_refinement_failure = "nonfinite_gn_state"
-                trace["stop_reason"] = self.last_refinement_failure
-                return None
-            # Post-step costs are diagnostics, not an acceptance or line-search test.
-            candidate_gelsight_pose = candidate.pose @ imu_T_gelsight
-            if hasattr(visual, "residual_on_fixed_rows"):
-                candidate_residual = visual.residual_on_fixed_rows(
-                    reference_pose, candidate_gelsight_pose, active_rows
-                )
-            else:
-                candidate_result = normal_evaluator(
-                    reference_pose, candidate_gelsight_pose)
-                candidate_residual = None if candidate_result is None else candidate_result[0]
-            valid_normal = (
-                candidate_residual is not None and len(candidate_residual) > 0
-                and len(candidate_residual) % _normal_dim(visual) == 0
-                and np.all(np.isfinite(candidate_residual))
-            )
-            candidate_normal_cost = (_normal_huber_cost(
-                candidate_residual, normal_scale, normal_huber_delta, _normal_dim(visual)
-            ) if valid_normal else None)
-            candidate_values = _imu_values(candidate_previous, candidate)
-            candidate_imu_cost = self.imu_weight * float(
-                nonlinear_imu_factor.error(candidate_values)
-            )
-            candidate_bias_cost = self.imu_weight * float(
-                nonlinear_bias_factor.error(candidate_values)
-            )
-            candidate_prior_cost = (0.0 if prior is None else
-                                    prior.error(candidate_previous))
-            candidate_height = self._height_z_linearization(
-                visual, reference_pose, candidate_gelsight_pose,
-                gel_from_imu_increment, jacobian=height_jacobian,
-            )
-            candidate_height_cost = None if candidate_height is None else candidate_height[2]
-            valid_costs = valid_normal and candidate_height is not None and all(
-                np.isfinite(cost) for cost in (candidate_normal_cost, candidate_imu_cost,
-                    candidate_bias_cost, candidate_prior_cost, candidate_height_cost))
-            candidate_cost = (candidate_normal_cost + candidate_imu_cost
-                              + candidate_bias_cost + candidate_prior_cost
-                              + candidate_height_cost) if valid_costs else None
-            trace["attempts"].append({
-                "scale": scale, "cost": candidate_cost, "reason": "full_gn_step",
-                "imu_cost": candidate_imu_cost if np.isfinite(candidate_imu_cost) else None,
-                "bias_cost": candidate_bias_cost if np.isfinite(candidate_bias_cost) else None,
-                "height_cost": candidate_height_cost,
-            })
-            current = candidate
-            previous = candidate_previous
-            # Reuse this exact state pair for the next iteration and for the
-            # final prior. Build another Values only after a new state update.
-            values = candidate_values
-            target_gelsight_pose = candidate_gelsight_pose
-            # Height uses this state and fixed image pair, independent of the
-            # next iteration's normal rows and Huber phase.
-            height_terms = candidate_height
-            inertial_costs = (candidate_imu_cost, candidate_bias_cost,
-                              candidate_prior_cost)
-            trace["accepted_scale"] = 1.0
-            trace["accepted_cost"] = candidate_cost
-            for term, cost in (("normal", candidate_normal_cost), ("imu", candidate_imu_cost),
-                               ("bias", candidate_bias_cost), ("prior", candidate_prior_cost),
-                               ("height", candidate_height_cost)):
-                trace["accepted_" + term + "_cost"] = (
-                    float(cost) if cost is not None and np.isfinite(cost) else None
-                )
-            trace["stop_reason"] = (
-                "invalid_updated_residual" if not valid_costs else
-                "step_converged" if step_converged else
-                "max_iterations" if iteration + 1 == self.max_iterations else None
-            )
-            if not valid_costs:
-                self.last_refinement_failure = trace["stop_reason"]
-                return None
-            if step_converged:
-                break
-        if prior is not None or (fixed_anchor and self.marginalization_enabled):
-            evaluated = normal_evaluator(
-                reference_pose, target_gelsight_pose)
-            if evaluated is None:
-                return None
-            residual, _, J = evaluated
-            if len(residual) < 10 * _normal_dim(visual) or not np.all(np.isfinite(residual)):
-                return None
-            if self.normal_zero_pose_z_jacobian:
-                J = J.copy()
-                J[:, 5] = 0.0
-            J = J @ gel_from_imu_increment
-            normal_A, normal_b, _, _ = _normal_huber_linearization(
-                residual, J, normal_scale, normal_huber_delta, _normal_dim(visual)
-            )
-            # Use the last solve's normal loss for retention (ordinary least
-            # squares after step five). Prior rows are always unrobustified.
-            joint_Ap, joint_Ac, joint_rhs = self._joint_rows(
-                inertial_factors, prior, previous, current, values=values)
-            if height_terms is None:
-                self.last_refinement_failure = "invalid_height_residual"
-                return None
-            height_A, height_b, _ = height_terms
-            # Allocate the retained rows once, including the optional height row.
-            # Numerical damping is excluded from the retained information.
-            joint_end = len(joint_rhs)
-            normal_end = joint_end + len(normal_b)
-            row_count = normal_end + int(self.height_z_enabled)
-            Ap = np.zeros((row_count, 15))
-            Ac = np.zeros((row_count, 15))
-            rhs = np.empty(row_count)
-            Ap[:joint_end] = joint_Ap
-            Ac[:joint_end] = joint_Ac
-            rhs[:joint_end] = joint_rhs
-            Ac[joint_end:normal_end, :6] = normal_A
-            rhs[joint_end:normal_end] = -normal_b
-            if self.height_z_enabled:
-                Ac[normal_end:, :6] = height_A
-                rhs[normal_end:] = -height_b
-            information = (Ac.T @ Ac if fixed_anchor else
-                           marginalize_rows_system(Ap, Ac, rhs).information)
-            self.pending_marginal_prior = NavigationPrior.from_information(current, information)
-        return current

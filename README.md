@@ -177,8 +177,8 @@ IMU 헤더 시각 1.0~2.9초를 정지 초기화 구간으로 사용합니다.
 현재 정지 초기화는 설정에 남아 있는 GT 기반 중력·속도 초기화보다 우선합니다.
 
 두 기록 데이터 설정에는 GT 토픽을 사용하는 옵션이 남아 있습니다.
-GT가 없는 데이터에서는 `frontend_gravity_initialization`과
-`gravity_initialization`을 `fixed_world_z`로 설정할 수 있지만,
+GT가 없는 데이터에서는 `frontend_gravity_initialization`을
+`fixed_world_z`로 설정할 수 있지만,
 이 방식은 초기 촉각 좌표의 Z축과 중력 방향이 맞을 때만 유효합니다.
 `frontend_first_trial_velocity_from_gt`는 `false`로 설정하고,
 `trajectory_evaluation.enabled`와 `trajectory_evaluation.state_velocity.enabled`도
@@ -504,7 +504,14 @@ When `trajectory_evaluation.enabled` is true and at least two timestamp matches 
 예측합니다. `tracking_status`는 `imu_prediction`입니다. 현재 이미지와 이미지 시각을
 사용하며, 최종 궤적 평가는 기준 키프레임의 최종 자세로 이 Frame의 자세를 계산합니다.
 확정 상태, marginal prior, 촉각 이력과 복구 키프레임 생성 주기는 유지합니다.
-비접촉 전파의 유효한 Frame은 기존에도 평가에 포함됩니다.
+최종 궤적 평가는 IMU 복구 키프레임 이미지의 Frame(`imu_only`)을 이 설정과 관계없이
+포함합니다. `false`이면 비접촉 전파 Frame(`no_contact_coasting`)과 `imu_prediction`
+Frame을 평가에서 제외합니다. `true`이면 이 Frame도 평가합니다. 비접촉 전파 Frame의 예측은
+이미지 시각 직전의 마지막 IMU 샘플 시각에서 끝나므로 `pose_valid`가 false입니다.
+평가는 이 Frame을 그 예측 시각(`pose_timestamp`)의 GT와 비교합니다. 예측 시각이 이전
+기록보다 늦지 않은 Frame은 제외합니다. `trajectory_metrics.json`의
+`final_frames_by_status`, `excluded_imu_only_frames`, `invalid_pose_frames`가 각 개수를
+기록합니다.
 초기화 전, IMU 구간 누락, 비접촉 전파 제한 시간 초과 또는 입력 큐에서 교체된 이미지는
 추가하지 않습니다. 이 설정은 처리된 이미지에 적용됩니다. 평가 파일을 저장하려면
 `trajectory_evaluation.enabled: true`도 필요합니다. 설정을 바꾼 뒤 노드를 다시 실행합니다.

@@ -20,13 +20,12 @@ from std_msgs.msg import String, UInt32
 from normalflow.utils import height2pointcloud
 
 from gelslam.core.inertial import ImuSample, gyro_to_rad_per_sec
-from gelslam.core.recorded_source_clock import RecordedSourceClock
+from gelslam.core.imu_mount_calibration import describe_imu_mount, load_config
 from gelslam.core.static_imu_initialization import REST_EVENTS
 from gelslam.core.streaming_source_clock import StreamingSourceClock
 from gelslam.core.tracker import Tracker, TrackingMode
 from gelslam.core.backend_feedback import FeedbackReceiver
 from gelslam.core.slam_packets import ArrayBridge, FramePacket, KeyFramePacket, to_ros
-from gelslam.core.gt_state_diagnostic import gt_state_test_needs_gt, resolve_gt_state_test
 from gelslam.core.state_velocity_evaluation import StateVelocityEvaluation, capture_state_velocity
 from gelslam.core.trajectory_evaluation import trajectory_output_dir
 from gelslam.nodes.tracker_executor import TrackerExecutor
@@ -56,9 +55,13 @@ class TrackerNode(Node):
             self.get_parameter("config_path").get_parameter_value().string_value
         )
         config_path = os.path.abspath(os.path.expanduser(config_path))
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
+        # IMU mounting slot of imu_config.gelsight_T_imu_calibration; "" keeps its slot.
+        self.declare_parameter("imu_slot", "")
+        config = load_config(config_path, self.get_parameter("imu_slot").value)
         self.config = config
+        mount = describe_imu_mount(config.get("imu_config"))
+        if mount is not None:
+            self.get_logger().info(mount)
         self.debug_visualization_enabled = config["gelslam_config"]["track_config"].get(
             "debug_visualization_enabled", True
         )
@@ -142,46 +145,14 @@ class TrackerNode(Node):
                 with open(os.path.join(output_dir, "state_velocity_config_supplied.yaml"), "w") as handle:
                     yaml.safe_dump(config, handle, sort_keys=False)
                 self.get_logger().info("Recording actual State.velocity; native IMU-origin GT, evaluation only: %s" % output_dir)
-        self.recorded_source_clock = None
         self.streaming_source_clock = None
         self._source_clock_ready_logged = False
         self._source_clock_error_logged = False
-        self._unmatched_source_images = 0
-        self._unmatched_source_imus = 0
         if self.tracker.imu_enabled and self.tracker.timestamp_source == "recorded_source":
-            bag_path = config["imu_config"].get("recorded_source_bag_path")
-            if not bag_path:
-                self.streaming_source_clock = StreamingSourceClock(
-                    warmup_s=float(config['imu_config'].get('recorded_source_warmup_s', 1.0)))
-                self.get_logger().info(
-                    "Using source timing topics; waiting for camera/IMU clock warmup; "
-                    "no bag path required")
-            elif not os.path.isabs(bag_path):
-                bag_path = os.path.join(os.path.dirname(config_path), bag_path)
-            if bag_path and not os.path.isfile(bag_path):
-                raise ValueError("recorded source bag database does not exist: %s" % bag_path)
-            if bag_path:
-                self.recorded_source_clock = RecordedSourceClock(
-                    bag_path,
-                    image_topic=config["device_config"].get("image_topic", "image"),
-                    camera_timing_topic=config["imu_config"].get(
-                        "camera_timing_topic", "/gelsight/timing"),
-                    imu_topic=config["imu_config"].get("topic", "/imu/data"),
-                    imu_device_time_topic=config["imu_config"].get(
-                        "imu_device_time_topic", "/imu/device_time_ms"),
-                )
-                self.get_logger().info(
-                    "Using recorded source clocks from %s: %d images, %d IMU samples; "
-                    "camera/IMU host-fit median residuals %.3f/%.3f ms; "
-                    "image_to_imu_time_offset_s=%.6f"
-                    % (
-                        bag_path, self.recorded_source_clock.image_count,
-                        self.recorded_source_clock.imu_count,
-                        self.recorded_source_clock.camera_fit[3] * 1000,
-                        self.recorded_source_clock.imu_fit[3] * 1000,
-                        self.tracker.image_to_imu_time_offset_s,
-                    )
-                )
+            self.streaming_source_clock = StreamingSourceClock(
+                warmup_s=float(config['imu_config'].get('recorded_source_warmup_s', 1.0)))
+            self.get_logger().info(
+                "Using source timing topics; waiting for camera/IMU clock warmup")
 
         # Initialize subscribers
         # Normal-flow image processing can take longer than one IMU period.
@@ -235,14 +206,10 @@ class TrackerNode(Node):
             # initialization even when a simulation preset still contains it.
             imu_config = self.tracker.imu_config
             self.imu_frame_id = imu_config.get("frame_id", "")
-            self.gyro_input_unit = imu_config.get("gyro_input_unit", "rad_s")
             self.gyro_max_rate_rad_s = imu_config.get("gyro_max_rate_rad_s", 5.0)
-            # Validate the declared unit and guard before accepting any IMU
-            # sample, rather than allowing an invalid config to fail later in
-            # the integration path.
-            gyro_to_rad_per_sec(
-                (0.0, 0.0, 0.0), self.gyro_input_unit, self.gyro_max_rate_rad_s
-            )
+            # Validate the rate guard before accepting any IMU sample, rather
+            # than allowing an invalid config to fail later in integration.
+            gyro_to_rad_per_sec((0.0, 0.0, 0.0), max_rate_rad_s=self.gyro_max_rate_rad_s)
             self.imu_sub = self.create_subscription(
                 Imu,
                 imu_config.get("topic", "/imu/data"),
@@ -255,8 +222,7 @@ class TrackerNode(Node):
                 % (imu_config.get("topic", "/imu/data"), self.imu_frame_id)
             )
             self.get_logger().info(
-                "IMU gyro unit=%s; rejecting rates above %s rad/s after conversion"
-                % (self.gyro_input_unit, self.gyro_max_rate_rad_s)
+                "IMU gyro in rad/s; rejecting rates above %s rad/s" % self.gyro_max_rate_rad_s
             )
             static_settings = getattr(self.tracker, "_static_imu_settings", None)
             if static_settings is not None and static_settings["mode"] == "recorded_rest_event":
@@ -271,10 +237,7 @@ class TrackerNode(Node):
                 self.get_logger().info(
                     "Subscribing to recorded rest events from %s" % static_settings["events_topic"])
             if (
-                imu_config.get("gravity_initialization") in {
-                    "ground_truth_initial_pose", "ground_truth_gel_pose"
-                }
-                or imu_config.get("frontend_gravity_initialization")
+                imu_config.get("frontend_gravity_initialization")
                 == "ground_truth_initial_pose"
                 or imu_config.get("frontend_first_trial_velocity_from_gt", False)
             ):
@@ -292,8 +255,7 @@ class TrackerNode(Node):
                     "and trial-axis initialization: %s"
                     % ground_truth_topic
                 )
-            diagnostic_gt = gt_state_test_needs_gt(resolve_gt_state_test(imu_config))
-            if (imu_config.get("frontend_first_trial_velocity_from_gt", False) or diagnostic_gt):
+            if imu_config.get("frontend_first_trial_velocity_from_gt", False):
                 ground_truth_imu_topic = imu_config.get(
                     "ground_truth_imu_pose_topic", "/ground_truth/imu_pose"
                 )
@@ -302,10 +264,8 @@ class TrackerNode(Node):
                     self.ground_truth_imu_pose_callback, 1000,
                 )
                 self.get_logger().warning(
-                    "Using simulation GT IMU poses for %s: %s"
-                    % ("per-frame previous-state diagnostic"
-                       if diagnostic_gt
-                       else "first-trial velocity initialization", ground_truth_imu_topic)
+                    "Using simulation GT IMU poses for first-trial velocity initialization: %s"
+                    % ground_truth_imu_topic
                 )
 
         # Initialize publishers
@@ -374,17 +334,7 @@ class TrackerNode(Node):
             self._source_clock_imu_guard.trigger()
             TrackerNode._drain_source_images(self)
             return
-        source_time = None
-        if self.recorded_source_clock is not None:
-            source_time = self.recorded_source_clock.image_timestamp(msg.header)
-            if source_time is None:
-                self._unmatched_source_images += 1
-                if self._unmatched_source_images == 1:
-                    self.get_logger().error(
-                        "Dropping image without matching recorded camera timing"
-                    )
-                return
-        TrackerNode._queue_selected_image(self, msg, source_time)
+        TrackerNode._queue_selected_image(self, msg)
 
     def _queue_selected_image(self, msg, source_time=None):
         if source_time is not None:
@@ -506,6 +456,8 @@ class TrackerNode(Node):
             pose_message.ref_t_curr = np.asarray(frame_msg.ref_t_curr).ravel().tolist()
             for field in ("tracking_status", "pose_valid", "pose_timestamp"):
                 setattr(pose_message, field, getattr(frame_msg, field))
+            pose_message.published_t_ref_estimate = np.asarray(
+                getattr(frame_msg, "published_t_ref_estimate", ()), dtype=np.float64).ravel().tolist()
             self.frame_pose_pub.publish(pose_message)
             message = to_ros(frame_msg, self.bridge) if isinstance(frame_msg, FramePacket) else frame_msg
             self.frame_pub.publish(message)
@@ -644,15 +596,6 @@ class TrackerNode(Node):
             return
         stamp = msg.header.stamp
         timestamp = float(stamp.sec) + float(stamp.nanosec) * 1e-9
-        if self.recorded_source_clock is not None:
-            timestamp = self.recorded_source_clock.imu_timestamp(msg)
-            if timestamp is None:
-                self._unmatched_source_imus += 1
-                if self._unmatched_source_imus == 1:
-                    self.get_logger().error(
-                        "Dropping IMU without matching recorded device time"
-                    )
-                return
         TrackerNode._ingest_imu(self, msg, timestamp)
 
     def rest_event_callback(self, msg):
@@ -697,8 +640,7 @@ class TrackerNode(Node):
                     msg.angular_velocity.y,
                     msg.angular_velocity.z,
                 ),
-                self.gyro_input_unit,
-                self.gyro_max_rate_rad_s,
+                max_rate_rad_s=self.gyro_max_rate_rad_s,
             )
         except ValueError as error:
             self._imu_dropped_samples += 1
@@ -759,8 +701,6 @@ class TrackerNode(Node):
     def _initialization_imu_gt_release_ready(self):
         """Check whether initialization-only GT can be retired by the spin owner."""
         tracker = self.tracker
-        if gt_state_test_needs_gt(resolve_gt_state_test(tracker.imu_config)):
-            return False
         return (self.ground_truth_imu_pose_sub is not None
                 and getattr(tracker, "_frontend_vi_state", None) is not None
                 and getattr(tracker, "_pending_frontend_initialization", None) is None
@@ -786,20 +726,6 @@ class TrackerNode(Node):
         """Use the GT IMU position directly; gravity still uses GelSight attitude."""
         timestamp = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
         position = msg.pose.position
-        if gt_state_test_needs_gt(resolve_gt_state_test(getattr(self.tracker, "imu_config", {}))):
-            q = msg.pose.orientation
-            quaternion = np.array([q.x, q.y, q.z, q.w])
-            norm = np.linalg.norm(quaternion)
-            if timestamp <= 0 or not np.isfinite(norm) or norm <= 1e-12:
-                self.get_logger().warning("Dropping invalid GT IMU diagnostic pose")
-                return
-            from scipy.spatial.transform import Rotation
-            if not self.tracker.add_ground_truth_imu_pose(
-                timestamp, Rotation.from_quat(quaternion / norm).as_matrix(),
-                (position.x, position.y, position.z),
-            ):
-                self.get_logger().warning("Dropping invalid GT IMU diagnostic pose")
-            return
         if timestamp <= 0.0 or not self.tracker.add_ground_truth_imu_position(
             timestamp, (position.x, position.y, position.z),
         ):

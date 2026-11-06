@@ -21,8 +21,7 @@ import gelslam.core.static_imu_initialization as initialization_module
 
 def config(**updates):
     return dict({
-        "enabled": True, "frontend_optimization": True,
-        "gtsam_vi_marginalization": True, "gravity_mps2": 9.81,
+        "enabled": True, "frontend_optimization": True, "gravity_mps2": 9.81,
         "gelsight_T_imu": np.eye(4).tolist(),
         "static_initialization": {"enabled": True},
     }, **updates)
@@ -95,8 +94,6 @@ def test_all_presets_are_unchanged_when_off_and_resolve_gt_when_on(preset):
     effective, settings, _ = resolve_static_imu_config(enabled, np.eye(4))
     assert effective["frontend_gravity_initialization"] == "static_imu"
     assert not effective["frontend_first_trial_velocity_from_gt"]
-    assert effective["gravity_initialization"] == "measured_acceleration"
-    assert "frontend_gravity_mps2" not in effective
     assert settings["enabled"]
     assert yaml.safe_dump(original) == snapshot
 
@@ -104,7 +101,6 @@ def test_all_presets_are_unchanged_when_off_and_resolve_gt_when_on(preset):
 @pytest.mark.parametrize("update,match", [
     ({"enabled": False}, "requires.*enabled"),
     ({"frontend_optimization": False}, "requires.*frontend_optimization"),
-    ({"gtsam_vi_marginalization": False}, "requires.*gtsam_vi_marginalization"),
     ({"buffer_max_samples": 50}, "buffer_max_samples"),
     ({"gravity_mps2": 0}, "gravity_mps2"),
     ({"accelerometer_bias_random_walk": 0}, "accelerometer_bias_random_walk"),
@@ -131,61 +127,6 @@ def test_requires_calibration_and_rotation_not_scale():
 def fixed_config(start=1.0, end=2.0, **options):
     return config(static_initialization=dict(
         enabled=True, mode="fixed_time", start_time_s=start, end_time_s=end, **options))
-
-
-def startup_config(duration=1.0, **options):
-    return config(static_initialization=dict(
-        enabled=True, mode="startup_duration", duration_s=duration, **options))
-
-
-@pytest.mark.parametrize("duration", [None, False, 0, -1, np.nan, np.inf])
-def test_startup_duration_requires_positive_finite_seconds(duration):
-    with pytest.raises(ValueError, match="duration_s"):
-        initializer(startup_config(duration))
-
-
-@pytest.mark.parametrize("options", [
-    {"mode": "fixed_time", "start_time_s": 1., "end_time_s": 2., "duration_s": 1.},
-    {"mode": "stationary_detection", "duration_s": 1.},
-    {"mode": "startup_duration", "duration_s": 1., "start_time_s": 1., "end_time_s": 2.},
-])
-def test_startup_duration_cannot_mix_relative_and_absolute_settings(options):
-    with pytest.raises(ValueError, match="require"):
-        initializer(config(static_initialization=dict(enabled=True, **options)))
-
-
-@pytest.mark.parametrize("start", [0., 41., 1792046893.])
-def test_startup_duration_uses_first_imu_time_and_freezes_before_approach(monkeypatch, start):
-    detector, buffer, extrinsic = initializer(startup_config())
-    monkeypatch.setattr(detector, "_statistics", lambda _: pytest.fail("stationary test must not run"))
-    detector.observe(())
-    rest = [ImuSample(start + i * .005, [0, 0, 9.81], [0, 0, 0]) for i in range(201)]
-    feed(detector, buffer, rest[:101])
-    assert detector.stationary is None
-    feed(detector, buffer, rest[101:])
-    assert detector.stationary[0] == start + 1.
-    feed(detector, buffer, [ImuSample(start + i * .005, [0.2, 0, 9.81], [0, 0, 0])
-                            for i in range(201, 302)])
-    seed = predict(detector, buffer, extrinsic, start + 1.5)
-    assert seed is not None
-    assert seed.stationary_timestamp == start + 1.
-    assert seed.state.velocity[0] == pytest.approx(.0995, abs=1e-6)
-    np.testing.assert_allclose(detector.stationary[1], [0, 0, 9.81], rtol=0, atol=1e-12)
-
-
-def test_startup_duration_does_not_shift_start_when_initial_measurements_are_missing():
-    detector, _, _ = initializer(startup_config())
-    detector.observe(stationary_samples(start=1.1, end=2.1), stream_start_time=1.)
-    assert detector.stationary is None
-    assert "no start coverage" in detector.status
-
-
-def test_real_far_preset_uses_first_five_imu_seconds():
-    cfg = yaml.safe_load((Path(__file__).parents[1] / "config" / "real_far_config.yaml").read_text())
-    _, settings, _ = resolve_static_imu_config(cfg["imu_config"], np.array(cfg["imu_config"]["gelsight_T_imu"]))
-    assert settings["enabled"]
-    assert settings["mode"] == "startup_duration" and settings["duration_s"] == 5.
-    assert settings["start_time_s"] is None and settings["end_time_s"] is None
 
 
 @pytest.mark.parametrize("options,match", [
@@ -496,10 +437,13 @@ def test_aligned_contact_state_prior_and_coasting_use_one_world(monkeypatch):
     assert np.array_equal(tracker.frontend_gravity_for_backend(), [0., 0., -9.81])
     prior = tracker.frontend_visual_inertial.marginal_prior
     assert prior.matches(state)
-    assert np.array_equal(prior.A, captured["A"])
+    # The first contact pose is the trial datum. The retained prior conditions
+    # the initializer's complete prior on it and keeps every other column.
+    assert [b.kind for b in prior.layout.blocks] == ["velocity", "accel_bias", "gyro_bias"]
+    assert np.array_equal(prior.A, captured["A"][:, 6:])
     assert np.array_equal(prior.rhs, captured["rhs"])
     covariance = np.linalg.inv(prior.A.T @ prior.A)
-    assert np.linalg.norm(covariance[6:9, 9:12]) > 1e-5
+    assert np.linalg.norm(covariance[0:3, 3:6]) > 1e-5
 
     assert tracker._initialize_no_contact_coast()
     for t in np.arange(2.505, 2.6025, .005):
@@ -620,39 +564,6 @@ def test_fixed_clock_offset_handoff_and_timeout_do_not_reset_interval(monkeypatc
     assert "no later rest window" in tracker._static_imu_initializer.status
 
 
-def test_startup_duration_uses_accepted_imu_origin_before_first_image(monkeypatch):
-    tracker, _, _ = make_tracker(monkeypatch)
-    tracker.imu_config, tracker._static_imu_settings, _ = resolve_static_imu_config(startup_config(), np.eye(4))
-    tracker._static_imu_initializer = StaticImuInitializer(tracker._static_imu_settings, tracker.imu_config)
-    for sample in stationary_samples(end=2.1):
-        assert tracker.add_imu_sample(sample)
-    assert not tracker.add_imu_sample(ImuSample(.5, [0, 0, 9.81], [0, 0, 0]))
-    assert tracker._imu_stream_start_time == 1.
-    tracker.timestamp_source = "recorded_source"
-    tracker.image_to_imu_time_offset_s = .025
-    h = header(100.)
-    tracker.set_recorded_image_timestamp(h, 1.475)
-    tracker._observe_static_imu(h)
-    assert tracker._static_imu_initializer.stationary is None  # Future IMU must not complete the interval.
-    tracker.set_recorded_image_timestamp(h, 1.975)
-    tracker._observe_static_imu(h)
-    assert tracker._static_imu_initializer.stationary[0] == 2.
-    assert tracker._prepare_static_trial(h)
-    assert tracker._static_trial_seed.state.timestamp == 2.
-    # The same startup interval remains fixed after its propagation deadline.
-    tracker.set_recorded_image_timestamp(h, 7.975)
-    tracker._observe_static_imu(h)
-    assert tracker._static_imu_initializer.stationary[0] == 2.
-    assert not tracker._prepare_static_trial(h)
-    assert "no later rest window" in tracker._static_imu_initializer.status
-    # A later disconnected trial must not treat its first image as a new origin.
-    tracker._static_imu_collecting = False
-    for sample in stationary_samples(start=8., end=9.1):
-        tracker.add_imu_sample(sample)
-    tracker.set_recorded_image_timestamp(h, 8.975)
-    tracker._observe_static_imu(h)
-    assert not tracker._prepare_static_trial(h)
-    assert "no start coverage" in tracker._static_imu_initializer.status
 
 
 def test_timed_out_approach_can_recover_after_new_no_contact_rest(monkeypatch):
@@ -832,6 +743,45 @@ def test_tracker_forwards_rest_events_and_restart_clears_sequence(monkeypatch):
         tracker.add_rest_event("trial_ready", np.nan)
 
 
+def test_repeated_rest_sequence_replaces_resolved_interval(monkeypatch):
+    tracker, _, _ = make_tracker(monkeypatch)
+    tracker.imu_config, tracker._static_imu_settings, _ = resolve_static_imu_config(event_config(), np.eye(4))
+    tracker._static_imu_initializer = StaticImuInitializer(tracker._static_imu_settings, tracker.imu_config)
+    for sample in segment(0.5, 5.0):
+        tracker.add_imu_sample(sample)
+    for name, timestamp in REST.items():
+        tracker.add_rest_event(name, timestamp)
+    tracker._observe_static_imu(header(2.4))
+    assert tracker._static_imu_initializer.stationary[0] == 2.2
+    # The operator repeats the rest before contact; the old GO must not stay.
+    tracker.add_rest_event("recorded_rest_started", 3.0)
+    tracker._observe_static_imu(header(3.5))
+    assert tracker._static_imu_initializer.stationary is None
+    tracker.add_rest_event("recorded_rest_completed", 4.0)
+    tracker.add_rest_event("trial_ready", 4.2)
+    tracker._observe_static_imu(header(4.4))
+    assert tracker._static_imu_initializer.stationary[0] == 4.2
+    assert "3.000000000 -> 4.000000000" in tracker._static_imu_initializer.status
+
+
+def test_live_preset_uses_real_objects_static_initialization():
+    root = Path(__file__).parents[1] / "config"
+    live, real = (yaml.safe_load((root / name).read_text())["imu_config"]["static_initialization"]
+                  for name in ("live_thick_far_config.yaml", "real_objects_config.yaml"))
+    assert live == real and live["mode"] == "recorded_rest_event"
+
+
+def test_rest_event_node_checks_imu_coverage_of_the_rest():
+    from gelslam.nodes.rest_event_node import rest_interval_check, rest_statistics
+    samples = [(t, (0., 0., 9.81), (0., 0., 0.)) for t in np.arange(10.0, 15.1, 0.005)]
+    assert rest_interval_check(samples, 10.0, 15.0, 50, 0.05) is None
+    assert rest_statistics(samples, 10.0, 15.0)[0] == pytest.approx(200.)
+    assert "cover" in rest_interval_check(samples, 9.0, 15.0, 50, 0.05)
+    gap = [sample for sample in samples if not 12.0 < sample[0] < 12.2]
+    assert "gap" in rest_interval_check(gap, 10.0, 15.0, 50, 0.05)
+    assert "min_samples" in rest_interval_check(samples, 10.0, 15.0, 2000, 0.05)
+
+
 def test_real_objects_preset_uses_rest_events_source_time_and_previous_state_start():
     from gelslam.core.contact_velocity import ContactVelocityHistory
     cfg = yaml.safe_load((Path(__file__).parents[1] / "config" / "real_objects_config.yaml").read_text())
@@ -839,12 +789,10 @@ def test_real_objects_preset_uses_rest_events_source_time_and_previous_state_sta
     effective, settings, _ = resolve_static_imu_config(imu, np.array(imu["gelsight_T_imu"]))
     assert settings["mode"] == "recorded_rest_event" and settings["max_propagation_s"] == 15.
     assert imu["frontend_initialize_from_imu_preintegration"] is False
-    assert imu["image_to_imu_time_offset_s"] == pytest.approx(-0.0615)
+    assert imu["image_to_imu_time_offset_s"] == pytest.approx(-0.0395)
     assert settings["contact_velocity_sigma_mps"] == pytest.approx(1.)
     assert imu["timestamp_source"] == "recorded_source"
     assert imu["gtsam_integration_sigma_m"] == pytest.approx(3e-4)
-    assert imu["output_truncation_gyro_step_rad_s"] == pytest.approx(np.radians(0.1))
-    assert imu["output_truncation_accel_step_mps2"] == pytest.approx(0.001 * 9.80665)
     assert cfg["gelslam_config"]["track_config"]["recontact_imu_recovery_min_gap_s"] == .2
     assert ContactVelocityHistory.from_config(effective) is None
 

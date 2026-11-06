@@ -172,7 +172,6 @@ def test_tracker_publishes_normal_map_when_contact_tracking_is_rejected():
     header = SimpleNamespace(stamp=Time(sec=3), frame_id="gel_frame")
     observation = SimpleNamespace(N=np.array([[[0.0, 0.0, 1.0]]]))
     node = SimpleNamespace(
-        recorded_source_clock=None,
         debug_visualization_enabled=True,
         bridge=SimpleNamespace(
             imgmsg_to_cv2=lambda *_args, **_kwargs: np.zeros((1, 1, 3)),

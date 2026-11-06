@@ -6,14 +6,14 @@ import gtsam
 import numpy as np
 import pytest
 
-from gelslam.core.gtsam_vi import create_frontend_solver
+from gelslam.core.gtsam_vi import _bias_factor, _split_imu_factor, create_frontend_solver
 from gelslam.core.imu_navigation import gelsight_pose
 from gelslam.core.inertial import ImuSample
 from gelslam.core.marginal_prior import NavigationPrior
 from gelslam.core.numpy_vi import DenseNormalResidual, NavigationState, adjoint
 from gelslam.core.retained_prior import (
-    RetainedPrior, VariableLayout, compress_normal, eliminate_rows, rank_solve,
-    rank_solve_normal, state_blocks, state_values,
+    RetainedPrior, VariableLayout, compress_normal, eliminate_normal, eliminate_rows,
+    rank_solve, rank_solve_normal, state_blocks, state_values,
 )
 from gelslam.core.split_pose import split_pose_plus
 
@@ -32,8 +32,7 @@ def state(time=1.):
 
 def solver(**overrides):
     return create_frontend_solver(dict(
-        frontend_state_mode="reference_marginalization", gtsam_vi_max_iterations=3,
-        gtsam_vi_min_iterations=1, **overrides))
+        gtsam_vi_max_iterations=3, gtsam_vi_min_iterations=1, **overrides))
 
 
 def advance(s, previous, visual=None, commit=True):
@@ -99,6 +98,25 @@ def test_normal_equation_solve_and_compression_match_row_versions():
     assert not Ah[:, 5].any()
     # Rows are unique only up to an orthogonal transform; compare A^T A and A^T rhs.
     np.testing.assert_allclose(Ah.T @ Ah, Ar.T @ Ar, rtol=0., atol=1e-9 * np.abs(H).max())
+    np.testing.assert_allclose(Ah.T @ bh, Ar.T @ br, rtol=0., atol=1e-9 * np.abs(g).max())
+
+
+@pytest.mark.parametrize('eliminated', [np.arange(6, 21), np.arange(12, 21), np.empty(0, int)])
+def test_normal_equation_schur_matches_row_elimination(eliminated):
+    rng = np.random.default_rng(29)
+    # 36D [reference, previous, current] with SI-like column scales.
+    A = rng.normal(size=(1500, 36)) * np.tile(np.r_[np.full(6, 1e3), np.full(9, 1e-2)], 3)[:36]
+    A[:, 5] = 0.  # Unobserved retained column.
+    A[:, 13] = A[:, 14]  # Rank-deficient eliminated pair.
+    rhs = rng.normal(size=1500)
+    retained = np.setdiff1d(np.arange(36), eliminated)
+    H, g = A.T @ A, A.T @ rhs
+    Ar, br = eliminate_rows(A, rhs, eliminated, retained)
+    Hr, gr = eliminate_normal(H, g, eliminated, retained)
+    np.testing.assert_allclose(Hr, Ar.T @ Ar, rtol=0., atol=1e-9 * np.abs(H).max())
+    np.testing.assert_allclose(gr, Ar.T @ br, rtol=0., atol=1e-9 * np.abs(g).max())
+    Ah, bh = compress_normal(Hr, gr)
+    assert Ah.shape == Ar.shape and not Ah[:, 5].any()
     np.testing.assert_allclose(Ah.T @ bh, Ar.T @ br, rtol=0., atol=1e-9 * np.abs(g).max())
 
 
@@ -307,7 +325,8 @@ def test_eliminate_first_matches_joint_solve_with_smaller_system():
             np.testing.assert_allclose(getattr(b, field), getattr(a, field), atol=1e-6)
 
 
-def test_hessian_linear_system_matches_stacked_rows():
+@pytest.mark.parametrize('mode', ['eliminate_first', 'joint'])
+def test_hessian_linear_system_matches_stacked_rows(mode):
     from test_frontend_gauss_newton import frame
     image = frame()
 
@@ -324,7 +343,7 @@ def test_hessian_linear_system_matches_stacked_rows():
     runs = {}
     for system in ('rows', 'hessian'):
         s = solver(dense_normalflow_residual_weight=1e5, gtsam_vi_height_z_enabled=True,
-                   frontend_reference_previous_state='eliminate_first',
+                   frontend_reference_previous_state=mode,
                    frontend_reference_linear_system=system)
         states = [advance(s, state(), PerturbedVisual())]  # Bootstrap: first pose fixed.
         states.append(advance(s, states[-1], PerturbedVisual()))  # Reference = first pose.
@@ -430,20 +449,6 @@ def test_nonfinite_failure_keeps_accepted_prior(bad):
     assert s.marginal_prior is prior and s.pending_marginal_prior is None
 
 
-@pytest.mark.parametrize('options', [
-    {'frontend_fix_previous_state': True},
-    {'frontend_imu_prediction_only': True}, {'gtsam_vi_marginalization': False},
-    {'frontend_gt_previous_state_test': True}, {'frontend_state_mode': 'unknown'},
-    {'frontend_reference_previous_state': 'unknown'},
-    {'frontend_reference_linear_system': 'unknown'},
-    {'frontend_reference_linear_system': 'hessian'},  # joint is the default.
-])
-def test_incompatible_modes_fail_explicitly(options):
-    with pytest.raises(ValueError):
-        create_frontend_solver(dict(frontend_state_mode='reference_marginalization', **options)
-                               if 'frontend_state_mode' not in options else options)
-
-
 def test_tracker_contact_keyframe_recovery_and_backend_map_only(monkeypatch):
     import gelslam.core.tracker as tm
     from test_contact_recovery_policy import tracker_with_imu
@@ -491,7 +496,6 @@ def test_no_contact_restart_transfers_information_and_replaces_both_references(m
     from test_contact_recovery_policy import tracker_with_imu
     from test_tracker_inertial import header
     tracker, initial = tracker_with_imu(monkeypatch)
-    tracker.imu_config['frontend_state_mode'] = 'reference_marginalization'
     tracker.frontend_visual_inertial = solver()
     tracker.frontend_visual_inertial.set_reference(initial.timestamp, initial)
     contact, trial = tracker.prev_frame, tracker._trial_index
@@ -520,7 +524,6 @@ def test_replacing_unpublished_restart_reference_sets_only_the_new_first_pose(mo
     from test_contact_recovery_policy import tracker_with_imu
     from test_tracker_inertial import header
     tracker, initial = tracker_with_imu(monkeypatch)
-    tracker.imu_config['frontend_state_mode'] = 'reference_marginalization'
     old_solver = solver()
     tracker.frontend_visual_inertial = old_solver
     old_solver.set_reference(initial.timestamp, initial)
@@ -581,3 +584,43 @@ def test_imu_callback_during_solve_only_buffers_measurements(monkeypatch):
     assert s.marginal_prior is prior
     assert node.tracker._frontend_vi_state is previous
     assert node.tracker.imu_buffer.latest_timestamp() == 1.25
+
+
+def _inertial_blocks(**weights):
+    s, previous = solver(**weights), state()
+    samples = tuple(ImuSample(float(t), [0.1, -0.2, 9.81], [0.01, 0.02, -0.03])
+                    for t in np.linspace(1., 1.1, 11))
+    current, pim = s.predict_current(previous, samples, np.eye(4))
+    prior, layout, values = s._problem(previous, current)
+    rows, right = s._inertial_rows(prior, layout, values, previous.timestamp, current.timestamp,
+                                   (_split_imu_factor(pim), _bias_factor(pim, s.config)))
+    return s, rows, right
+
+
+def test_bias_residual_weight_defaults_to_imu_weight():
+    s, rows, right = _inertial_blocks(imu_residual_weight=1e-4)
+    assert s.bias_weight == s.imu_weight == 1e-4
+    _, same_rows, same_right = _inertial_blocks(imu_residual_weight=1e-4, bias_residual_weight=None)
+    _, explicit_rows, explicit_right = _inertial_blocks(imu_residual_weight=1e-4,
+                                                        bias_residual_weight=1e-4)
+    for other_rows, other_right in ((same_rows, same_right), (explicit_rows, explicit_right)):
+        for a, b in zip(rows + right, other_rows + other_right):
+            np.testing.assert_array_equal(a, b)
+
+
+def test_bias_residual_weight_scales_only_bias_rows():
+    _, unit_rows, unit_right = _inertial_blocks(imu_residual_weight=1., bias_residual_weight=1.)
+    _, rows, right = _inertial_blocks(imu_residual_weight=1e-4, bias_residual_weight=1e-2)
+    # [prior, IMU (9 rows), bias random walk (6 rows)]
+    np.testing.assert_array_equal(rows[0], unit_rows[0])
+    np.testing.assert_allclose(rows[1], 1e-2 * unit_rows[1], rtol=1e-12, atol=0)
+    np.testing.assert_allclose(right[1], 1e-2 * unit_right[1], rtol=1e-12, atol=0)
+    np.testing.assert_allclose(rows[2], 1e-1 * unit_rows[2], rtol=1e-12, atol=0)
+    np.testing.assert_allclose(right[2], 1e-1 * unit_right[2], rtol=1e-12, atol=0)
+    assert np.abs(unit_right[1]).max() > 0
+
+
+@pytest.mark.parametrize("bad", [0., -1., float("nan"), float("inf")])
+def test_bias_residual_weight_rejects_invalid_values(bad):
+    with pytest.raises(ValueError, match="bias_residual_weight"):
+        solver(bias_residual_weight=bad)

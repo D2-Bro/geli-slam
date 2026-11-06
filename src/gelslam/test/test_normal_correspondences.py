@@ -4,18 +4,18 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from normalflow.registration import LoseTrackError
 from cv_bridge import CvBridge
 from std_msgs.msg import Header
 
 from gelslam.core.numpy_vi import DenseNormalResidual
-from gelslam.core.tracker import QualityGateError, Tracker
+from gelslam.core.tracker import Tracker
 from gelslam.nodes.tracker_node import TrackerNode
 from gelslam.visualization.normal_correspondences import (
     normal_map_to_rgb8,
     project_normal_correspondences,
     render_normal_correspondences,
 )
-import gelslam.core.tracker as tracker_module
 
 
 def surface(h=24, w=32):
@@ -99,7 +99,10 @@ def test_display_limit_and_invalid_pairs_do_not_modify_inputs():
     render_normal_correspondences(ref, ref, [[np.nan, 0]], [[0, 0]], "", "", "")
 
 
-def test_rejected_pose_snapshot_retains_compared_reference_after_promotion(monkeypatch):
+def test_failed_solve_snapshot_retains_compared_reference_after_promotion():
+    # The NormalFlow-only fallback was removed: without a VI solver the solve fails.
+    # The snapshot must still keep the images and stamps that were compared, even
+    # after a later keyframe promotion replaces ref_frame.
     tracker = object.__new__(Tracker)
     reference, current = surface(), surface()
     tracker.ppmm = 1.0
@@ -113,10 +116,7 @@ def test_rejected_pose_snapshot_retains_compared_reference_after_promotion(monke
     tracker.logger = SimpleNamespace(info=lambda _message: None)
     current_header = Header()
     current_header.stamp.sec = 2
-    monkeypatch.setattr(tracker_module, "normalflow", lambda *a, **k: (
-        np.eye(4, dtype=np.float32), {"scr": 0.2, "ccs": 0.9}
-    ))
-    with pytest.raises(QualityGateError):
+    with pytest.raises(LoseTrackError):
         tracker._refine_normalflow_with_imu(np.eye(4), current_header, reference, current)
     tracker.ref_frame = surface()  # A subsequent keyframe promotion changes this.
     snapshot = tracker.latest_normal_correspondences
@@ -124,8 +124,7 @@ def test_rejected_pose_snapshot_retains_compared_reference_after_promotion(monke
     assert snapshot["current"] is current
     assert snapshot["reference_stamp"] == 1.0
     assert snapshot["current_stamp"] == 2.0
-    assert snapshot["status"] == "NormalFlow final pose: quality rejected"
-    assert len(snapshot["reference_xy"]) > 10
+    assert snapshot["status"] == "Frontend failed: vi_unavailable"
 
 
 def test_ros_image_uses_current_header_and_saved_reference():

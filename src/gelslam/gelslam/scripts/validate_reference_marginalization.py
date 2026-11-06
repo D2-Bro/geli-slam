@@ -60,7 +60,6 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     config = yaml.safe_load(args.config.read_text())
-    config["imu_config"]["frontend_state_mode"] = "reference_marginalization"
     imu = config["imu_config"]
     if imu.get("timestamp_source", "header") != "header":
         parser.error("this replay requires header timestamps; use ROS launch for recorded_source")
@@ -85,7 +84,7 @@ def main():
         if kind == "imu":
             gyro = gyro_to_rad_per_sec(
                 [message.angular_velocity.x, message.angular_velocity.y, message.angular_velocity.z],
-                imu.get("gyro_input_unit", "rad_s"), imu.get("gyro_max_rate_rad_s", 5.))
+                max_rate_rad_s=imu.get("gyro_max_rate_rad_s", 5.))
             if not tracker.add_imu_sample(ImuSample(time,
                     [message.linear_acceleration.x, message.linear_acceleration.y,
                      message.linear_acceleration.z], gyro)):

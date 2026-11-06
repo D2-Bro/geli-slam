@@ -85,25 +85,6 @@ class PositionObservation:
         return residual, np.zeros_like(J), J
 
 
-def test_frontend_observation_receives_gelsight_pose_and_retains_imu_prior():
-    extrinsic = mount()
-    previous = NavigationState(0., extrinsic.copy(), np.zeros(3), np.zeros(3), np.zeros(3))
-    force = extrinsic[:3, :3].T @ [0., 0., 9.81]
-    samples = [ImuSample(float(t), force, [0., 0., 0.]) for t in np.linspace(0., .1, 11)]
-    solver = GtsamVisualInertialSolver({"gtsam_vi_max_iterations": 3,
-                                      "dense_normalflow_residual_weight": 1e4})
-    current, pim = solver.predict_current(previous, samples, extrinsic)
-    visual = PositionObservation(np.array([.001, -.002, .003]))
-    refined = solver.refine_current(visual, np.eye(4), previous, current,
-                                    samples, extrinsic, preintegrated=pim)
-    assert refined is not None
-    assert np.allclose(visual.seen[0], np.eye(4), atol=1e-12)
-    assert np.linalg.norm(gelsight_pose(refined.pose, extrinsic)[:3, 3] - visual.target) < .003
-    assert solver.pending_marginal_prior.matches(refined)
-    assert np.allclose(solver.pending_marginal_prior.anchor.pose, refined.pose)
-    assert not np.allclose(refined.pose, gelsight_pose(refined.pose, extrinsic))
-
-
 @pytest.mark.parametrize("between", [False, True])
 def test_backend_gelsight_factor_jacobians_use_imu_increments(between):
     extrinsic = mount()
@@ -158,4 +139,3 @@ def test_old_active_gelsight_tracker_state_is_not_loaded_as_imu(tmp_path):
         pickle.dump(tracker, stream)
     with pytest.raises(ValueError, match='GelSight navigation states'):
         Tracker.load(tmp_path, 'unused', SimpleNamespace())
-
