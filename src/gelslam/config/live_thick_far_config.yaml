@@ -233,7 +233,7 @@ gelslam_config:
     # DDS queue depth for /image. 1 drops stale images when tracking is slow.
     # IMU synchronization also keeps only the latest image waiting for IMU.
     image_queue_size: 1
-    contact_threshold: 10
+    contact_threshold: 1
     scr_threshold: 0.5
     ccs_threshold: 0.3
   pose_graph_config:
