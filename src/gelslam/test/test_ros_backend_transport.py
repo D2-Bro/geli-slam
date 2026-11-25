@@ -1,5 +1,4 @@
 """ROS serialization, correction freshness and backend process ownership."""
-from collections import deque
 from dataclasses import replace
 from threading import Condition
 from types import SimpleNamespace
@@ -136,10 +135,9 @@ def test_end_marker_waits_for_the_last_keyframe_callback():
 
 
 def test_backend_worker_failure_is_reported_to_coordinator():
-    def fail(_packets):raise ValueError('backend sentinel')
-    node = SimpleNamespace(_work=Condition(), running=True, _failure=None,
-        _pending=deque([roundtrip(packet())]), _bridge=CvBridge(),
-        backend_optimization_enabled=True, _backend=SimpleNamespace(process=fail))
+    def fail():raise ValueError('backend sentinel')
+    node = SimpleNamespace(_work=Condition(), running=True, _failure=None, _inserted=1,
+        backend_optimization_enabled=True, _backend=SimpleNamespace(optimize=fail))
     PoseGraphNode.loop_closure(node)
     assert not node.running
     with pytest.raises(RuntimeError, match='backend sentinel'):
@@ -153,18 +151,24 @@ def test_feedback_flag_preserves_backend_solve_and_map_publication(enabled):
     cfg['device_config'] = {'ppmm': 1.}
     service = TopicBackend(cfg, Logger(print_output=False))
     published, trajectories = [], []
-    node = SimpleNamespace(_work=Condition(), running=True, _failure=None,
-        _pending=deque([roundtrip(packet(i)) for i in range(2)]), _bridge=CvBridge(),
+    node = SimpleNamespace(_work=Condition(), running=True, _failure=None, _inserted=0,
+        _last_received={}, _bridge=CvBridge(),
         backend_optimization_enabled=True, backend_feedback_enabled=enabled,
         feedback_messages_published=0, rendering=False, _backend=service,
         feedback_pub=SimpleNamespace(publish=published.append),
         publish_gelsight_keyframe_trajectory=lambda: trajectories.append(True),
         get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: Header().stamp)))
-    process = service.process
-    def process_once(packets):
+    # K thread: the callback decodes and inserts each keyframe (features included).
+    for i in range(2):
+        PoseGraphNode.keyframe_callback(node, roundtrip(packet(i)))
+    assert node._inserted == 2 and node._last_received == {'tracking-a': 1}
+    assert service.search.db.size() == 2 and service.mapper.db.size() == 0
+    # L thread: one pass optimizes both, then the stop request ends the loop.
+    optimize = service.optimize
+    def optimize_once():
         node.running = False
-        return process(packets)
-    service.process = process_once
+        return optimize()
+    service.optimize = optimize_once
     node._bind_backend = lambda: PoseGraphNode._bind_backend(node)
     PoseGraphNode.loop_closure(node)
     PoseGraphNode.raise_if_failed(node)
@@ -175,6 +179,91 @@ def test_feedback_flag_preserves_backend_solve_and_map_publication(enabled):
     assert len(published) == node.feedback_messages_published == int(enabled)
     if enabled:
         assert list(published[0].kids) == [0, 1]
+
+
+def test_keyframe_callback_failure_stops_the_backend_and_is_reported():
+    """K thread: a keyframe without a navigation seed fails the 15D backend."""
+    cfg = config(coverage_graph_overlap_threshold=.8, min_sift_inliers=8,
+                 scr_threshold=.3, ccs_threshold=.7)
+    cfg['device_config'] = {'ppmm': 1.}
+    service = TopicBackend(cfg, Logger(print_output=False))
+    node = SimpleNamespace(_work=Condition(), running=True, _failure=None, _inserted=0,
+        _last_received={}, _bridge=CvBridge(), backend_optimization_enabled=True,
+        _backend=service)
+    PoseGraphNode.keyframe_callback(node, roundtrip(replace(packet(), navigation_valid=False)))
+    assert not node.running and node._inserted == 0 and node._last_received == {}
+    with pytest.raises(RuntimeError, match='synchronized navigation'):
+        PoseGraphNode.raise_if_failed(node)
+    # A stopped backend ignores later keyframes.
+    PoseGraphNode.keyframe_callback(node, roundtrip(packet()))
+    assert service.store.snapshot_for_tracking().observations == ()
+
+
+def test_split_ingest_and_optimize_equal_the_sequential_process():
+    """ingest() per keyframe then one optimize() gives the result of process()."""
+    cfg = config(coverage_graph_overlap_threshold=.8, min_sift_inliers=8,
+                 scr_threshold=.3, ccs_threshold=.7)
+    cfg['device_config'] = {'ppmm': 1.}
+    packets = [packet(i) for i in range(4)]
+    sequential = TopicBackend(cfg, Logger(print_output=False))
+    assert sequential.process(packets)
+    split = TopicBackend(cfg, Logger(print_output=False))
+    assert not split.optimize()                       # nothing ingested yet
+    assert all(split.ingest(p) for p in packets)
+    assert split.search.db.size() == 4 and split.mapper.db.size() == 0
+    assert split.optimize() and not split.optimize()  # second call: no new keyframe
+    assert split.mapper.db.size() == sequential.mapper.db.size() == 4
+    assert split.mapper.graph.temporal_links == sequential.mapper.graph.temporal_links
+    for a, b in zip(split.mapper.solutions, sequential.mapper.solutions):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_loop_closure_optimizes_only_the_snapshot_while_keyframes_keep_arriving():
+    """A keyframe inserted after the snapshot waits for the next L thread pass."""
+    cfg = config(coverage_graph_overlap_threshold=.8, min_sift_inliers=8,
+                 scr_threshold=.3, ccs_threshold=.7)
+    cfg['device_config'] = {'ppmm': 1.}
+    service = TopicBackend(cfg, Logger(print_output=False))
+    for i in range(2):
+        service.ingest(packet(i))
+    detect = service.search.detect
+    def detect_with_arrival(snapshot):
+        service.ingest(packet(2))                     # K thread inserts during the search
+        return detect(snapshot)
+    service.search.detect = detect_with_arrival
+    assert service.optimize()
+    assert service.mapper.db.size() == 2 and service.search.db.size() == 3
+    assert service.search._next_target == 2
+    service.search.detect = detect
+    assert service.optimize()
+    assert service.mapper.db.size() == 3 and service.search._next_target == 3
+
+
+def test_concurrent_insertion_and_loop_closure_threads_handle_every_keyframe():
+    from threading import Thread
+    # Exclude all 8 keyframes from loop matching: the small synthetic maps are
+    # never sent to NormalFlow registration. Insertion and search still run.
+    cfg = config(coverage_graph_overlap_threshold=.8, min_sift_inliers=8,
+                 scr_threshold=.3, ccs_threshold=.7, loop_search_exclude_recent_keyframes=100)
+    cfg['device_config'] = {'ppmm': 1.}
+    service = TopicBackend(cfg, Logger(print_output=False))
+    node = SimpleNamespace(_work=Condition(), running=True, _failure=None, _inserted=0,
+        _last_received={}, _bridge=CvBridge(), backend_optimization_enabled=True,
+        backend_feedback_enabled=False, feedback_messages_published=0, rendering=False,
+        _backend=service, publish_gelsight_keyframe_trajectory=lambda: None)
+    node._bind_backend = lambda: PoseGraphNode._bind_backend(node)
+    worker = Thread(target=PoseGraphNode.loop_closure, args=(node,))
+    worker.start()
+    for i in range(8):
+        PoseGraphNode.keyframe_callback(node, roundtrip(packet(i)))
+    with node._work:
+        node.running = False
+        node._work.notify_all()
+    worker.join(timeout=60)
+    assert not worker.is_alive()
+    PoseGraphNode.raise_if_failed(node)
+    assert node._inserted == 8 and node.processed_keyframe_count == 8
+    assert service.mapper.graph.temporal_links == [(i, i + 1) for i in range(7)]
 
 
 @pytest.mark.parametrize('filename', ['bag_replay_launch.py', 'live_demo_launch.py',

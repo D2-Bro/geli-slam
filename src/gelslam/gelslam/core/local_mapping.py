@@ -227,16 +227,28 @@ class LoopSearch:
         self._next_target = 1
         self._last_search_timestamp = None
 
+    def insert(self, packet):
+        """Add one keyframe with its SIFT features (keyframe insertion thread).
+
+        The caller serializes insert() with the snapshot that detect() receives,
+        so the database always holds at least the snapshot's keyframes.
+        """
+        self.db.insert(packet, log_prefix="Keyframe Insert", compute_features=True)
+
     def detect(self, snapshot):
         if self.epoch != snapshot.epoch:
             self.__init__(self.config, self.logger)
             self.epoch = snapshot.epoch
         for packet in snapshot.observations[self.db.size():]:
-            # Feature extraction belongs to this worker, never the BA worker.
+            # Callers without an insertion thread: extract features here,
+            # never in the BA worker.
             self.db.insert(packet, log_prefix="Loop Search", compute_features=True)
         result = []
         last_timestamp = self._last_search_timestamp
-        for target_index in range(self._next_target, self.db.size()):
+        # The insertion thread can add keyframes after this snapshot was taken.
+        # Search only the snapshot's keyframes; the rest wait for the next call.
+        limit = min(self.db.size(), len(snapshot.observations))
+        for target_index in range(self._next_target, limit):
             keyframe = self.db[target_index]
             state = keyframe.navigation_state
             timestamp = state.timestamp if state is not None else keyframe.timestamp
@@ -259,6 +271,6 @@ class LoopSearch:
                     self.db[reference].kid, self.db[target].kid, transform))
             last_timestamp = timestamp
         # Commit only after the whole result is ready for the caller.
-        self._next_target = max(1, self.db.size())
+        self._next_target = max(1, limit)
         self._last_search_timestamp = last_timestamp
         return result

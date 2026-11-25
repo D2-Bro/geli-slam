@@ -1,7 +1,6 @@
 import os
 import signal
 import json
-from collections import deque
 from traceback import format_exc
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -112,7 +111,8 @@ class PoseGraphNode(Node):
         self._bind_backend()
         self.add_keyframe_lock = threading.Lock()
         self._work = threading.Condition()
-        self._pending = deque()
+        # Count of keyframes inserted by the K thread; the L thread waits on it.
+        self._inserted = 0
         self._failure = None
         self._closed = False
         self._last_received = {}
@@ -192,12 +192,32 @@ class PoseGraphNode(Node):
         self.pose_graph_solutions = mapper.solutions
 
     def keyframe_callback(self, keyframe_msg):
-        # Decode and derived-feature work belong to the backend worker.
+        """K thread (original GelSLAM): decode the keyframe and insert it.
+
+        The insertion stores the keyframe and extracts its loop-search features.
+        The subscription is in the node's default mutually exclusive callback
+        group, so keyframes are inserted one at a time in arrival order.
+        """
         with self._work:
             if not self.running:
                 return
+        try:
+            packet = keyframe_from_ros(keyframe_msg, self._bridge)
+            if self.backend_optimization_enabled and not packet.navigation_valid:
+                raise ValueError('15D backend requires synchronized navigation keyframe seeds')
+            self._backend.ingest(packet)
+        except BaseException as error:
+            with self._work:
+                if self._failure is None:
+                    self._failure = (error, format_exc())
+                self.running = False
+                self._work.notify_all()
+            return
+        with self._work:
+            # Recorded after the insertion: the end marker then waits for the
+            # last keyframe to be in the database, not only in a queue.
             self._last_received[keyframe_msg.session_id] = keyframe_msg.kid
-            self._pending.append(keyframe_msg)
+            self._inserted += 1
             self._work.notify_all()
 
     def stream_end_callback(self, message):
@@ -413,25 +433,30 @@ class PoseGraphNode(Node):
             )
 
     def loop_closure(self):
-        """Drain ordered keyframes; search, optimize and publish in one owner."""
+        """L thread (original GelSLAM): loop detection, pose graph and publication.
+
+        Each pass handles every keyframe that the K thread inserted so far.
+        Keyframes inserted before a stop request are still optimized.
+        """
         try:
+            handled = 0
             while True:
                 with self._work:
-                    self._work.wait_for(lambda: self._pending or not self.running)
-                    if not self._pending and not self.running:
+                    self._work.wait_for(lambda: self._inserted != handled or not self.running)
+                    if self._inserted == handled and not self.running:
                         return
-                    pending, self._pending = self._pending, deque()
-                packets = [keyframe_from_ros(message, self._bridge) for message in pending]
-                if self.backend_optimization_enabled and any(not p.navigation_valid for p in packets):
-                    raise ValueError('15D backend requires synchronized navigation keyframe seeds')
-                changed = self._backend.process(packets)
+                    handled = self._inserted
+                changed = self._backend.optimize()
                 self._bind_backend()
                 self.processed_keyframe_count = self.keyframedb.size()
                 if not changed:
                     continue
                 if self.backend_feedback_enabled:
-                    feedback = feedback_message(self._backend.store.snapshot_for_tracking(),
-                                                self._backend.session_id)
+                    # The store and session that this pass optimized. The K thread
+                    # can already hold a newer tracking session.
+                    feedback = feedback_message(
+                        self._backend.optimized_store.snapshot_for_tracking(),
+                        self._backend.optimized_session_id)
                     feedback.header.stamp = self.get_clock().now().to_msg()
                     self.feedback_pub.publish(feedback)
                     self.feedback_messages_published += 1
