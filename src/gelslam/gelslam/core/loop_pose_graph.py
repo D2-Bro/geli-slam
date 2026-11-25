@@ -1,8 +1,14 @@
-"""Global 15D navigation optimization with registered GelSight loop poses.
+"""Global navigation optimization with registered GelSight loop poses.
 
-Each keyframe has an IMU Pose3, world velocity, and accelerometer/gyro bias.
-Contact odometry and loop measurements observe GelSight poses in metres.
-Raw IMU and bias diffusion couple the remaining navigation variables. The
+pose_graph_config.imu_factors true (default): each keyframe has an IMU Pose3,
+world velocity, and accelerometer/gyro bias (15D). Raw IMU and bias diffusion
+couple the navigation variables.
+pose_graph_config.imu_factors false: pose-only graph (6D). No IMU factor, bias
+random-walk factor, velocity/bias variable or velocity/bias prior. The velocity
+and bias corrections of every keyframe then stay as they are (zero for a new
+graph). Every temporal link needs a relative-pose factor, so
+recovery_odometry_translation_sigma_m must be set.
+Contact odometry and loop measurements observe GelSight poses in metres. The
 global solution stays separate from local VI states and marginal priors.
 """
 import gtsam
@@ -23,6 +29,15 @@ class LoopPoseGraph:
     def __init__(self, config, imu_config=None):
         self.config = dict(config)
         self.imu_config = dict(imu_config or {})
+        self.imu_factors = self.config.get('imu_factors', True)
+        if not isinstance(self.imu_factors, bool):
+            raise ValueError('pose_graph_config.imu_factors must be true or false')
+        if not self.imu_factors:
+            if self.config.get('recovery_odometry_translation_sigma_m') is None:
+                raise ValueError('pose_graph_config.imu_factors false requires '
+                                 'recovery_odometry_translation_sigma_m: an IMU recovery '
+                                 'link would have no factor')
+            self.degrees_of_freedom = 6
         # Optional backend-only IMU integration sigma (default: imu_config value).
         # A stiff frontend integration sigma (0.001) made each first global solve
         # move whole trajectories to absorb stale keyframe velocities.
@@ -39,7 +54,14 @@ class LoopPoseGraph:
         # Registered loops use the odometry sigmas and an optional robust kernel
         # (width loop_pgo_loop_robust_width). Registered loop rotations were measured
         # 1-5 deg (up to 15 deg) off GT on real-objects, far above 0.01 rad.
+        # loop_rotation_sigma_rad (optional): rotation sigma of loop factors only.
+        # Absent: the odometry rotation sigma, as before.
         self.loop_noise = self.noise
+        if self.config.get('loop_rotation_sigma_rad') is not None:
+            self.loop_noise = gtsam.noiseModel.Diagonal.Sigmas(np.repeat([
+                self._positive('loop_rotation_sigma_rad', .01),
+                self._positive('loop_pgo_translation_sigma_m', .0001),
+            ], 3))
         # An IMU recovery keyframe has no tactile measurement, so its link has no
         # contact odometry and the frontend's re-contact estimate across the gap is
         # lost. With this sigma, the link also gets odometry from the frontend seeds
@@ -218,7 +240,7 @@ class LoopPoseGraph:
         return imu, bias
 
     def solve(self):
-        """Jointly optimize full rotations, positions, velocities and both biases."""
+        """Jointly optimize the keyframe poses and, with imu_factors, velocities and biases."""
         graph, values, kinds, fixed = gtsam.NonlinearFactorGraph(), gtsam.Values(), [], set()
         states = [self.map_state(key) for key in range(len(self.local_states))]
 
@@ -228,14 +250,17 @@ class LoopPoseGraph:
 
         for key, state in enumerate(states):
             values.insert(key, gtsam.Pose3(state.pose))
-            values.insert(velocity_key(key), state.velocity)
-            values.insert(bias_key(key), gtsam.imuBias.ConstantBias(state.accel_bias, state.gyro_bias))
+            if self.imu_factors:
+                values.insert(velocity_key(key), state.velocity)
+                values.insert(bias_key(key), gtsam.imuBias.ConstantBias(state.accel_bias, state.gyro_bias))
         for group, key in self.roots.items():
             if group not in self.removed_groups:
                 anchor = self.anchor_poses[group]
                 values.update(key, gtsam.Pose3(anchor @ self.extrinsic))
                 add(split_prior_factor(key, anchor, self.anchor_noise, self.imu_T_gel), 'pose_anchor')
                 fixed.add(key)
+            if not self.imu_factors:
+                continue
             anchor = self.anchor_states[group]
             add(gtsam.PriorFactorVector(velocity_key(key), anchor.velocity,
                 gtsam.noiseModel.Isotropic.Sigma(3, self._positive('initial_velocity_sigma_mps', .1))), 'velocity_prior')
@@ -245,9 +270,10 @@ class LoopPoseGraph:
                 gtsam.imuBias.ConstantBias(anchor.accel_bias, anchor.gyro_bias),
                 gtsam.noiseModel.Diagonal.Sigmas(sigmas)), 'bias_prior')
         for reference, target in self.temporal_links:
-            imu, bias = self._imu_factors(reference, target, states[reference])
-            add(imu, 'imu')
-            add(bias, 'bias')
+            if self.imu_factors:
+                imu, bias = self._imu_factors(reference, target, states[reference])
+                add(imu, 'imu')
+                add(bias, 'bias')
             measurement = np.linalg.inv(self.local_poses[reference]) @ self.local_poses[target]
             if self.records[target].tactile_valid:
                 add(split_between_factor(reference, target, measurement, self.noise,
@@ -270,6 +296,11 @@ class LoopPoseGraph:
             pose = result.atPose3(key).matrix()
             correction = pose @ np.linalg.inv(local.pose)
             corrections.append(correction)
+            if not self.imu_factors:
+                # Pose-only graph: no velocity or bias estimate; keep the offsets.
+                velocities.append(self.velocity_corrections[key])
+                biases.append(self.bias_corrections[key])
+                continue
             velocities.append(result.atVector(velocity_key(key)) - correction[:3, :3] @ local.velocity)
             biases.append(result.atConstantBias(bias_key(key)).vector() - np.r_[local.accel_bias, local.gyro_bias])
         if not all(np.isfinite(value).all() for value in corrections + velocities + biases):

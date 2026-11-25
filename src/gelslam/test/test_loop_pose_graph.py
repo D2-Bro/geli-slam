@@ -131,3 +131,64 @@ def test_legacy_direct_loop_snapshot_requires_replay(tmp_path):
         pickle.dump(data, handle)
     with pytest.raises(ValueError, match='lacks registered loop measurements'):
         PoseGraph.load(tmp_path)
+
+
+def _pose_only(**overrides):
+    return LoopPoseGraph(dict({'max_iterations': 20, 'imu_factors': False,
+                               'recovery_odometry_translation_sigma_m': .001}, **overrides))
+
+
+def test_pose_only_graph_has_no_imu_velocity_or_bias_factor():
+    graph = _pose_only()
+    local = [translation(x) for x in (0., .01, .02)]
+    records = loop_records(local)
+    graph.synchronize(local, records, [(0, 1), (1, 2)])
+    assert graph.add_loop(0, 2, translation(-.018))
+    graph.solve()
+    assert graph.factor_kinds == ['pose_anchor', 'odometry', 'odometry', 'loop']
+    assert graph.degrees_of_freedom == 6 and graph.graph_result.dim() == 18
+    positions = [p[0, 3] for p in graph.map_poses()]
+    assert positions[0] == 0. and 0. < positions[1] < .01 and .018 < positions[2] < .02
+    assert np.array_equal(graph.local_poses, local)
+    assert graph.last_final_cost < graph.last_initial_cost
+    # No velocity or bias estimate: the offsets stay zero, the seeds are kept.
+    assert all(not v.any() for v in graph.velocity_corrections + graph.bias_corrections)
+    state = graph.map_state(2)
+    np.testing.assert_array_equal(state.accel_bias, graph.local_states[2].accel_bias)
+    # A second solve from the corrected poses stays at the solution.
+    before = graph.map_poses()
+    graph.solve()
+    np.testing.assert_allclose(graph.map_poses(), before, atol=1e-9)
+
+
+def test_pose_only_graph_links_an_imu_recovery_keyframe_by_recovery_odometry():
+    graph = _pose_only()
+    local = [translation(x) for x in (0., .01, .02)]
+    records = loop_records(local)
+    records[1].tactile_valid = False
+    # A missing IMU interval is not an error without IMU factors.
+    records[1].imu_samples = ()
+    graph.synchronize(local, records, [(0, 1), (1, 2)])
+    graph.solve()
+    assert graph.factor_kinds == ['pose_anchor', 'recovery_odometry', 'odometry']
+    np.testing.assert_allclose(graph.map_poses(), local, atol=1e-9)
+
+
+def test_pose_only_graph_settings_are_validated():
+    with pytest.raises(ValueError, match='requires recovery_odometry_translation_sigma_m'):
+        LoopPoseGraph({'imu_factors': False})
+    with pytest.raises(ValueError, match='imu_factors must be true or false'):
+        LoopPoseGraph({'imu_factors': 0})
+    assert LoopPoseGraph({}).imu_factors and LoopPoseGraph({}).degrees_of_freedom == 15
+
+
+def test_loop_rotation_sigma_is_separate_from_the_odometry_sigma():
+    graph = LoopPoseGraph({'loop_rotation_sigma_rad': .05, 'loop_pgo_loop_robust': 'huber'})
+    assert np.allclose(graph.noise.sigmas(), [.01] * 3 + [.0001] * 3)
+    assert np.allclose(graph.loop_noise.noise().sigmas(), [.05] * 3 + [.0001] * 3)
+    plain = LoopPoseGraph({'loop_rotation_sigma_rad': .05})
+    assert np.allclose(plain.loop_noise.sigmas(), [.05] * 3 + [.0001] * 3)
+    default = LoopPoseGraph({})
+    assert default.loop_noise is default.noise
+    with pytest.raises(ValueError, match='loop_rotation_sigma_rad'):
+        LoopPoseGraph({'loop_rotation_sigma_rad': 0.})
