@@ -265,6 +265,12 @@ gelslam_config:
     initial_gyro_bias_sigma_rps: 0.01
     max_iterations: 10
     coverage_graph_overlap_threshold: 50
+    # Loop search skips references that the coverage graph deactivated (covered by
+    # other keyframes), as original GelSLAM does. Without it every older keyframe
+    # that passes SIFT/SCR/CCS becomes a loop (real-objects-12: up to 84 loops per
+    # keyframe). Offline 12 real-objects trials: loops -74 to -80 %, keyframe final
+    # MAE +0.02 to +0.04 mm (current 1.080 -> 1.123, tf/peak 1.041 -> 1.061).
+    loop_search_coverage_filter: true
     min_sift_inliers: 8
     scr_threshold: 0.5
     ccs_threshold: 0.3

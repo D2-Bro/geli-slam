@@ -40,6 +40,9 @@ class LocalMapping:
         self.solutions = self.graph.raw_solutions()
         self.epoch = 0
         self.accepted_pairs = set()
+        # (epoch, keyframe IDs the coverage graph deactivated). LoopSearch reads it
+        # from its own thread; the tuple is replaced, never edited.
+        self.coverage_inactive_kids = (self.epoch, frozenset())
 
     def _apply_keyframe_update(self, row):
         """Replace an earlier keyframe's stored seed by the frontend's later estimate.
@@ -199,7 +202,14 @@ class LocalMapping:
             if global_solve:
                 self.coverage.update_wrt_loop_closure(sorted(set(merged_original)),
                     sorted(set(merged_new)), self.db, self.solutions)
+            self._publish_coverage_inactive()
         return True
+
+    def _publish_coverage_inactive(self):
+        """Publish the keyframes that the coverage graph has deactivated (original GelSLAM loop filter)."""
+        self.coverage_inactive_kids = (self.epoch, frozenset(
+            self.db[index].kid for index in range(self.coverage.size())
+            if not self.coverage[index].is_active))
 
     def save(self, directory):
         self.graph.save(directory)
@@ -221,6 +231,13 @@ class LoopSearch:
             raise ValueError('loop_search_min_interval_s must be finite and nonnegative') from None
         if isinstance(value, bool) or not np.isfinite(self.min_interval_s) or self.min_interval_s < 0:
             raise ValueError('loop_search_min_interval_s must be finite and nonnegative')
+        # loop_search_coverage_filter: skip references that LocalMapping's coverage
+        # graph has deactivated (another keyframe covers them), as original GelSLAM
+        # does. Keyframes not yet in the coverage graph stay references.
+        self.coverage_filter = config['gelslam_config']['pose_graph_config'].get(
+            'loop_search_coverage_filter', False)
+        if not isinstance(self.coverage_filter, bool):
+            raise ValueError('loop_search_coverage_filter must be true or false')
         self.db = database(config, logger)
         self.epoch = 0
         # DB index zero has no preceding reference. Reset with the map epoch.
@@ -235,7 +252,16 @@ class LoopSearch:
         """
         self.db.insert(packet, log_prefix="Keyframe Insert", compute_features=True)
 
-    def detect(self, snapshot):
+    def detect(self, snapshot, coverage_inactive_kids=None):
+        """Loop candidates for the snapshot's new targets.
+
+        coverage_inactive_kids: LocalMapping.coverage_inactive_kids (epoch, kids); used
+        only with loop_search_coverage_filter and when its epoch is the snapshot's.
+        """
+        inactive = None
+        if (self.coverage_filter and coverage_inactive_kids is not None
+                and coverage_inactive_kids[0] == snapshot.epoch):
+            inactive = coverage_inactive_kids[1]
         if self.epoch != snapshot.epoch:
             self.__init__(self.config, self.logger)
             self.epoch = snapshot.epoch
@@ -261,9 +287,13 @@ class LoopSearch:
                 if 0 <= elapsed < self.min_interval_s - tolerance:
                     continue
             # Missing or backwards time starts a new interval, avoiding a stall.
-            pairs = PoseGraph.detect_loop_candidates(
-                self.db, target_index,
-                self.config['gelslam_config']['pose_graph_config'])
+            config = self.config['gelslam_config']['pose_graph_config']
+            if inactive is None:
+                pairs = PoseGraph.detect_loop_candidates(self.db, target_index, config)
+            else:
+                active = {index for index in range(target_index)
+                          if self.db[index].kid not in inactive}
+                pairs = PoseGraph.detect_loop_candidates(self.db, target_index, config, active)
             for reference, target, transform in pairs:
                 transform = np.array(transform, copy=True)
                 transform.setflags(write=False)

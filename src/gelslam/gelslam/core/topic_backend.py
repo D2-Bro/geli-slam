@@ -60,7 +60,12 @@ class TopicBackend:
             self._mapper_generation, self._optimized_count = generation, 0
         if len(snapshot.observations) == self._optimized_count:
             return False
-        candidates = search.detect(snapshot) if search is not None else ()
+        if search is None:
+            candidates = ()
+        elif getattr(search, 'coverage_filter', False):
+            candidates = search.detect(snapshot, self.mapper.coverage_inactive_kids)
+        else:
+            candidates = search.detect(snapshot)
         changed = self.mapper.process(snapshot, candidates, store)
         self.optimized_store, self.optimized_session_id = store, session_id
         self._optimized_count = len(snapshot.observations)

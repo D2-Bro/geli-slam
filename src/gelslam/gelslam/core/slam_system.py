@@ -131,7 +131,11 @@ class SlamSystem:
                     if token == last and self._tracking_done:
                         return
                 begin = monotonic()
-                candidates = self.loop_search.detect(snapshot)
+                if getattr(self.loop_search, 'coverage_filter', False):
+                    candidates = self.loop_search.detect(
+                        snapshot, getattr(self.local_mapping, 'coverage_inactive_kids', None))
+                else:
+                    candidates = self.loop_search.detect(snapshot)
                 self.metrics['loop_seconds'].append(monotonic() - begin)
                 with self._condition:
                     self._loops.extend(candidates)
