@@ -149,13 +149,25 @@ imu_config:
   # nonzero levels to interval centres before buffering; static initialization
   # then uses the corrected rest samples. null disables.
   # Frontend-only, 12 real-objects trials (docs/recontact_gap_error_20261105.md):
-  # truncation alone 7.94 -> 6.36 mm; with the calibration below 5.80 mm.
-  output_truncation_gyro_step_rad_s: 0.0017453292519943296  # 0.1 deg/s
-  output_truncation_accel_step_mps2: 0.00980665  # 0.001 g
-  # Fixed EBIMU accelerometer calibration, f_corrected = f - (bias + scale * f),
-  # applied after the truncation correction (fitted on near-rig motion windows).
-  accel_calibration_bias_mps2: [0.010146590820458705, -0.018299274385377835, -0.07040754072005488]
-  accel_calibration_scale: [-1.5244874151686127e-05, -0.003497099531017146, 0.0035123444051688322]
+  # truncation alone 7.94 -> 6.36 mm.
+  # null disables (since 2026-11-25, for now). Until then:
+  # gyro step 0.0017453292519943296 rad/s (0.1 deg/s), accel step 0.00980665 m/s^2 (0.001 g).
+  # Frontend, 12 real-objects trials, 2026-11-25 (position MAE / rotation MAE; per-axis
+  # calibration off): truncation on 2.23 mm / 0.37 deg, off 2.97 mm / 0.42 deg
+  # (height_threshold 0.1); on 2.63 / 0.37, off 2.84 / 0.43 (height_threshold 0.2).
+  output_truncation_gyro_step_rad_s: null
+  output_truncation_accel_step_mps2: null
+  # Fixed per-axis accelerometer calibration, f_corrected = f - (bias + scale * f),
+  # applied after the truncation correction. null disables (since 2026-11-25).
+  # Until then: bias [0.010146590820458705, -0.018299274385377835, -0.07040754072005488],
+  # scale [-1.5244874151686127e-05, -0.003497099531017146, 0.0035123444051688322],
+  # fitted with GT on real-objects near-rig motion windows and the earlier T_GI
+  # (not a static calibration). Frontend, 12 real-objects trials (data of the fit):
+  # 2026-11-05 RMSE with the truncation correction 6.36 -> 5.80 mm, alone 7.94 -> 7.78 mm;
+  # 2026-11-25 position MAE on 1.89 mm, off 2.23 mm (height_threshold 0.1); on 2.28,
+  # off 2.63 (height_threshold 0.2).
+  accel_calibration_bias_mps2: null
+  accel_calibration_scale: null
   gyroscope_bias_random_walk: 0.0000022
   buffer_max_samples: 6000
   # T_GI (gelsight_T_imu: IMU coordinates into gel_frame) of the far-carrier rig,
