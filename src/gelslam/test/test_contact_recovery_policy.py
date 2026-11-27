@@ -41,7 +41,8 @@ def tracker_with_imu(monkeypatch):
 
 @pytest.mark.parametrize("scr,ccs,accepted,keyframes", [
     (.29, .70, True, 1), (.30, .70, True, 0),
-    (.29, .69, False, 0), (.31, .69, False, 0),
+    # CCS below the threshold no longer rejects the frame; SCR still requests a keyframe.
+    (.29, .69, True, 1), (.31, .69, True, 0),
     (float("nan"), .9, False, 0), (.1, float("nan"), False, 0),
 ])
 def test_current_image_quality_decides_commit_and_immediate_keyframe(

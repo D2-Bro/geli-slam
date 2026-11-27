@@ -54,11 +54,15 @@ class TrackingMode(Enum):
 
 
 class QualityGateError(LoseTrackError):
-    """A candidate failed CCS, finite-state, or IMU-consistency checks."""
+    """A solved candidate was rejected: its state or SCR/CCS value is not finite.
+
+    The CCS threshold and the IMU-consistency distance no longer reject a
+    candidate (removed 2026-11-27); SCR still only requests a keyframe.
+    """
 
     def __init__(self, trial_T_curr, vi_state=None, *, scr=None, ccs=None,
-                 reason="ccs_below_threshold"):
-        super().__init__("normal-flow SCR/CCS quality failed")
+                 reason="nonfinite"):
+        super().__init__("frontend candidate is not finite")
         self.trial_T_curr = np.asarray(trial_T_curr, dtype=np.float64).copy()
         self.vi_state = vi_state
         self.scr, self.ccs, self.reason = scr, ccs, reason
@@ -1564,7 +1568,6 @@ class Tracker:
         if predicted is None:
             return False, None
         current, pim = predicted
-        predicted_prior = staged_solver.propagate_prior(previous, current, pim)
         ref_pose = gelsight_pose(previous.pose, self.gelsight_T_imu)
         visual = DenseNormalResidual(
             reference, frame, self.ppmm, ref_pose, gelsight_pose(current.pose, self.gelsight_T_imu),
@@ -1578,9 +1581,7 @@ class Tracker:
             pose = gelsight_pose(refined.pose, self.gelsight_T_imu)
             scr, ccs = normalflow_quality(reference, frame, np.linalg.inv(pose) @ ref_pose,
                 self.ppmm, int(self.imu_config.get("dense_normalflow_quality_samples", 3000)))
-            distance = staged_solver.prediction_pose_distance(current, refined, predicted_prior)
-            accepted = (np.isfinite([scr, ccs, distance]).all()
-                        and ccs >= float(self.track_config["ccs_threshold"]) and distance <= 22.46)
+            accepted = bool(np.isfinite([scr, ccs]).all())
         if not accepted:
             staged_solver.discard_pending_prior()
             if timestamp - previous.timestamp >= float(self.track_config.get(
@@ -1692,13 +1693,6 @@ class Tracker:
         if prediction is None:
             self._fail_frontend("imu_prediction_unavailable")
         current, preintegrated = prediction
-        # The initialization flag controls the optimizer's starting value only.
-        # Consistency is always measured against the physical IMU prediction.
-        imu_predicted = (solver.predict_preintegrated(
-            previous, preintegrated, timestamp, force=True)[0]
-            if hasattr(solver, "predict_preintegrated") else current)
-        predicted_prior = (solver.propagate_prior(previous, imu_predicted, preintegrated)
-                           if hasattr(solver, "propagate_prior") else None)
         visual = DenseNormalResidual(
             reference_frame, current_frame, self.ppmm,
             navigation_reference_pose, gelsight_pose(current.pose, self.gelsight_T_imu),
@@ -1759,7 +1753,9 @@ class Tracker:
             self._fail_frontend("vi_refinement_failed_other")
         refined_pose = gelsight_pose(refined.pose, self.gelsight_T_imu)
         navigation_reference_pose = gelsight_pose(solver.last_reference_pose, self.gelsight_T_imu)
-        # The quality gate projects reference pixels into the current image.
+        # SCR/CCS project reference pixels into the current image. SCR below its
+        # threshold requests a keyframe. CCS and the IMU-prediction distance do not
+        # reject the candidate; only a non-finite result does.
         scr, ccs = normalflow_quality(
             reference_frame,
             current_frame,
@@ -1770,11 +1766,7 @@ class Tracker:
         finite = all(np.all(np.isfinite(value)) for value in (
             refined.pose, refined.velocity, refined.accel_bias, refined.gyro_bias,
             [scr, ccs]))
-        distance = (solver.prediction_pose_distance(imu_predicted, refined, predicted_prior)
-                    if finite and predicted_prior is not None else 0.0)
-        consistent = np.isfinite(distance) and distance <= 22.46
-        quality_failed = (not finite or not consistent
-                          or ccs < float(self.track_config["ccs_threshold"]))
+        quality_failed = not finite
         self._quality_force_keyframe = (
             not quality_failed and scr < float(self.track_config["scr_threshold"]))
         self._record_normal_correspondences(
@@ -1787,25 +1779,13 @@ class Tracker:
         if quality_failed:
             self._count_frontend_event("vi_quality_rejected")
             self.logger.info(
-                "Dense normal-flow quality failed: scr=%.3f (min %.3f), "
-                "ccs=%.3f (min %.3f), IMU pose distance=%.6f (max 22.46)"
-                % (
-                    scr,
-                    float(self.track_config["scr_threshold"]),
-                    ccs,
-                    float(self.track_config["ccs_threshold"]),
-                    distance,
-                )
-            )
+                "Frontend candidate is not finite: scr=%.3f, ccs=%.3f" % (scr, ccs))
             trial_T_curr = refined_pose
             if hasattr(solver, "discard_pending_prior"):
                 solver.discard_pending_prior()
             if not np.all(np.isfinite(trial_T_curr)):
                 raise LoseTrackError("dense normal-flow pose is not finite")
-            raise QualityGateError(
-                trial_T_curr, refined, scr=scr, ccs=ccs,
-                reason="nonfinite" if not finite else
-                "imu_inconsistent" if not consistent else "ccs_below_threshold")
+            raise QualityGateError(trial_T_curr, refined, scr=scr, ccs=ccs, reason="nonfinite")
         if hasattr(solver, "commit_marginal_prior"):
             solver.commit_marginal_prior(refined)
             self._after_frontend_commit(solver, refined.timestamp, "contact")

@@ -1186,7 +1186,7 @@ def test_ccs_failure_promotes_previous_and_keeps_imu_interval(monkeypatch):
     tracker.track_config["keyframe_max_interval_s"] = 0.0  # Isolate the original recovery path.
     monkeypatch.setattr(tracker_module, "Frame", FakeFrame)
     monkeypatch.setattr(tracker_module, "DenseNormalResidual", lambda *_args, **_kwargs: object())
-    qualities = iter(((0.9, 0.2), (0.9, 0.9)))
+    qualities = iter(((0.9, float("nan")), (0.9, 0.9)))
     monkeypatch.setattr(
         tracker_module, "normalflow_quality", lambda *_args: next(qualities)
     )
@@ -1392,7 +1392,7 @@ def test_failure_after_keyframe_promotion_keeps_committed_navigation_prior(monke
             return np.zeros(30), np.zeros((30, 6)), np.zeros((30, 6))
 
     monkeypatch.setattr(tracker_module, "DenseNormalResidual", lambda *a, **k: FlatVisual())
-    qualities = iter(((0.2, 0.2), (0.9, 0.2), (0.9, 0.9)))
+    qualities = iter(((0.2, float("nan")), (0.9, float("nan")), (0.9, 0.9)))
     monkeypatch.setattr(tracker_module, "normalflow_quality", lambda *a: next(qualities))
     monkeypatch.setattr(tracker_module, "create_keyframe_msg", lambda *a, **k: k)
 
@@ -1679,7 +1679,8 @@ def test_quality_recovery_then_visual_solve_uses_predicted_navigation_anchor(mon
 
     monkeypatch.setattr(solver, "refine_current", refine)
     monkeypatch.setattr(tracker_module, "DenseNormalResidual", lambda *a, **k: FlatVisual())
-    qualities = iter(((0.1, 0.9), (0.9, 0.1), (0.9, 0.9)))
+    # Only a non-finite result rejects a candidate (no CCS or IMU-distance rejection).
+    qualities = iter(((0.1, float("nan")), (0.9, float("nan")), (0.9, 0.9)))
     monkeypatch.setattr(tracker_module, "normalflow_quality", lambda *a: next(qualities))
     image = np.zeros((1, 1, 3), dtype=np.uint8)
     tracker.track(image, header(1.04))
@@ -1870,7 +1871,7 @@ def test_contact_gap_reuses_preintegration_through_rejection_and_acceptance(
             return np.zeros(30), np.zeros((30, 6)), np.zeros((30, 6))
 
     monkeypatch.setattr(tracker_module, "DenseNormalResidual", lambda *a, **k: FlatVisual())
-    qualities = iter(((0., 0.), (0., 0.), (1., 1.)))
+    qualities = iter(((0., float("nan")), (0., float("nan")), (1., 1.)))
     monkeypatch.setattr(tracker_module, "normalflow_quality", lambda *a: next(qualities))
     refine = solver.refine_current
     snapshots = []
@@ -1977,7 +1978,7 @@ def test_frontend_recovery_coast_reacquire_keeps_accepted_optimization_anchor(
 
     monkeypatch.setattr(solver, "refine_current", refine)
     monkeypatch.setattr(tracker_module, "DenseNormalResidual", lambda *a, **k: FlatVisual())
-    qualities = iter(((0., 0.), (0., 0.), (1., 1.), (1., 1.)))
+    qualities = iter(((0., float("nan")), (0., float("nan")), (1., 1.), (1., 1.)))
     monkeypatch.setattr(tracker_module, "normalflow_quality", lambda *a: next(qualities))
     image = np.zeros((1, 1, 3), dtype=np.uint8)
     tracker.track(image, header(1.0625))

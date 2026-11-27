@@ -534,7 +534,7 @@ def test_replacing_unpublished_restart_reference_sets_only_the_new_first_pose(mo
     tracker.track(image, header(1.10))
     tracker.track(image, header(2.12))
     monkeypatch.setattr(tm, 'Frame', lambda *a, **k: contact)
-    monkeypatch.setattr(tm, 'normalflow_quality', lambda *a: (.9, .1))
+    monkeypatch.setattr(tm, 'normalflow_quality', lambda *a: (.9, float('nan')))
     assert tracker.track(image, header(2.14)) == (False, None)
     assert tracker.track(image, header(2.70)) == (False, None)
     staged = tracker._pending_segment_contact[-1]

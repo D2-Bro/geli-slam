@@ -119,10 +119,20 @@ def test_tactile_only_fallback_implementation_is_removed():
     assert not hasattr(tm, 'normalflow')
 
 
-def test_ccs_quality_rejection_is_not_a_fallback(monkeypatch):
+def test_low_ccs_is_accepted(monkeypatch):
     tracker = make_tracker(monkeypatch)
     tracker.frontend_visual_inertial.refine_current = lambda *_args, **_kwargs: state(1.1)
-    monkeypatch.setattr(tm, "normalflow_quality", lambda *_args: (0.1, 0.1))
+    monkeypatch.setattr(tm, "normalflow_quality", lambda *_args: (1.0, 0.1))
+    refine(tracker)
+    counts = tracker.frontend_tracking_statistics()
+    assert counts["vi_solve_calls"] == counts["vi_accepted"] == 1
+    assert counts["vi_quality_rejected"] == 0
+
+
+def test_nonfinite_quality_rejection_is_not_a_fallback(monkeypatch):
+    tracker = make_tracker(monkeypatch)
+    tracker.frontend_visual_inertial.refine_current = lambda *_args, **_kwargs: state(1.1)
+    monkeypatch.setattr(tm, "normalflow_quality", lambda *_args: (0.1, float("nan")))
     with pytest.raises(QualityGateError):
         refine(tracker)
     counts = tracker.frontend_tracking_statistics()

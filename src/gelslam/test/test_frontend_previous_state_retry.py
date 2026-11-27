@@ -51,17 +51,12 @@ def test_retry_rebuilds_target_seed_and_reuses_the_vi_solver(monkeypatch, mode):
         tracker._reference_is_imu_only = True
     method = "refine_current"
     solve = getattr(solver, method)
-    attempts, consistency_predictions, commits = [], [], []
+    attempts, commits = [], []
 
     def capture(visual, reference, anchor, target, interval, extrinsic, **kwargs):
         attempts.append((visual, reference.copy(), anchor, target.copy(), interval,
                          extrinsic, kwargs["preintegrated"]))
         return solve(visual, reference, anchor, target, interval, extrinsic, **kwargs)
-
-    distance = solver.prediction_pose_distance
-    def capture_distance(prediction, candidate, prior):
-        consistency_predictions.append(prediction.copy())
-        return distance(prediction, candidate, prior)
 
     commit = solver.commit_marginal_prior
     def capture_commit(state):
@@ -69,7 +64,6 @@ def test_retry_rebuilds_target_seed_and_reuses_the_vi_solver(monkeypatch, mode):
         commit(state)
 
     monkeypatch.setattr(solver, method, capture)
-    monkeypatch.setattr(solver, "prediction_pose_distance", capture_distance)
     monkeypatch.setattr(solver, "commit_marginal_prior", capture_commit)
     run_target(tracker)
 
@@ -91,8 +85,7 @@ def test_retry_rebuilds_target_seed_and_reuses_the_vi_solver(monkeypatch, mode):
         assert reference is tracker.ref_frame and target is tracker.prev_frame
     np.testing.assert_array_equal(visuals[0][2], visuals[1][2])
     np.testing.assert_allclose(visuals[1][3], gelsight_pose(seed.pose, tracker.gelsight_T_imu))
-    assert len(consistency_predictions) == len(commits) == 1
-    assert_same_state(consistency_predictions[0], predicted)
+    assert len(commits) == 1
     np.testing.assert_allclose(tracker._frontend_vi_state.pose, predicted.pose, atol=1e-10)
     assert solver.marginal_prior.matches(tracker._frontend_vi_state)
     assert solver.pending_marginal_prior is None
@@ -135,15 +128,11 @@ def test_failed_retry_preserves_anchor_and_prior_and_does_not_loop(monkeypatch, 
     assert counts["previous_state_retry_accepted"] == counts["vi_accepted"] == 0
 
 
-@pytest.mark.parametrize("rejection", ["ccs", "imu_consistency"])
-def test_retry_must_pass_quality_before_committing_state_or_prior(monkeypatch, rejection):
+def test_retry_must_be_finite_before_committing_state_or_prior(monkeypatch):
     tracker, previous, solver, visuals, _ = retry_tracker(monkeypatch)
     original = previous.copy()
     prior = solver.marginal_prior
-    if rejection == "ccs":
-        monkeypatch.setattr(tm, "normalflow_quality", lambda *a: (1., .1))
-    else:
-        monkeypatch.setattr(solver, "prediction_pose_distance", lambda *a: 23.)
+    monkeypatch.setattr(tm, "normalflow_quality", lambda *a: (1., float("nan")))
     with pytest.raises(tm.QualityGateError):
         run_target(tracker)
     assert len(visuals) == 2
