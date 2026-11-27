@@ -294,6 +294,16 @@ gelslam_config:
     # 0.5 / 0.3 until 2026-11-27.
     scr_threshold: 0.3
     ccs_threshold: 0.7
+    # Chunk-based loop closure (core/chunk_loop_closure.py): every 3rd keyframe with
+    # >= 2000 contact px is the centre of a chunk that fuses the keyframes c-4..c+4 of
+    # its contact segment (published poses); chunks sharing no keyframe are matched
+    # with SIFT contrast 0.005 + affine RANSAC (>= 12 inliers) and verified by NormalFlow
+    # with scr_threshold / ccs_threshold above. Finds revisits of texture-poor surfaces
+    # that the keyframe search (SIFT 0.02) misses. Online replay of the 12 real-objects
+    # trials (main 50a6b7b1, 2026-11-27): final keyframe RMSE 2.95 -> 2.39 mm, 9/12
+    # better, trial_004 5.25 -> 2.30, trial_010 3.51 -> 1.70, no trial worse by > 0.05 mm;
+    # replay time +10-40 %.
+    chunk_loop_closure: true
     # Backend-only IMU integration sigma (frontend: imu_config.gtsam_integration_sigma_m).
     # Offline 12 real-objects trials with recovery odometry 1 mm (keyframe RMSE):
     # 0.0003 2.64, 0.001 2.51, 0.003 2.51, 0.01 2.50 mm; without recovery odometry

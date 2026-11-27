@@ -6,6 +6,7 @@ from gelslam.core.slam_packets import ArrayBridge
 from gelslam.core.gtsam_pose_graph import PoseGraph, loop_search_exclusion_count
 from gelslam.core.parent_groups_info import ParentGroupsInfo
 from gelslam.core.coverage_graph import CoverageGraph
+from gelslam.core.chunk_loop_closure import ChunkLoopDetector
 from gelslam.core.shared_map import MapEstimate
 from gelslam.core.imu_navigation import gelsight_pose
 from gelslam.core.slam_packets import apply_keyframe_update
@@ -238,6 +239,12 @@ class LoopSearch:
             'loop_search_coverage_filter', False)
         if not isinstance(self.coverage_filter, bool):
             raise ValueError('loop_search_coverage_filter must be true or false')
+        # chunk_loop_closure: also register fused keyframe chunks (core/chunk_loop_closure.py).
+        pose_graph_config = config['gelslam_config']['pose_graph_config']
+        chunk_loops = pose_graph_config.get('chunk_loop_closure', False)
+        if not isinstance(chunk_loops, bool):
+            raise ValueError('chunk_loop_closure must be true or false')
+        self.chunk_loops = ChunkLoopDetector(pose_graph_config) if chunk_loops else None
         self.db = database(config, logger)
         self.epoch = 0
         # DB index zero has no preceding reference. Reset with the map epoch.
@@ -300,6 +307,13 @@ class LoopSearch:
                 result.append(LoopCandidate(snapshot.epoch, snapshot.revision,
                     self.db[reference].kid, self.db[target].kid, transform))
             last_timestamp = timestamp
+        if self.chunk_loops is not None:
+            for reference, target, transform in self.chunk_loops.update(self.db, limit):
+                transform = np.array(transform, copy=True)
+                transform.setflags(write=False)
+                result.append(LoopCandidate(snapshot.epoch, snapshot.revision,
+                                            self.db[reference].kid, self.db[target].kid,
+                                            transform))
         # Commit only after the whole result is ready for the caller.
         self._next_target = max(1, limit)
         self._last_search_timestamp = last_timestamp
