@@ -249,20 +249,25 @@ gelslam_config:
     # Minimum contact-mask pixels for a frame to count as in contact (original
     # GelSLAM value). 1 until 2026-11-27.
     contact_threshold: 500
-    # SCR below this value requests a keyframe.
-    scr_threshold: 0.5
-    # Not used by the frontend since 2026-11-27: the CCS threshold and the
-    # IMU-prediction distance no longer reject a solved frame.
-    ccs_threshold: 0.3
+    # Quality rule of the original NormalFlow / GelSLAM, evaluated after each contact
+    # solve: SCR < scr_threshold or CCS < ccs_threshold rejects the frame. On the
+    # first rejection the previous accepted frame becomes the keyframe. Until
+    # 2026-11-27: scr_threshold 0.5 requested a keyframe without a rejection, and
+    # CCS did not reject.
+    scr_threshold: 0.3
+    ccs_threshold: 0.7
   pose_graph_config:
     loop_pgo_rotation_sigma_rad: 0.01
     loop_pgo_translation_sigma_m: 0.0001
     # Minimum data-time gap between loop-search targets; 0 searches every KF.
     # Skipped targets remain available as references. Not wall-clock throttling.
     loop_search_min_interval_s: 0.0
-    # Exclude the previous N keyframes from loop candidates, across trial boundaries.
-    # K_t skips K_(t-1)..K_(t-N); 0 disables this candidate exclusion.
-    loop_search_exclude_recent_keyframes: 10
+    # Exclude the previous N keyframes from loop candidates: K_t skips
+    # K_(t-1)..K_(t-N); 0 disables this candidate exclusion. With
+    # loop_search_exclude_same_trial_only true only keyframes of the same trial
+    # group are excluded. 1 and true: original GelSLAM (10 and false until 2026-11-27).
+    loop_search_exclude_recent_keyframes: 1
+    loop_search_exclude_same_trial_only: true
     # IMU/bias noise densities use imu_config; reject uncovered/gapped intervals.
     imu_max_sample_gap_s: 0.05
     initial_velocity_sigma_mps: 0.1

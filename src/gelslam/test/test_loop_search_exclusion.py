@@ -86,3 +86,21 @@ def test_invalid_count_is_rejected_before_search(value):
         LoopSearch(cfg, Logger(print_output=False))
     with pytest.raises(ValueError, match='loop_search_exclude_recent_keyframes'):
         PoseGraph.detect_loop_candidates(database(1), 0, settings)
+
+
+@pytest.mark.parametrize('separate_trials,expected', [
+    (False, list(range(6))),   # K_6 is the previous keyframe of the same trial: excluded
+    (True, list(range(7))),    # K_6 is in another trial: stays a candidate
+])
+def test_same_trial_only_excludes_the_previous_keyframe_as_original(
+        successful_matching, separate_trials, expected):
+    cfg = dict(min_sift_inliers=4, scr_threshold=.3, ccs_threshold=.7,
+               loop_search_exclude_recent_keyframes=1,
+               loop_search_exclude_same_trial_only=True)
+    found = PoseGraph.detect_loop_candidates(database(8, separate_trials), 7, cfg)
+    pairs = [(reference, 7) for reference in expected]
+    assert [(r, t) for r, t, _ in found] == pairs
+    assert successful_matching == (pairs, pairs)
+    cfg['loop_search_exclude_same_trial_only'] = 'yes'
+    with pytest.raises(ValueError, match='loop_search_exclude_same_trial_only'):
+        PoseGraph.detect_loop_candidates(database(8), 7, cfg)

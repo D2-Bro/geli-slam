@@ -165,12 +165,21 @@ class PoseGraph:
     @staticmethod
     def detect_loop_candidates(keyframedb, tar_kidx, pose_graph_config, active_indices=None):
         exclude_recent = loop_search_exclusion_count(pose_graph_config)
+        same_trial_only = pose_graph_config.get('loop_search_exclude_same_trial_only', False)
+        if not isinstance(same_trial_only, bool):
+            raise ValueError('loop_search_exclude_same_trial_only must be true or false')
         target = keyframedb[tar_kidx]
         matched = []
-        # Count from this target's DB index, including across trial boundaries.
-        # K_t excludes K_(t-1)..K_(t-N); K_(t-N-1) is the newest candidate.
-        for reference_key in range(max(0, tar_kidx - exclude_recent)):
+        # Count from this target's DB index: K_t excludes K_(t-1)..K_(t-N).
+        # Default: also across trial boundaries. loop_search_exclude_same_trial_only:
+        # only keyframes of the target's trial group are excluded (original GelSLAM
+        # with N = 1: skip K_(t-1) when it is in the same trial).
+        for reference_key in range(tar_kidx):
             reference = keyframedb[reference_key]
+            if (tar_kidx - reference_key <= exclude_recent
+                    and (not same_trial_only
+                         or reference.trial_group == target.trial_group)):
+                continue
             if len(reference.kp) == 0 or len(target.kp) == 0:
                 continue
             if active_indices is not None and reference_key not in active_indices:
