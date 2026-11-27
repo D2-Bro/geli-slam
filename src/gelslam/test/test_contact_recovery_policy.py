@@ -40,9 +40,9 @@ def tracker_with_imu(monkeypatch):
 
 
 @pytest.mark.parametrize("scr,ccs,accepted,keyframes", [
-    # Original NormalFlow rule: SCR < 0.3 or CCS < 0.7 rejects the frame.
-    (.29, .70, False, 0), (.30, .70, True, 0),
-    (.29, .69, False, 0), (.31, .69, False, 0),
+    (.29, .70, True, 1), (.30, .70, True, 0),
+    # CCS below the threshold no longer rejects the frame; SCR still requests a keyframe.
+    (.29, .69, True, 1), (.31, .69, True, 0),
     (float("nan"), .9, False, 0), (.1, float("nan"), False, 0),
 ])
 def test_current_image_quality_decides_commit_and_immediate_keyframe(
@@ -77,7 +77,7 @@ def reject_contact(*_args, **_kwargs):
 
 @pytest.mark.parametrize("initialize_from_imu", [False, True])
 @pytest.mark.parametrize("scr,target_time,keyframes", [
-    (.9, 1.24, 0), (.9, 1.70, 1),
+    (.9, 1.24, 0), (.29, 1.24, 1), (.9, 1.70, 1),
 ])
 def test_recontact_without_shared_points_recovers_immediately_then_tracks(
         monkeypatch, initialize_from_imu, scr, target_time, keyframes):
@@ -252,8 +252,7 @@ def test_half_second_and_repeated_contact_failures_keep_trial_and_prior(monkeypa
 def test_success_at_failure_deadline_emits_only_one_tactile_keyframe(monkeypatch):
     tracker, _ = tracker_with_imu(monkeypatch)
     tracker._contact_failure_since = 1.04
-    # Accepted at the deadline; the 0.5 s timed rule makes the one keyframe.
-    monkeypatch.setattr(tm, "normalflow_quality", lambda *a: (.9, .9))
+    monkeypatch.setattr(tm, "normalflow_quality", lambda *a: (.2, .9))
     ret, (message, packets) = tracker.track(np.zeros((1, 1, 3), np.uint8), header(1.54))
     assert ret and len(packets) == 1 and packets[0]["tactile_valid"]
     assert tracker._contact_failure_since is None
@@ -270,7 +269,7 @@ def test_no_contact_timeout_stages_moving_restart_without_empty_trials(monkeypat
     assert tracker._restart_pending
     assert tracker._trial_index == 7
     monkeypatch.setattr(tm, "Frame", lambda *a, **k: contact)
-    monkeypatch.setattr(tm, "normalflow_quality", lambda *a: (.9, .9))
+    monkeypatch.setattr(tm, "normalflow_quality", lambda *a: (.2, .9))
     assert tracker.track(image, header(2.14)) == (False, None)
     assert tracker._trial_index == 7
     assert tracker._frontend_vi_state is initial

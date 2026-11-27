@@ -249,13 +249,11 @@ gelslam_config:
     # Minimum contact-mask pixels for a frame to count as in contact (original
     # GelSLAM value). 1 until 2026-11-27.
     contact_threshold: 500
-    # Quality rule of the original NormalFlow / GelSLAM, evaluated after each contact
-    # solve: SCR < scr_threshold or CCS < ccs_threshold rejects the frame. On the
-    # first rejection the previous accepted frame becomes the keyframe. Until
-    # 2026-11-27: scr_threshold 0.5 requested a keyframe without a rejection, and
-    # CCS did not reject.
-    scr_threshold: 0.3
-    ccs_threshold: 0.7
+    # SCR below this value requests a keyframe.
+    scr_threshold: 0.5
+    # Not used by the frontend since 2026-11-27: the CCS threshold and the
+    # IMU-prediction distance no longer reject a solved frame.
+    ccs_threshold: 0.3
   pose_graph_config:
     loop_pgo_rotation_sigma_rad: 0.01
     loop_pgo_translation_sigma_m: 0.0001

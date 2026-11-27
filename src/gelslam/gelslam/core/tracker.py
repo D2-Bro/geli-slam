@@ -54,15 +54,15 @@ class TrackingMode(Enum):
 
 
 class QualityGateError(LoseTrackError):
-    """A solved candidate was rejected by the original NormalFlow quality rule.
+    """A solved candidate was rejected: its state or SCR/CCS value is not finite.
 
-    Rejected when SCR < scr_threshold or CCS < ccs_threshold, or when its state
-    or SCR/CCS value is not finite. The IMU-consistency distance is not used.
+    The CCS threshold and the IMU-consistency distance no longer reject a
+    candidate (removed 2026-11-27); SCR still only requests a keyframe.
     """
 
     def __init__(self, trial_T_curr, vi_state=None, *, scr=None, ccs=None,
-                 reason="ccs_below_threshold"):
-        super().__init__("normal-flow SCR/CCS quality failed")
+                 reason="nonfinite"):
+        super().__init__("frontend candidate is not finite")
         self.trial_T_curr = np.asarray(trial_T_curr, dtype=np.float64).copy()
         self.vi_state = vi_state
         self.scr, self.ccs, self.reason = scr, ccs, reason
@@ -1581,9 +1581,7 @@ class Tracker:
             pose = gelsight_pose(refined.pose, self.gelsight_T_imu)
             scr, ccs = normalflow_quality(reference, frame, np.linalg.inv(pose) @ ref_pose,
                 self.ppmm, int(self.imu_config.get("dense_normalflow_quality_samples", 3000)))
-            accepted = bool(np.isfinite([scr, ccs]).all()
-                            and scr >= float(self.track_config["scr_threshold"])
-                            and ccs >= float(self.track_config["ccs_threshold"]))
+            accepted = bool(np.isfinite([scr, ccs]).all())
         if not accepted:
             staged_solver.discard_pending_prior()
             if timestamp - previous.timestamp >= float(self.track_config.get(
@@ -1755,9 +1753,9 @@ class Tracker:
             self._fail_frontend("vi_refinement_failed_other")
         refined_pose = gelsight_pose(refined.pose, self.gelsight_T_imu)
         navigation_reference_pose = gelsight_pose(solver.last_reference_pose, self.gelsight_T_imu)
-        # SCR/CCS project reference pixels into the current image. As in the
-        # original NormalFlow, SCR or CCS below its threshold rejects the frame
-        # (lose-track rule). A non-finite result also rejects it.
+        # SCR/CCS project reference pixels into the current image. SCR below its
+        # threshold requests a keyframe. CCS and the IMU-prediction distance do not
+        # reject the candidate; only a non-finite result does.
         scr, ccs = normalflow_quality(
             reference_frame,
             current_frame,
@@ -1768,11 +1766,9 @@ class Tracker:
         finite = all(np.all(np.isfinite(value)) for value in (
             refined.pose, refined.velocity, refined.accel_bias, refined.gyro_bias,
             [scr, ccs]))
-        low_scr = finite and scr < float(self.track_config["scr_threshold"])
-        low_ccs = finite and ccs < float(self.track_config["ccs_threshold"])
-        quality_failed = not finite or low_scr or low_ccs
-        # A low SCR rejects the frame; it no longer makes an accepted keyframe.
-        self._quality_force_keyframe = False
+        quality_failed = not finite
+        self._quality_force_keyframe = (
+            not quality_failed and scr < float(self.track_config["scr_threshold"]))
         self._record_normal_correspondences(
             reference_frame, current_frame, np.linalg.inv(navigation_reference_pose) @ refined_pose,
             "VI final pose: "
@@ -1783,18 +1779,13 @@ class Tracker:
         if quality_failed:
             self._count_frontend_event("vi_quality_rejected")
             self.logger.info(
-                "Dense normal-flow quality failed: scr=%.3f (min %.3f), ccs=%.3f (min %.3f)"
-                % (scr, float(self.track_config["scr_threshold"]),
-                   ccs, float(self.track_config["ccs_threshold"])))
+                "Frontend candidate is not finite: scr=%.3f, ccs=%.3f" % (scr, ccs))
             trial_T_curr = refined_pose
             if hasattr(solver, "discard_pending_prior"):
                 solver.discard_pending_prior()
             if not np.all(np.isfinite(trial_T_curr)):
                 raise LoseTrackError("dense normal-flow pose is not finite")
-            raise QualityGateError(
-                trial_T_curr, refined, scr=scr, ccs=ccs,
-                reason="nonfinite" if not finite else
-                "scr_below_threshold" if low_scr else "ccs_below_threshold")
+            raise QualityGateError(trial_T_curr, refined, scr=scr, ccs=ccs, reason="nonfinite")
         if hasattr(solver, "commit_marginal_prior"):
             solver.commit_marginal_prior(refined)
             self._after_frontend_commit(solver, refined.timestamp, "contact")

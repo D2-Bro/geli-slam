@@ -465,8 +465,7 @@ def test_tracker_contact_keyframe_recovery_and_backend_map_only(monkeypatch):
         np.testing.assert_array_equal(s.marginal_prior.fixed_values[s.first_pose_id], initial.pose)
     assert s.last_problem['solve_dimension'] == 30
     assert s.marginal_prior.layout.dimension == 15
-    # A keyframe at every accepted frame (timed rule; a low SCR now rejects).
-    tracker.track_config['keyframe_max_interval_s'] = 0.03
+    monkeypatch.setattr(tm, 'normalflow_quality', lambda *args: (.1, .9))
     for time in (1.16, 1.20, 1.24):
         ok, (_, packets) = tracker.track(image, header(time))
         assert ok and len(packets) == 1
@@ -506,7 +505,7 @@ def test_no_contact_restart_transfers_information_and_replaces_both_references(m
     tracker.track(image, header(2.12))
     assert tracker._restart_pending
     monkeypatch.setattr(tm, 'Frame', lambda *a, **k: contact)
-    monkeypatch.setattr(tm, 'normalflow_quality', lambda *a: (.9, .9))
+    monkeypatch.setattr(tm, 'normalflow_quality', lambda *a: (.2, .9))
     assert tracker.track(image, header(2.14)) == (False, None)
     ok, (_, packets) = tracker.track(image, header(2.18))
     assert ok and len(packets) == 2
