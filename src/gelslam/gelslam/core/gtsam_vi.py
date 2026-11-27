@@ -27,20 +27,29 @@ def _normal_dim(visual):
     return int(getattr(visual, "residual_dim", 3))
 
 
-def _normal_huber_cost_from_norms(norms, delta):
+NORMAL_NORMALIZATIONS = ("mean", "sum")
+
+
+def _normal_huber_cost_from_norms(norms, delta, mean=True):
     """Use the same scaled norms for the cost and IRLS weights."""
     if len(norms) == 0:
         return np.inf
+    count = len(norms) if mean else 1
     if delta == 0.0:
-        return 0.5 * float(norms @ norms) / len(norms)
-    return float(np.mean(np.where(
+        return 0.5 * float(norms @ norms) / count
+    return float(np.sum(np.where(
         norms <= delta, 0.5 * norms**2,
         delta * (norms - 0.5 * delta),
-    )))
+    ))) / count
 
 
-def _normal_huber_linearization(residual, jacobian, scale, delta, dim=3):
-    """IRLS rows scaled by 1/sqrt(N) to match the mean Huber cost."""
+def _normal_huber_linearization(residual, jacobian, scale, delta, dim=3, mean=True):
+    """IRLS rows of the normal term.
+
+    mean True: rows scaled by 1/sqrt(N) (N active points), the mean (Huber) cost.
+    mean False: no 1/N; the cost is the plain sum over the active points, as the
+    least-squares problem of the original NormalFlow.
+    """
     scaled = np.asarray(residual) * scale
     norms = np.linalg.norm(scaled.reshape(-1, dim), axis=1)
     if len(norms) == 0:
@@ -51,11 +60,12 @@ def _normal_huber_linearization(residual, jacobian, scale, delta, dim=3):
         block_weights[outliers] = delta / norms[outliers]
     else:
         outliers = np.zeros(len(norms), dtype=bool)
-    row_weights = np.repeat(np.sqrt(block_weights / len(norms)), dim)
+    row_weights = np.repeat(
+        np.sqrt(block_weights / len(norms) if mean else block_weights), dim)
     return (
         np.asarray(jacobian) * (scale * row_weights[:, None]),
         scaled * row_weights,
-        _normal_huber_cost_from_norms(norms, delta),
+        _normal_huber_cost_from_norms(norms, delta, mean),
         int(np.count_nonzero(outliers)),
     )
 
@@ -368,6 +378,12 @@ class GtsamVisualInertialSolver:
             if type(value) is not int or value < minimum:
                 raise ValueError(name + " must be an integer >= " + str(minimum))
         self.visual_weight = float(self.config.get("dense_normalflow_residual_weight", 1.0))
+        # mean: normal term = mean over the active points (1/N). sum: no 1/N, the
+        # plain least-squares sum of the original NormalFlow.
+        normalization = self.config.get("dense_normalflow_normalization", "mean")
+        if normalization not in NORMAL_NORMALIZATIONS:
+            raise ValueError("dense_normalflow_normalization must be 'mean' or 'sum'")
+        self.normal_mean = normalization == "mean"
         self.normal_huber_delta = float(self.config.get("gtsam_vi_normal_huber_delta", 0.4))
         self.normal_linearization = self.config.get(
             "gtsam_vi_normal_linearization", "inverse_compositional"

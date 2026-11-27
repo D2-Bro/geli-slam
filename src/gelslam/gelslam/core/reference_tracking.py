@@ -297,7 +297,7 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
             normal_A, normal_b, normal_cost, _ = _normal_huber_linearization(
                 residual, np.column_stack((Jr @ gel_J, Jt @ gel_J)),
                 np.sqrt(self.visual_weight), self.normal_huber_delta_at(iteration),
-                _normal_dim(visual))
+                _normal_dim(visual), self.normal_mean)
             terms = [(A_nav, b_nav, None) for A_nav, b_nav in zip(*navigation_rows(point))]
             terms.append((normal_A, -normal_b, (reference_id, current_id)))
             height = self._height_z_linearization(visual, reference, target, gel_J)

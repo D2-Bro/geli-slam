@@ -66,3 +66,27 @@ def test_tangent_residual_projects_the_vector_residual(method):
 def test_residual_space_is_validated():
     with pytest.raises(ValueError):
         _pair("sphere")
+
+
+def test_sum_normalization_drops_the_one_over_n_factor():
+    from gelslam.core.gtsam_vi import create_frontend_solver
+
+    rng = np.random.default_rng(0)
+    residual, jacobian = rng.normal(size=12), rng.normal(size=(12, 6))
+    for delta in (0.0, 0.4):
+        A_mean, b_mean, cost_mean, outliers = _normal_huber_linearization(
+            residual, jacobian, 1.0, delta, 3)
+        A_sum, b_sum, cost_sum, outliers_sum = _normal_huber_linearization(
+            residual, jacobian, 1.0, delta, 3, mean=False)
+        # Four active points: the sum rows are sqrt(4) times the mean rows.
+        np.testing.assert_allclose(A_sum, 2.0 * A_mean)
+        np.testing.assert_allclose(b_sum, 2.0 * b_mean)
+        assert cost_sum == pytest.approx(4.0 * cost_mean) and outliers == outliers_sum
+    # Without Huber the sum rows are the plain NormalFlow least-squares rows.
+    A_sum, b_sum, _, _ = _normal_huber_linearization(residual, jacobian, 1.0, 0.0, 3, mean=False)
+    np.testing.assert_allclose(A_sum, jacobian)
+    np.testing.assert_allclose(b_sum, residual)
+    assert create_frontend_solver({}).normal_mean
+    assert not create_frontend_solver(dict(dense_normalflow_normalization="sum")).normal_mean
+    with pytest.raises(ValueError, match="dense_normalflow_normalization"):
+        create_frontend_solver(dict(dense_normalflow_normalization="average"))

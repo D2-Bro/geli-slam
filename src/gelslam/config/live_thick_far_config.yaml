@@ -190,9 +190,19 @@ imu_config:
   dense_normalflow_residual_space: "tangent"
   # Positive relative objective weights for the joint frontend solve.
   dense_normalflow_residual_weight: 1.0
+  # Normal term: "sum" = plain sum over the active points (no 1/N, the least-squares
+  # form of the original NormalFlow); "mean" (absent key) = mean over the active points.
+  # With "sum" the normal term is about N (several hundred) times larger, so the IMU
+  # and bias weights are 1e-2 instead of 1e-4 ("mean").
+  # Frontend, 12 real-objects trials, 2026-11-27 (position MAE / RMSE, rotation MAE):
+  # mean 1e-4: 3.06 / 7.24 mm, 0.43 deg; sum 1e-4: 4.62 / 13.10, 1.28;
+  # sum 5e-3: 2.63 / 5.92, 0.45; sum 1e-2: 2.64 / 5.91, 0.43; sum 2e-2: 2.72 / 6.11, 0.43;
+  # sum 4e-2: 2.93 / 6.79, 0.42; mean 2.5e-5: 2.64 / 5.93, 0.43
+  # (output/real_batch_20261030/NRM_20261127).
+  dense_normalflow_normalization: "sum"
   # Objective weight of the 9D IMU preintegration factor.
-  imu_residual_weight: 0.0001
-  bias_residual_weight: 0.0001
+  imu_residual_weight: 0.01
+  bias_residual_weight: 0.01
   # Pixels of the SCR/CCS quality gate (strongest-curvature reference pixels,
   # evaluated once after the solve). 3000 is the original NormalFlow value; the
   # optimization uses dense_normalflow_samples. 500 until 2026-11-26.
