@@ -277,8 +277,10 @@ gelslam_config:
     # MAE +0.02 to +0.04 mm (current 1.080 -> 1.123, tf/peak 1.041 -> 1.061).
     loop_search_coverage_filter: true
     min_sift_inliers: 8
-    scr_threshold: 0.5
-    ccs_threshold: 0.3
+    # Loop registration acceptance (NormalFlow SCR / CCS), original GelSLAM values.
+    # 0.5 / 0.3 until 2026-11-27.
+    scr_threshold: 0.3
+    ccs_threshold: 0.7
     # Backend-only IMU integration sigma (frontend: imu_config.gtsam_integration_sigma_m).
     # Offline 12 real-objects trials with recovery odometry 1 mm (keyframe RMSE):
     # 0.0003 2.64, 0.001 2.51, 0.003 2.51, 0.01 2.50 mm; without recovery odometry
