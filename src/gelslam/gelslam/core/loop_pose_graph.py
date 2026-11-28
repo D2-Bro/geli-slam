@@ -12,9 +12,14 @@ Contact odometry and loop measurements observe GelSight poses in metres. The
 global solution stays separate from local VI states and marginal priors.
 
 The graph is a native GTSAM graph: Pose3 keys are IMU body poses, relative-pose
-measurements are BetweenFactorPose3, trial anchors are PriorFactorPose3, and the
-IMU option adds gtsam.ImuFactor, bias random-walk and velocity/bias priors on the
-same keys. gtsam.LevenbergMarquardtOptimizer solves it (max_iterations).
+measurements are BetweenFactorPose3, the root of a trial group holds its anchor
+pose with NonlinearEqualityPose3, and the IMU option adds gtsam.ImuFactor, bias
+random-walk and velocity/bias priors on the same keys.
+gtsam.LevenbergMarquardtOptimizer solves it (max_iterations).
+pose_graph_config.root_tilt_sigma_rad (imu_factors true only) replaces the 6-DOF
+root equality: the GelSight position and the rotation about the vertical stay
+exact, the tilt gets a Gaussian prior, so the gravity in the IMU factors can
+correct the root tilt.
 """
 import gtsam
 import numpy as np
@@ -41,6 +46,20 @@ class LoopPoseGraph:
                                  'recovery_odometry_translation_sigma_m: an IMU recovery '
                                  'link would have no factor')
             self.degrees_of_freedom = 6
+        # root_tilt_sigma_rad: constraint on the root keyframe of a trial group.
+        #   null (default): the root holds its anchor pose exactly (6 DOF).
+        #   sigma [rad]: the root GelSight position and its rotation about the
+        #   vertical hold exactly (4 DOF; these are not observable). The tilt has a
+        #   Gaussian prior with this sigma at the anchor tilt. The gravity in the
+        #   IMU factors can then correct a tilt error of the first pose.
+        # A pose-only graph has no gravity measurement, so the option needs
+        # imu_factors true.
+        self.root_tilt_sigma = None
+        if self.config.get('root_tilt_sigma_rad') is not None:
+            if not self.imu_factors:
+                raise ValueError('pose_graph_config.root_tilt_sigma_rad requires imu_factors '
+                                 'true: a pose-only graph does not observe the root tilt')
+            self.root_tilt_sigma = self._positive('root_tilt_sigma_rad', .01)
         # Optional backend-only IMU integration sigma (default: imu_config value).
         # A stiff frontend integration sigma (0.001) made each first global solve
         # move whole trajectories to absorb stale keyframe velocities.
@@ -132,6 +151,45 @@ class LoopPoseGraph:
         """Relative IMU pose of a relative GelSight pose: T_IG Z T_GI."""
         return gtsam.Pose3(self.imu_T_gel @ np.asarray(gel_measurement, dtype=float)
                            @ self.extrinsic)
+
+    def _root_tilt_factor(self, key, gel_anchor):
+        """Root constraint with a free tilt: exact position and yaw, tilt prior.
+
+        gel_anchor is the anchor GelSight pose T_WG. With the IMU pose T_WI of
+        the key and T_WG = T_WI T_IG, the error (6) is
+        [B^T Log(R_WG R_WG,A^T), p_WG - p_WG,A], B = [e1 e2 up], e1 and e2
+        horizontal. Rows 0-1 are the tilt about the horizontal axes (Gaussian,
+        root_tilt_sigma_rad). Row 2 (rotation about the vertical) and rows 3-5
+        (position of the GelSight origin) have sigma 0: GTSAM solves them as
+        equality constraints. The GelSight origin holds, not the IMU origin, so
+        a tilt update does not move the map anchor through the lever arm.
+        """
+        gel_anchor = np.asarray(gel_anchor, dtype=float).copy()
+        anchor_rotation = gel_anchor[:3, :3] @ self.extrinsic[:3, :3]  # R_WI of the anchor
+        lever = self.imu_T_gel[:3, 3]                                  # GelSight origin in the IMU frame
+        x, y, z = lever
+        lever_skew = np.array(((0., -z, y), (z, 0., -x), (-y, x, 0.)))
+        first = np.cross(self.up, np.eye(3)[np.argmin(np.abs(self.up))])
+        first /= np.linalg.norm(first)
+        basis = np.column_stack((first, np.cross(self.up, first), self.up))
+
+        def error(_factor, values, jacobians):
+            pose = values.atPose3(key).matrix()
+            # R_WI R_WI,A^T = R_WG R_WG,A^T: the mount rotation cancels.
+            rotation = gtsam.Rot3.Logmap(gtsam.Rot3(pose[:3, :3] @ anchor_rotation.T))
+            if jacobians is not None:
+                # Pose3 increment: body-frame [rotation, translation].
+                J = np.zeros((6, 6))
+                J[:3, :3] = basis.T @ gtsam.Rot3.LogmapDerivative(rotation) @ anchor_rotation
+                J[3:, :3] = -pose[:3, :3] @ lever_skew
+                J[3:, 3:] = pose[:3, :3]
+                jacobians[0] = J
+            position = pose[:3, 3] + pose[:3, :3] @ lever
+            return np.r_[basis.T @ rotation, position - gel_anchor[:3, 3]]
+
+        sigmas = np.r_[self.root_tilt_sigma, self.root_tilt_sigma, np.zeros(4)]
+        return gtsam.CustomFactor(gtsam.noiseModel.Constrained.MixedSigmas(1000., sigmas),
+                                  [key], error)
 
     def _positive(self, name, default):
         value = float(self.config.get(name, default))
@@ -313,10 +371,14 @@ class LoopPoseGraph:
                 values.insert(bias_key(key), gtsam.imuBias.ConstantBias(state.accel_bias, state.gyro_bias))
         for group, key in self.roots.items():
             if group not in self.removed_groups:
-                anchor = gtsam.Pose3(self.anchor_poses[group] @ self.extrinsic)
-                values.update(key, anchor)
-                # Hard equality: the root of a trial group holds its anchor pose exactly.
-                add(gtsam.NonlinearEqualityPose3(key, anchor), 'pose_anchor')
+                if self.root_tilt_sigma is None:
+                    # Hard equality: the root of a trial group holds its anchor pose exactly.
+                    anchor = gtsam.Pose3(self.anchor_poses[group] @ self.extrinsic)
+                    values.update(key, anchor)
+                    add(gtsam.NonlinearEqualityPose3(key, anchor), 'pose_anchor')
+                else:
+                    # The start value keeps the root tilt of the previous solve.
+                    add(self._root_tilt_factor(key, self.anchor_poses[group]), 'pose_anchor')
             if not self.imu_factors:
                 continue
             anchor = self.anchor_states[group]

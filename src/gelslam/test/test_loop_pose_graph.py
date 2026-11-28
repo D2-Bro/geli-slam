@@ -333,3 +333,105 @@ def test_backend_graph_uses_native_gtsam_factors_and_optimizer():
     # The IMU-frame cost equals the GelSight-frame cost of the same poses.
     assert graph.last_final_cost == pytest.approx(reference.error(expected), rel=1e-5)
     assert graph.last_final_cost < graph.last_initial_cost
+
+
+def _tilted_stationary_graph(**overrides):
+    """Stationary sensor with an IMU lever arm; every seed pose has the same tilt error."""
+    import gtsam
+    extrinsic = np.eye(4)
+    extrinsic[:3, :3] = [[0., 1., 0.], [1., 0., 0.], [0., 0., -1.]]
+    extrinsic[:3, 3] = [.002, -.001, -.14]
+    truth = gtsam.Rot3.Rodrigues(.2, -.1, .4).matrix()
+    tilt_error = gtsam.Rot3.Rodrigues(.02, -.015, 0.).matrix()
+    true_pose, seed = np.eye(4), np.eye(4)                 # GelSight poses
+    true_pose[:3, :3] = truth
+    true_pose[:3, 3] = seed[:3, 3] = [.01, -.02, .03]
+    seed[:3, :3] = tilt_error @ truth
+    count = 8
+    # The IMU measures the true IMU attitude. The seeds have the tilt error.
+    records = loop_records([true_pose @ extrinsic] * count)
+    states = []
+    for record in records:
+        state = record.navigation_state.copy()
+        state.pose = seed @ extrinsic
+        states.append(state)
+    settings = dict(max_iterations=50, initial_accel_bias_sigma_mps2=.005)
+    settings.update(overrides)
+    graph = LoopPoseGraph(settings, {'gelsight_T_imu': extrinsic.tolist()})
+    graph.synchronize([seed] * count, records, [(i, i + 1) for i in range(count - 1)],
+                      navigation_states=states)
+    return graph, true_pose, seed
+
+
+def _tilt_and_yaw(rotation, reference):
+    import gtsam
+    error = gtsam.Rot3.Logmap(gtsam.Rot3(rotation @ reference.T))
+    return float(np.linalg.norm(error[:2])), float(error[2])
+
+
+def test_root_tilt_prior_lets_imu_factors_correct_the_first_pose_tilt():
+    fixed, true_pose, seed = _tilted_stationary_graph()
+    fixed.solve()
+    assert type(fixed.graph.at(0)).__name__ == 'NonlinearEqualityPose3'
+    np.testing.assert_allclose(fixed.map_poses()[0], seed, atol=1e-12)
+    start_tilt, _ = _tilt_and_yaw(seed[:3, :3], true_pose[:3, :3])
+    assert start_tilt == pytest.approx(.025, abs=1e-6)
+
+    free, true_pose, seed = _tilted_stationary_graph(root_tilt_sigma_rad=.05)
+    free.solve()
+    assert free.factor_kinds[0] == 'pose_anchor'
+    assert type(free.graph.at(0)).__name__ == 'CustomFactor'
+    root = free.map_poses()[0]
+    # The GelSight position and the rotation about the vertical hold exactly
+    # (the IMU origin moves through the 0.14 m lever arm); the tilt moves to the truth.
+    np.testing.assert_allclose(root[:3, 3], seed[:3, 3], atol=1e-10)
+    assert abs(_tilt_and_yaw(root[:3, :3], seed[:3, :3])[1]) < 1e-9
+    assert _tilt_and_yaw(root[:3, :3], true_pose[:3, :3])[0] < .2 * start_tilt
+    imu_shift = (root @ free.extrinsic)[:3, 3] - (seed @ free.extrinsic)[:3, 3]
+    assert np.linalg.norm(imu_shift) > .002
+    for pose in free.map_poses()[1:]:
+        assert _tilt_and_yaw(pose[:3, :3], true_pose[:3, :3])[0] < .2 * start_tilt
+    # A second solve starts from the corrected tilt and keeps the constraint.
+    first = [pose.copy() for pose in free.map_poses()]
+    free.solve()
+    np.testing.assert_allclose(free.map_poses(), first, atol=1e-6)
+    np.testing.assert_allclose(free.map_poses()[0][:3, 3], seed[:3, 3], atol=1e-10)
+
+
+def test_root_tilt_factor_jacobian_matches_finite_differences():
+    import gtsam
+    graph, _, seed = _tilted_stationary_graph(root_tilt_sigma_rad=.05)
+    factor = graph._root_tilt_factor(0, seed)
+    pose = gtsam.Pose3(seed @ graph.extrinsic).retract(np.array([.2, -.3, .1, .01, -.02, .03]))
+
+    def error(value):
+        values = gtsam.Values()
+        values.insert(0, value)
+        return factor.unwhitenedError(values), values
+
+    residual, values = error(pose)
+    numerical = np.empty((6, 6))
+    for column in range(6):
+        step = np.eye(6)[column] * 1e-6
+        numerical[:, column] = (error(pose.retract(step))[0]
+                                - error(pose.retract(-step))[0]) / 2e-6
+    # Linearized rows: the tilt rows are divided by the sigma; the constrained
+    # rows (sigma 0) keep their scale.
+    scale = np.array([1 / .05, 1 / .05, 1., 1., 1., 1.])
+    A, b = factor.linearize(values).jacobianUnweighted()
+    np.testing.assert_allclose(A, scale[:, None] * numerical, atol=1e-6)
+    np.testing.assert_allclose(-b, scale * residual, atol=1e-12)
+    # Rows: tilt (2), rotation about the vertical (1), GelSight position (3).
+    assert np.linalg.norm(residual[:2]) > .1 and abs(residual[2]) > .01
+    gel = pose.matrix() @ graph.imu_T_gel
+    np.testing.assert_allclose(residual[3:], gel[:3, 3] - seed[:3, 3], atol=1e-12)
+    # The error is zero at the anchor.
+    np.testing.assert_allclose(error(gtsam.Pose3(seed @ graph.extrinsic))[0], 0., atol=1e-12)
+
+
+def test_root_tilt_sigma_requires_imu_factors():
+    with pytest.raises(ValueError, match='root_tilt_sigma_rad requires imu_factors'):
+        LoopPoseGraph({'imu_factors': False, 'recovery_odometry_translation_sigma_m': .001,
+                       'root_tilt_sigma_rad': .01})
+    with pytest.raises(ValueError, match='root_tilt_sigma_rad must be positive'):
+        LoopPoseGraph({'root_tilt_sigma_rad': 0.})

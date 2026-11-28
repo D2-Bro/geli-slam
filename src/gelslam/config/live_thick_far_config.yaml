@@ -319,6 +319,12 @@ gelslam_config:
     initial_velocity_sigma_mps: 0.1
     initial_accel_bias_sigma_mps2: 0.1
     initial_gyro_bias_sigma_rps: 0.01
+    # Root keyframe of a trial group. null: the root holds its anchor pose
+    # exactly (6 DOF). A sigma [rad] (imu_factors true only): position and
+    # rotation about the vertical hold exactly; the tilt has a Gaussian prior at
+    # the anchor tilt, so the gravity in the IMU factors can correct the tilt of
+    # the first pose. Not allowed with imu_factors false.
+    root_tilt_sigma_rad: null
     max_iterations: 10
     coverage_graph_overlap_threshold: 50
     # Loop search skips references that the coverage graph deactivated (covered by
