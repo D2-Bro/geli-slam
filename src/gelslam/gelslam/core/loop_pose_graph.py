@@ -10,17 +10,20 @@ graph). Every temporal link needs a relative-pose factor, so
 recovery_odometry_translation_sigma_m must be set.
 Contact odometry and loop measurements observe GelSight poses in metres. The
 global solution stays separate from local VI states and marginal priors.
+
+The graph is a native GTSAM graph: Pose3 keys are IMU body poses, relative-pose
+measurements are BetweenFactorPose3, trial anchors are PriorFactorPose3, and the
+IMU option adds gtsam.ImuFactor, bias random-walk and velocity/bias priors on the
+same keys. gtsam.LevenbergMarquardtOptimizer solves it (max_iterations).
 """
 import gtsam
 import numpy as np
 
-from gelslam.core.backend_factors import bias_key, velocity_key, variable_type
+from gelslam.core.backend_factors import bias_key, velocity_key
 from gelslam.core.gravity_pose import align_directions, up_direction, yaw_angle
 from gelslam.core.gtsam_vi import preintegrate_imu
 from gelslam.core.imu_mount_calibration import require_resolved
-from gelslam.core.split_pose import (
-    optimize_split_pose_graph, split_between_factor, split_prior_factor,
-)
+from gelslam.core.numpy_vi import adjoint
 
 
 class LoopPoseGraph:
@@ -85,14 +88,28 @@ class LoopPoseGraph:
         if self.loop_tilt_source not in ('registration', 'keyframe_gravity'):
             raise ValueError("pose_graph_config.loop_tilt_source must be 'registration' or 'keyframe_gravity'")
         robust = self.config.get('loop_pgo_loop_robust')
+        loop_kernel = None
         if robust is not None:
             width = self._positive('loop_pgo_loop_robust_width', 1.345)
             kernels = {'huber': gtsam.noiseModel.mEstimator.Huber, 'cauchy': gtsam.noiseModel.mEstimator.Cauchy}
             if robust not in kernels:
                 raise ValueError("pose_graph_config.loop_pgo_loop_robust must be null, 'huber' or 'cauchy'")
-            self.loop_noise = gtsam.noiseModel.Robust.Create(kernels[robust].Create(width), self.loop_noise)
-        self.anchor_noise = gtsam.noiseModel.Isotropic.Sigma(
-            6, self._positive('anchor_sigma', 1e-6))
+            loop_kernel = kernels[robust].Create(width)
+        # The graph variables are IMU body poses (Pose3), so that native IMU factors
+        # attach to the same keys. Tactile measurements are relative GelSight poses
+        # with the diagonal sigmas above in the GelSight tangent. For the native
+        # GTSAM factors on IMU poses the measurement is conjugated by T_IG and the
+        # covariance is mapped by Ad(T_IG): Sigma_I = Ad Sigma_G Ad^T (exact for the
+        # between and prior errors of Pose3).
+        self._imu_adjoint = adjoint(self.imu_T_gel)
+        self.odometry_factor_noise = self._imu_frame_noise(self.noise)
+        self.loop_factor_noise = self._imu_frame_noise(self.loop_noise)
+        if loop_kernel is not None:
+            self.loop_noise = gtsam.noiseModel.Robust.Create(loop_kernel, self.loop_noise)
+            self.loop_factor_noise = gtsam.noiseModel.Robust.Create(
+                loop_kernel, self.loop_factor_noise)
+        self.recovery_factor_noise = (None if self.recovery_noise is None
+                                      else self._imu_frame_noise(self.recovery_noise))
         self.graph = gtsam.NonlinearFactorGraph()
         self.graph_init = gtsam.Values()
         self.graph_result = None
@@ -104,6 +121,17 @@ class LoopPoseGraph:
         self.up = np.array([0., 0., 1.])
         self.local_up, self.temporal_links = [], []
         self.last_initial_cost = self.last_final_cost = None
+
+    def _imu_frame_noise(self, gel_noise):
+        """Gaussian noise of a GelSight-tangent diagonal model, in the IMU-pose tangent."""
+        covariance = np.diag(np.asarray(gel_noise.sigmas(), dtype=float) ** 2)
+        return gtsam.noiseModel.Gaussian.Covariance(
+            self._imu_adjoint @ covariance @ self._imu_adjoint.T)
+
+    def _imu_relative(self, gel_measurement):
+        """Relative IMU pose of a relative GelSight pose: T_IG Z T_GI."""
+        return gtsam.Pose3(self.imu_T_gel @ np.asarray(gel_measurement, dtype=float)
+                           @ self.extrinsic)
 
     def _positive(self, name, default):
         value = float(self.config.get(name, default))
@@ -271,7 +299,7 @@ class LoopPoseGraph:
 
     def solve(self):
         """Jointly optimize the keyframe poses and, with imu_factors, velocities and biases."""
-        graph, values, kinds, fixed = gtsam.NonlinearFactorGraph(), gtsam.Values(), [], set()
+        graph, values, kinds = gtsam.NonlinearFactorGraph(), gtsam.Values(), []
         states = [self.map_state(key) for key in range(len(self.local_states))]
 
         def add(factor, kind):
@@ -285,10 +313,10 @@ class LoopPoseGraph:
                 values.insert(bias_key(key), gtsam.imuBias.ConstantBias(state.accel_bias, state.gyro_bias))
         for group, key in self.roots.items():
             if group not in self.removed_groups:
-                anchor = self.anchor_poses[group]
-                values.update(key, gtsam.Pose3(anchor @ self.extrinsic))
-                add(split_prior_factor(key, anchor, self.anchor_noise, self.imu_T_gel), 'pose_anchor')
-                fixed.add(key)
+                anchor = gtsam.Pose3(self.anchor_poses[group] @ self.extrinsic)
+                values.update(key, anchor)
+                # Hard equality: the root of a trial group holds its anchor pose exactly.
+                add(gtsam.NonlinearEqualityPose3(key, anchor), 'pose_anchor')
             if not self.imu_factors:
                 continue
             anchor = self.anchor_states[group]
@@ -306,19 +334,22 @@ class LoopPoseGraph:
                 add(bias, 'bias')
             measurement = np.linalg.inv(self.local_poses[reference]) @ self.local_poses[target]
             if self.records[target].tactile_valid:
-                add(split_between_factor(reference, target, measurement, self.noise,
-                                         self.imu_T_gel), 'odometry')
-            elif self.recovery_noise is not None:
-                add(split_between_factor(reference, target, measurement, self.recovery_noise,
-                                         self.imu_T_gel), 'recovery_odometry')
+                add(gtsam.BetweenFactorPose3(reference, target, self._imu_relative(measurement),
+                                             self.odometry_factor_noise), 'odometry')
+            elif self.recovery_factor_noise is not None:
+                add(gtsam.BetweenFactorPose3(reference, target, self._imu_relative(measurement),
+                                             self.recovery_factor_noise), 'recovery_odometry')
         for reference, target, measurement in self.loops:
-            add(split_between_factor(reference, target,
-                                     self.loop_measurement(reference, target, measurement),
-                                     self.loop_noise, self.imu_T_gel), 'loop')
+            add(gtsam.BetweenFactorPose3(
+                reference, target,
+                self._imu_relative(self.loop_measurement(reference, target, measurement)),
+                self.loop_factor_noise), 'loop')
         initial_cost = float(graph.error(values))
-        result = optimize_split_pose_graph(graph, values,
-            max_iterations=int(self.config.get('max_iterations', 10)),
-            variable_types={key: variable_type(key) for key in values.keys()}, fixed_keys=fixed)
+        # Native GTSAM factors and optimizer. With imu_factors the same graph also
+        # holds gtsam.ImuFactor, bias random-walk and velocity/bias prior factors.
+        parameters = gtsam.LevenbergMarquardtParams()
+        parameters.setMaxIterations(int(self.config.get('max_iterations', 10)))
+        result = gtsam.LevenbergMarquardtOptimizer(graph, values, parameters).optimize()
         final_cost = float(graph.error(result))
         if not np.isfinite(final_cost) or final_cost > initial_cost + 1e-10 * max(initial_cost, 1.):
             raise ValueError('loop PGO did not produce a finite non-increasing cost')

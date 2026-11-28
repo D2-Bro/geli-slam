@@ -252,6 +252,44 @@ def test_first_pose_is_copied_exactly_during_optimization_and_imu_propagation():
     np.testing.assert_array_equal(original.fixed_values[s.first_pose_id], frozen_pose)
 
 
+def test_gtsam_elimination_matches_the_rank_aware_solve_and_guards_rank_deficiency(monkeypatch):
+    import gelslam.core.retained_prior as rp
+    rng = np.random.default_rng(3)
+    m, r = np.arange(6, 21), np.r_[0:6, 21:36]
+
+    def both(A, rhs):
+        results = []
+        for use_gtsam in (True, False):
+            monkeypatch.setattr(rp, "USE_GTSAM_ELIMINATION", use_gtsam)
+            before = dict(rp.ELIMINATION_COUNTS)
+            rows = rp.eliminate_rows(A, rhs, m, r)
+            normal = rp.eliminate_normal(A.T @ A, A.T @ rhs, m, r)
+            used = {k: rp.ELIMINATION_COUNTS[k] - before[k] for k in before}
+            results.append((rows, normal, used))
+        return results
+
+    A = rng.normal(size=(70, 36)) * rng.uniform(1e-2, 1e2, size=36)
+    rhs = rng.normal(size=70)
+    (rows, normal, used), (rows0, normal0, used0) = both(A, rhs)
+    assert used == {"gtsam": 2, "numpy": 0} and used0 == {"gtsam": 0, "numpy": 2}
+    assert rows[0].shape == rows0[0].shape == (21, 21)
+    scale = np.abs(normal0[0]).max()
+    np.testing.assert_allclose(rows[0].T @ rows[0], rows0[0].T @ rows0[0], atol=1e-10 * scale)
+    np.testing.assert_allclose(rows[0].T @ rows[1], rows0[0].T @ rows0[1], atol=1e-10 * scale)
+    np.testing.assert_allclose(normal[0], normal0[0], atol=1e-10 * scale)
+    np.testing.assert_allclose(normal[1], normal0[1], atol=1e-10 * scale)
+    # A rank-deficient eliminated block: GTSAM QR would return a wrong marginal
+    # without an error, so the guard selects the rank-aware solve.
+    for change in (lambda B: B.__setitem__((slice(None), 8), 2. * B[:, 7]),
+                   lambda B: B.__setitem__((slice(None), 10), 0.)):
+        deficient = A.copy()
+        change(deficient)
+        (rows, normal, used), (rows0, normal0, _) = both(deficient, rhs)
+        assert used == {"gtsam": 0, "numpy": 2}
+        np.testing.assert_array_equal(rows[0], rows0[0])
+        np.testing.assert_array_equal(normal[0], normal0[0])
+
+
 def test_reference_change_eliminates_old_pose_preserving_gradient_and_cross_information():
     s, previous = solver(), state()
     current = advance(s, previous)

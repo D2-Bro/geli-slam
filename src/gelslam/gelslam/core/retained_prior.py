@@ -1,13 +1,21 @@
 """Frozen, correlated pose/navigation priors with explicit variable identity.
 
 Rows use 1/2 ||A dx - rhs||^2, hence H dx = A.T rhs = -g_cost.
-Elimination projects out the eliminated row space with a rank-aware SVD
-least-squares solve. This is the square-root form of the Schur complement;
-it never forms an inverse or inserts damping into retained information.
+Elimination (marginalization) is done by GTSAM: the rows, or the normal
+equations, become one Gaussian factor on [eliminated block, retained block],
+and GaussianFactorGraph.eliminatePartialSequential eliminates the first block
+(QR for rows, Cholesky for normal equations). The remaining factor is the
+Schur complement on the retained block. GTSAM needs a full-rank eliminated
+block: its QR returns a wrong marginal without an error when the block is
+rank deficient. Such a block (checked on the conditional's R diagonal after
+column scaling) is eliminated by the rank-aware NumPy solve below instead,
+which projects out the observable row space only. No path inserts damping
+into retained information. ELIMINATION_COUNTS counts both paths.
 """
 
 from dataclasses import dataclass
 
+import gtsam
 import numpy as np
 
 from gelslam.core.numpy_vi import NavigationState
@@ -22,6 +30,15 @@ RANK_TOLERANCE = 1e-12
 # had s_min / s_max >= 2.2e-4 (trial_001, 4000 scaled systems).
 NORMAL_RANK_TOLERANCE = 1e-6
 STATE_KINDS = ("pose", "velocity", "accel_bias", "gyro_bias")
+# Elimination calls by path (diagnostics): GTSAM, or the rank-aware NumPy solve
+# used when the eliminated block is rank deficient or GTSAM is switched off.
+ELIMINATION_COUNTS = {"gtsam": 0, "numpy": 0}
+# False: always use the NumPy solve (comparison runs and tests).
+USE_GTSAM_ELIMINATION = True
+# GTSAM is used when min |R_ii| / max |R_ii| of the eliminated block's
+# triangular factor exceeds this value (columns scaled to unit norm first).
+GTSAM_RANK_GUARD = 1e-6
+_ELIMINATED_KEY, _RETAINED_KEY = 0, 1
 
 
 @dataclass(frozen=True)
@@ -121,8 +138,49 @@ def rank_solve(A, rhs):
     return solution / (scales if rhs.ndim == 1 else scales[:, None]), rank, singular
 
 
+def _first_block_ordering():
+    ordering = gtsam.Ordering()
+    ordering.push_back(_ELIMINATED_KEY)
+    return ordering
+
+
+def _full_rank(bayes_net):
+    """True when the eliminated block's triangular factor has no near-zero pivot."""
+    diagonal = np.abs(np.diag(bayes_net.at(0).R()))
+    return bool(len(diagonal) and np.isfinite(diagonal).all()
+                and diagonal.min() > GTSAM_RANK_GUARD * diagonal.max())
+
+
+def _gtsam_eliminate_rows(Am, Ar, rhs):
+    """QR elimination of the Am block; (Ar, rhs) of the remaining factor, or None."""
+    if not (USE_GTSAM_ELIMINATION and Am.shape[1] and Ar.shape[1] and len(rhs)):
+        return None
+    scales = np.linalg.norm(Am, axis=0)
+    if not np.all(scales > 0.):
+        return None  # An eliminated coordinate without any row: rank deficient.
+    graph = gtsam.GaussianFactorGraph()
+    graph.add(gtsam.JacobianFactor(_ELIMINATED_KEY, Am / scales, _RETAINED_KEY, Ar, rhs,
+                                   gtsam.noiseModel.Unit.Create(len(rhs))))
+    try:
+        bayes_net, remaining = graph.eliminatePartialSequential(
+            _first_block_ordering(), gtsam.EliminateQR)
+    except RuntimeError:
+        return None
+    if not _full_rank(bayes_net):
+        return None
+    if remaining.size() == 0:
+        return np.zeros((0, Ar.shape[1])), np.zeros(0)
+    reduced_A, reduced_rhs = remaining.jacobian()
+    if not (np.isfinite(reduced_A).all() and np.isfinite(reduced_rhs).all()):
+        return None
+    return reduced_A, reduced_rhs
+
+
 def eliminate_rows(A, rhs, eliminate_columns, retain_columns):
-    """Schur Hrr-Hrm solve(Hmm,Hmr), and RHS, without normal-equation squaring."""
+    """Schur Hrr-Hrm solve(Hmm,Hmr), and RHS, without normal-equation squaring.
+
+    GTSAM QR eliminates the block; a rank-deficient block uses rank_solve.
+    """
     A, rhs = np.asarray(A, float), np.asarray(rhs, float)
     if A.ndim != 2 or rhs.shape != (len(A),):
         raise ValueError("row dimensions do not match")
@@ -133,9 +191,15 @@ def eliminate_rows(A, rhs, eliminate_columns, retain_columns):
     zero_columns = scales == 0.
     scales[scales == 0.] = 1.
     if Am.shape[1]:
-        solution, _, _ = rank_solve(Am, np.column_stack((Ar, rhs)))
-        projected = np.column_stack((Ar, rhs)) - Am @ solution
-        Ar, rhs = projected[:, :-1], projected[:, -1]
+        eliminated = _gtsam_eliminate_rows(Am, Ar, rhs)
+        if eliminated is not None:
+            ELIMINATION_COUNTS["gtsam"] += 1
+            Ar, rhs = eliminated
+        else:
+            ELIMINATION_COUNTS["numpy"] += 1
+            solution, _, _ = rank_solve(Am, np.column_stack((Ar, rhs)))
+            projected = np.column_stack((Ar, rhs)) - Am @ solution
+            Ar, rhs = projected[:, :-1], projected[:, -1]
     # Compress to at most retained_dimension rows. Column scaling is used for
     # rank selection only. Undo it in the stored rows, preserving SI units.
     u, singular, vt = np.linalg.svd(Ar / scales, full_matrices=False)
@@ -188,9 +252,35 @@ def compress_normal(H, g):
     return compressed, (vectors[:, active].T @ gs) / singular[active]
 
 
+def _gtsam_eliminate_normal(Hmm, Hmr, gm, Hrr, gr):
+    """Cholesky elimination of the m block of the normal equations; (H, g) on r, or None."""
+    if not (USE_GTSAM_ELIMINATION and len(gr)):
+        return None
+    scales = np.sqrt(np.clip(np.diag(Hmm), 0., None))
+    if not np.all(scales > 0.):
+        return None  # An eliminated coordinate without information: rank deficient.
+    graph = gtsam.GaussianFactorGraph()
+    graph.add(gtsam.HessianFactor(
+        _ELIMINATED_KEY, _RETAINED_KEY, Hmm / np.outer(scales, scales), Hmr / scales[:, None],
+        gm / scales, Hrr, gr, 0.0))
+    try:
+        # Default elimination of a Hessian factor: Cholesky. It raises for a
+        # block that is not positive definite.
+        bayes_net, remaining = graph.eliminatePartialSequential(_first_block_ordering())
+    except RuntimeError:
+        return None
+    if not _full_rank(bayes_net) or remaining.size() == 0:
+        return None
+    reduced, linear = remaining.hessian()
+    if not (np.isfinite(reduced).all() and np.isfinite(linear).all()):
+        return None
+    return .5 * (reduced + reduced.T), linear
+
+
 def eliminate_normal(H, g, eliminate_columns, retain_columns):
     """eliminate_rows(A, rhs, m, r) from H = A^T A and g = A^T rhs, as (H, g) on r.
 
+    GTSAM Cholesky eliminates the block. For a rank-deficient block:
     Hrr - Hrm Hmm^- Hmr and gr - Hrm Hmm^- gm. Hmm^- inverts only the observable
     subspace of the column-scaled Hmm (NORMAL_RANK_TOLERANCE), as rank_solve(Am)
     does in eliminate_rows; Am Hmm^- Am^T is the same projector for any such inverse.
@@ -203,6 +293,11 @@ def eliminate_normal(H, g, eliminate_columns, retain_columns):
     if not len(m):
         return Hrr, gr
     Hmm, Hmr, gm = H[np.ix_(m, m)], H[np.ix_(m, r)], g[m]
+    eliminated = _gtsam_eliminate_normal(Hmm, Hmr, gm, Hrr, gr)
+    if eliminated is not None:
+        ELIMINATION_COUNTS["gtsam"] += 1
+        return eliminated
+    ELIMINATION_COUNTS["numpy"] += 1
     scales, inactive, singular, vectors, _ = _scaled_normal_eigh(
         Hmm, gm, lambda s: s <= np.finfo(float).eps * len(s) * max(float(s.max(initial=0.)), 1.))
     active = singular > NORMAL_RANK_TOLERANCE * (singular[0] if len(singular) else 0.)

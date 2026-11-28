@@ -266,3 +266,70 @@ def test_keyframe_gravity_loop_does_not_tilt_the_pose_only_map(source):
     else:
         assert tilt < 1e-9
         np.testing.assert_allclose(graph.map_poses(), local, atol=1e-9)
+
+
+def _lever_arm_graph(**overrides):
+    extrinsic = np.eye(4)
+    extrinsic[:3, :3] = [[0., 1., 0.], [1., 0., 0.], [0., 0., -1.]]
+    extrinsic[:3, 3] = [.002, -.001, -.14]
+    settings = dict(max_iterations=50, imu_factors=False, recovery_odometry_translation_sigma_m=.001,
+                    loop_rotation_sigma_rad=.2, loop_pgo_loop_robust='huber')
+    settings.update(overrides)
+    return LoopPoseGraph(settings, {'gelsight_T_imu': extrinsic.tolist()})
+
+
+def _curved_path(count=6):
+    import gtsam
+    poses, pose = [], gtsam.Pose3()
+    step = gtsam.Pose3(gtsam.Rot3.Rodrigues(.05, -.03, .2), np.array([.004, .001, .0005]))
+    for _ in range(count):
+        poses.append(pose.matrix())
+        pose = pose.compose(step)
+    return poses
+
+
+def test_backend_graph_uses_native_gtsam_factors_and_optimizer():
+    import gtsam
+    local = _curved_path()
+    graph = _lever_arm_graph()
+    records = loop_records(local)
+    records[3].tactile_valid = False
+    # Navigation states are IMU poses: GelSight pose times T_GI.
+    states = []
+    for record, pose in zip(records, local):
+        state = record.navigation_state.copy()
+        state.pose = pose @ graph.extrinsic
+        states.append(state)
+    graph.synchronize(local, records, [(i, i + 1) for i in range(5)], navigation_states=states)
+    loop = np.linalg.inv(local[5]) @ local[0]
+    loop[:3, 3] += [.002, -.001, .0005]
+    assert graph.add_loop(0, 5, loop)
+    graph.solve()
+    kinds = dict(zip(graph.factor_kinds, (type(graph.graph.at(i)).__name__
+                                           for i in range(graph.graph.size()))))
+    assert kinds == {'pose_anchor': 'NonlinearEqualityPose3', 'odometry': 'BetweenFactorPose3',
+                     'recovery_odometry': 'BetweenFactorPose3', 'loop': 'BetweenFactorPose3'}
+    solved = graph.map_poses()
+    np.testing.assert_allclose(solved[0], local[0], atol=1e-12)
+
+    # Same problem on GelSight-pose variables with the GelSight-tangent sigmas.
+    reference, values = gtsam.NonlinearFactorGraph(), gtsam.Values()
+    start = _lever_arm_graph()
+    start.synchronize(local, records, [(i, i + 1) for i in range(5)], navigation_states=states)
+    start.add_loop(0, 5, loop)
+    for key, pose in enumerate(start.map_poses()):
+        values.insert(key, gtsam.Pose3(pose))
+    reference.add(gtsam.NonlinearEqualityPose3(0, gtsam.Pose3(local[0])))
+    for a in range(5):
+        noise = graph.recovery_noise if a + 1 == 3 else graph.noise
+        reference.add(gtsam.BetweenFactorPose3(
+            a, a + 1, gtsam.Pose3(np.linalg.inv(local[a]) @ local[a + 1]), noise))
+    reference.add(gtsam.BetweenFactorPose3(0, 5, gtsam.Pose3(np.linalg.inv(loop)), graph.loop_noise))
+    parameters = gtsam.LevenbergMarquardtParams()
+    parameters.setMaxIterations(50)
+    expected = gtsam.LevenbergMarquardtOptimizer(reference, values, parameters).optimize()
+    for key, pose in enumerate(solved):
+        np.testing.assert_allclose(pose, expected.atPose3(key).matrix(), atol=1e-7)
+    # The IMU-frame cost equals the GelSight-frame cost of the same poses.
+    assert graph.last_final_cost == pytest.approx(reference.error(expected), rel=1e-5)
+    assert graph.last_final_cost < graph.last_initial_cost
