@@ -9,9 +9,3 @@ def velocity_key(index):
 
 def bias_key(index):
     return gtsam.symbol('b', index)
-
-
-def variable_type(key):
-    if key < (1 << 56):
-        return 'pose'
-    return 'vector' if gtsam.Symbol(key).chr() == ord('v') else 'bias'

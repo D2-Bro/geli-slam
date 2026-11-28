@@ -1,6 +1,5 @@
 """Origin rotation/XY stopping and the five-step normal-only Huber phase."""
 
-import gtsam
 import numpy as np
 import pytest
 
@@ -24,17 +23,6 @@ class FlatVisual:
 
     def evaluate(self, reference, target):
         return np.zeros(30), np.zeros((30, 6)), np.zeros((30, 6))
-
-
-def force_step(monkeypatch, column=None, value=.1):
-    increment = np.zeros(15)
-    if column is not None:
-        increment[column] = value
-    values = gtsam.VectorValues()
-    for key, part in ((gv.POSE_J, increment[:6]), (gv.VELOCITY_J, increment[6:9]),
-                      (gv.BIAS_J, increment[9:])):
-        values.insert(key, part)
-    monkeypatch.setattr(gv, 'solve_gaussian_qr', lambda graph: values)
 
 
 @pytest.mark.parametrize('settings', [

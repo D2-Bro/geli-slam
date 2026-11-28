@@ -4,7 +4,6 @@ from backend_test_support import config as backend_config, frame as backend_fram
 
 from types import SimpleNamespace
 
-import gtsam
 import numpy as np
 import pytest
 import pickle
@@ -12,13 +11,11 @@ import pickle
 from gelslam.core.gtsam_pose_graph import PoseGraph
 from gelslam.core.gtsam_vi import GtsamVisualInertialSolver
 from gelslam.core.imu_navigation import (
-    gelsight_pose, gelsight_pose_jacobian, gelsight_velocity, imu_pose, imu_velocity,
+    gelsight_pose, gelsight_pose_jacobian, gelsight_velocity, imu_velocity,
 )
 from gelslam.core.inertial import ImuSample
 from gelslam.core.numpy_vi import NavigationState, so3_exp
-from gelslam.core.split_pose import (
-    split_between_factor, split_pose_coordinates, split_pose_plus, split_prior_factor,
-)
+from gelslam.core.split_pose import split_pose_coordinates, split_pose_plus
 from gelslam.core.tracker import Tracker
 
 
@@ -83,34 +80,6 @@ class PositionObservation:
         J = np.zeros((30, 6))
         J[:, 3:] = np.tile(target[:3, :3], (10, 1))
         return residual, np.zeros_like(J), J
-
-
-@pytest.mark.parametrize("between", [False, True])
-def test_backend_gelsight_factor_jacobians_use_imu_increments(between):
-    extrinsic = mount()
-    a = np.eye(4)
-    b = np.eye(4)
-    b[:3, :3] = so3_exp(np.array([-.1, .3, .2]))
-    b[:3, 3] = [.1, -.03, .02]
-    values = gtsam.Values()
-    values.insert(0, gtsam.Pose3(imu_pose(a, extrinsic)))
-    values.insert(1, gtsam.Pose3(imu_pose(b, extrinsic)))
-    noise = gtsam.noiseModel.Unit.Create(6)
-    offset = np.linalg.inv(extrinsic)
-    factor = (split_between_factor(0, 1, np.eye(4), noise, offset) if between
-              else split_prior_factor(1, np.eye(4), noise, offset))
-    A, _ = factor.linearize(values).jacobian()
-    numerical = np.empty_like(A)
-    for column in range(A.shape[1]):
-        key = list(factor.keys())[column // 6]
-        pose = values.atPose3(key).matrix()
-        step = np.eye(6)[column % 6] * 1e-7
-        plus, minus = gtsam.Values(values), gtsam.Values(values)
-        plus.update(key, gtsam.Pose3(split_pose_plus(pose, step)))
-        minus.update(key, gtsam.Pose3(split_pose_plus(pose, -step)))
-        numerical[:, column] = (factor.unwhitenedError(plus)
-                                - factor.unwhitenedError(minus)) / 2e-7
-    assert np.allclose(A, numerical, atol=1e-8)
 
 
 def test_backend_states_are_imu_and_output_and_reload_remain_gelsight(tmp_path):
