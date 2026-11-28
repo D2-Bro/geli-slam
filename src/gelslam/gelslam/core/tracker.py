@@ -1,7 +1,7 @@
 import os
 import pickle
 from bisect import bisect_left
-from collections import Counter
+from collections import Counter, deque
 from enum import Enum
 
 import cv2
@@ -38,7 +38,16 @@ from gelslam.core.static_imu_initialization import (
 )
 from gelslam.core.contact_velocity import ContactVelocityHistory
 from gelslam.core.imu_coupling import inflate_bias, make_coupling_schedule
+from gelslam.core.keyframe_selection import (
+    kernel_moments, make_window_frame, reference_kernel_overlap, resolve_kernel_settings,
+    resolve_keyframe_selection, select_window_frame,
+)
+from gelslam.core.retained_prior import VariableBlock
 from gelslam.visualization.normal_correspondences import project_normal_correspondences
+
+
+# When a keyframe is made: track_config.keyframe_rule.
+KEYFRAME_RULES = ("timed_scr", "kernel_overlap")
 
 
 class TrackingMode(Enum):
@@ -92,6 +101,23 @@ class Tracker:
             raise ValueError("gelslam_config.track_config.keep_imu_only_frames must be a boolean")
         self._keyframe_interval_s()  # Validate the common selection condition.
         self._last_keyframe_timestamp = None
+        # Which frame a keyframe trigger makes the keyframe; None: the newest
+        # accepted frame. kernel_score: a frame of the window of accepted contact
+        # frames after the reference keyframe (gelslam.core.keyframe_selection).
+        self._keyframe_selection = resolve_keyframe_selection(self.track_config)
+        # When a keyframe is made. timed_scr: keyframe_max_interval_s deadline, and
+        # SCR < scr_threshold makes the accepted frame a keyframe. kernel_overlap: no
+        # deadline; the accepted frame t is a keyframe when the reference keyframe's
+        # kernel ellipse covers less than keyframe_overlap_threshold of t's.
+        self._keyframe_rule = self.track_config.get("keyframe_rule", "timed_scr")
+        if self._keyframe_rule not in KEYFRAME_RULES:
+            raise ValueError("track_config.keyframe_rule must be one of %s" % ", ".join(KEYFRAME_RULES))
+        if self._keyframe_rule == "kernel_overlap":
+            self._keyframe_kernel = resolve_kernel_settings(self.track_config)
+            self._keyframe_overlap_threshold = self._overlap_threshold()
+        self._keyframe_window = (
+            deque(maxlen=self._keyframe_selection["window_size"])
+            if self._keyframe_selection is not None else None)
         self.imu_config = config.get("imu_config", {})
         self._contact_velocity_history = ContactVelocityHistory.from_config(self.imu_config)
         self._coast_velocity_seed = None
@@ -170,6 +196,11 @@ class Tracker:
         self._imu_integration_sample = None
         self._coast_start_timestamp = None
         self.frontend_visual_inertial = self._make_frontend_solver(self.imu_config)
+        if self._keyframe_selection is not None:
+            if not getattr(self.frontend_visual_inertial, "reference_marginalization", False):
+                raise ValueError("track_config.keyframe_selection requires the "
+                                 "reference_marginalization frontend")
+            self.logger.info("Window keyframe selection: %s" % self._keyframe_selection)
         if self.frontend_visual_inertial is None:
             self.logger.info("World gravity alignment requires the calibrated VI frontend; inactive")
         # The frontend VI state and published poses use the same trial axes.
@@ -619,6 +650,8 @@ class Tracker:
         """Record an accepted contact surface pose and its trial-frame VI state."""
         pose = np.asarray(ref_T_gelsight, dtype=np.float64).copy()
         if reference_changed:
+            # Window candidates must stay later than the new reference keyframe.
+            self._trim_keyframe_window(self._imu_timestamp(getattr(self, "ref_header", None)))
             self.previous_tactile_ref_T = None
             self.previous_tactile_header = None
         elif getattr(self, "last_tactile_ref_T", None) is not None:
@@ -703,6 +736,35 @@ class Tracker:
             # A future disconnected trial must not reuse stationary evidence
             # from an accepted tactile contact (which may include sliding).
             self._static_imu_collecting = False
+
+    def _sync_window_request(self):
+        """Ask the solver to retain the pose blocks of the window frames."""
+        solver = getattr(self, "frontend_visual_inertial", None)
+        window = getattr(self, "_keyframe_window", None)
+        if solver is not None and hasattr(solver, "window_pose_timestamps"):
+            solver.window_pose_timestamps = tuple(f.timestamp for f in window or ())
+
+    def _trim_keyframe_window(self, reference_timestamp):
+        """Drop window frames at or before the reference time (all if None)."""
+        window = getattr(self, "_keyframe_window", None)
+        if window is None:
+            return
+        kept = [] if reference_timestamp is None else [
+            f for f in window if f.timestamp > reference_timestamp + 1e-9]
+        window.clear()
+        window.extend(kept)
+        self._sync_window_request()
+
+    def _push_keyframe_window(self, frame, header):
+        """Add the accepted contact frame (current State) as the newest window frame."""
+        window = getattr(self, "_keyframe_window", None)
+        state = getattr(self, "_frontend_vi_state", None)
+        timestamp = self._imu_timestamp(header)
+        if (window is None or state is None or timestamp is None or not frame.is_contacted
+                or abs(state.timestamp - timestamp) > 1e-9):
+            return
+        window.append(make_window_frame(self.curr_fid, timestamp, header, frame, state, self.ppmm))
+        self._sync_window_request()
 
     def _sync_reference_prior(self):
         """Change visual reference only at a serialized accepted-state boundary."""
@@ -1029,6 +1091,28 @@ class Tracker:
             raise ValueError("track_config.keyframe_max_interval_s must be finite and nonnegative")
         return interval
 
+    def _overlap_threshold(self):
+        value = self.track_config.get("keyframe_overlap_threshold")
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not 0.0 <= value <= 1.0):
+            raise ValueError("track_config.keyframe_overlap_threshold must be a number in [0, 1] "
+                             "for keyframe_rule kernel_overlap")
+        return float(value)
+
+    def _reference_kernel_overlap(self, frame, trial_T_current):
+        """O_K(t) of the accepted frame t against the reference keyframe K (ref_frame).
+
+        K's kernel moments are computed once per reference frame.
+        """
+        reference = self.ref_frame
+        cached = getattr(self, "_reference_kernel_moments", None)
+        if cached is None or cached[0] is not reference:
+            cached = (reference, kernel_moments(reference, self.ppmm))
+            self._reference_kernel_moments = cached
+        return reference_kernel_overlap(
+            cached[1], self.trial_T_ref, kernel_moments(frame, self.ppmm), trial_T_current,
+            self._keyframe_kernel, self.ppmm)
+
     def _recontact_imu_recovery_min_gap_s(self):
         value = self.track_config.get("recontact_imu_recovery_min_gap_s")
         if value is None:
@@ -1089,22 +1173,45 @@ class Tracker:
         return float(np.degrees(np.arccos(np.clip((np.trace(rotation) - 1.0) / 2.0, -1.0, 1.0))))
 
     def _maybe_add_timed_keyframe(self, frame, header, log_prefix, *, force=False):
-        """Promote a valid contact target after the common keyframe deadline."""
+        """Promote a valid contact target after the common keyframe deadline.
+
+        keyframe_rule kernel_overlap: no deadline; promote t only when
+        O_K(t) < keyframe_overlap_threshold (force is not used). With a
+        keyframe_selection window, the keyframe can be a past window frame.
+        """
         if not frame.is_contacted:
             return None
+        rule = getattr(self, "_keyframe_rule", "timed_scr")
         interval = self._keyframe_interval_s()
         timestamp = self._camera_timestamp(header)
         last = getattr(self, "_last_keyframe_timestamp", None)
         if last is None:
             # Saved trackers predating the timer still have a reference header.
             last = self._camera_timestamp(getattr(self, "ref_header", None))
+        trial_T_current = self.trial_T_ref @ self.ref_T_prev
+        overlap = None
+        if rule == "kernel_overlap":
+            if not np.all(np.isfinite(trial_T_current)):
+                return None
+            overlap = self._reference_kernel_overlap(frame, trial_T_current)
+            self.latest_reference_kernel_overlap = overlap
+            force = overlap < self._keyframe_overlap_threshold
         if (timestamp is None or (not force and (
-                interval == 0 or last is None
+                rule == "kernel_overlap" or interval == 0 or last is None
                 or timestamp - last < interval - 1e-9))):
             return None
-        trial_T_current = self.trial_T_ref @ self.ref_T_prev
         if not np.all(np.isfinite(trial_T_current)):
             return None
+        reason = "Low overlap" if overlap is not None else ("Low SCR" if force else "Timed")
+        if overlap is not None:
+            self._count_frontend_event("low_overlap_keyframes")
+        elif force:
+            self._count_frontend_event("low_scr_keyframes")
+        selected = self._select_window_keyframe(header)
+        if selected is not None:
+            return self._add_window_keyframe(
+                selected, trial_T_current, header, log_prefix, reason,
+                0.0 if last is None else timestamp - last)
         keyframe = self._make_keyframe_msg(
             frame, self.curr_kid + 1, self.curr_fid, False,
             trial_T_current, header,
@@ -1121,13 +1228,86 @@ class Tracker:
             self.ref_T_prev, header, reference_changed=True,
             preserve_frontend_state=True,
         )
-        reason = "Low SCR" if force else "Timed"
-        if force:
-            self._count_frontend_event("low_scr_keyframes")
         self.logger.info(
-            "%s -- %s Keyframe: frame ID: %d, interval: %.6f s"
+            "%s -- %s Keyframe: frame ID: %d, interval: %.6f s%s"
             % (log_prefix, reason, self.curr_fid,
-               0.0 if last is None else timestamp - last)
+               0.0 if last is None else timestamp - last,
+               "" if overlap is None else ", kernel overlap: %.3f" % overlap)
+        )
+        return keyframe
+
+    def _select_window_keyframe(self, header):
+        """At a keyframe trigger for the newest frame t, return a past window frame or None.
+
+        Candidates are the window frames whose pose blocks the retained prior
+        still carries, plus t. None keeps the newest frame t.
+        """
+        settings = getattr(self, "_keyframe_selection", None)
+        window = getattr(self, "_keyframe_window", None)
+        solver = getattr(self, "frontend_visual_inertial", None)
+        state = getattr(self, "_frontend_vi_state", None)
+        timestamp = self._imu_timestamp(header)
+        if (settings is None or not window or solver is None or state is None
+                or timestamp is None or abs(window[-1].timestamp - timestamp) > 1e-9
+                or abs(state.timestamp - timestamp) > 1e-9):
+            return None
+        values = getattr(getattr(solver, "marginal_prior", None), "values", {})
+        reference = self._imu_timestamp(getattr(self, "ref_header", None))
+        frames, poses = [], []
+        for entry in window:
+            if reference is not None and entry.timestamp <= reference + 1e-9:
+                continue
+            pose = state.pose if entry is window[-1] else values.get(VariableBlock("pose", entry.timestamp))
+            if pose is None:
+                continue
+            frames.append(entry)
+            poses.append(gelsight_pose(pose, self.gelsight_T_imu))
+        if len(frames) < 2:
+            return None
+        selected, info = select_window_frame(frames, poses, settings, self.ppmm)
+        self.latest_keyframe_selection = dict(info, selected_fid=selected.fid,
+                                              current_fid=frames[-1].fid, candidates=len(frames))
+        return None if selected is frames[-1] else selected
+
+    def _add_window_keyframe(self, entry, trial_T_current, header, log_prefix, reason, interval):
+        """Make the past window frame m the keyframe K_{k+1} at trigger frame t.
+
+        K_{k+1} is published with m's image, header and frame ID, and with m's
+        accepted navigation state whose pose is the retained prior estimate at t.
+        The visual reference of t+1 is m. The accepted State at t, its velocity,
+        biases and the correlated prior stay; only the reference moves to m.
+        """
+        solver = self.frontend_visual_inertial
+        state = entry.state.copy()
+        state.pose = np.array(solver.marginal_prior.values[VariableBlock("pose", entry.timestamp)],
+                              dtype=np.float64, copy=True)
+        trial_T_keyframe = gelsight_pose(state.pose, self.gelsight_T_imu)
+        self._backend_keyframe_state_override = state
+        try:
+            keyframe = self._make_keyframe_msg(
+                entry.frame, self.curr_kid + 1, entry.fid, False, trial_T_keyframe, entry.header)
+        finally:
+            self._backend_keyframe_state_override = None
+        self.curr_kid += 1
+        self.trial_T_ref = trial_T_keyframe
+        self.ref_frame, self.ref_header = entry.frame, entry.header
+        self.ref_T_prev = (np.linalg.inv(trial_T_keyframe)
+                           @ np.asarray(trial_T_current, dtype=np.float64)).astype(np.float32)
+        # t itself is not a keyframe: a failure at t+1 may still promote it.
+        self.prev_is_keyframe_flag = False
+        self._record_tactile_pose(
+            self.ref_T_prev, header, reference_changed=True,
+            preserve_frontend_state=True,
+        )
+        self._count_frontend_event("window_keyframes")
+        info = getattr(self, "latest_keyframe_selection", {})
+        self.logger.info(
+            "%s -- %s Window Keyframe: frame ID: %d selected at frame ID: %d (%s, %d candidates, "
+            "peak frame ID: %s, selected kernel overlap: %s), image delay: %.6f s, interval: %.6f s"
+            % (log_prefix, reason, entry.fid, self.curr_fid, info.get("status"),
+               info.get("candidates", 0), info.get("peak_fid"),
+               "%.3f" % info["selected_overlap"] if "selected_overlap" in info else "n/a",
+               self._camera_timestamp(header) - self._camera_timestamp(entry.header), interval)
         )
         return keyframe
 
@@ -1440,7 +1620,7 @@ class Tracker:
         names = (
             "refine_calls", "frontend_failed_calls", "vi_solve_calls", "vi_accepted", "vi_quality_rejected",
             "previous_state_retry_calls", "previous_state_retry_accepted",
-            "low_scr_keyframes", "imu_recovery_keyframes",
+            "low_scr_keyframes", "low_overlap_keyframes", "window_keyframes", "imu_recovery_keyframes",
             # Kept for log consumers; recovery alone no longer promotes a target.
             "recovered_contact_keyframes",
             # Legacy summary keys remain for log consumers; no path now
@@ -1767,8 +1947,10 @@ class Tracker:
             refined.pose, refined.velocity, refined.accel_bias, refined.gyro_bias,
             [scr, ccs]))
         quality_failed = not finite
+        # Only timed_scr makes a Low SCR keyframe; kernel_overlap keys by O_K(t).
         self._quality_force_keyframe = (
-            not quality_failed and scr < float(self.track_config["scr_threshold"]))
+            getattr(self, "_keyframe_rule", "timed_scr") == "timed_scr"
+            and not quality_failed and scr < float(self.track_config["scr_threshold"]))
         self._record_normal_correspondences(
             reference_frame, current_frame, np.linalg.inv(navigation_reference_pose) @ refined_pose,
             "VI final pose: "
@@ -2429,6 +2611,8 @@ class Tracker:
                     self._no_contact_since = self._imu_timestamp(header)
                 self.logger.info("%s -- Skip Frame: Not in contact" % log_prefix)
                 self.prev_in_contact_flag = False
+                # The window holds one contact segment; its poses leave the prior.
+                self._trim_keyframe_window(None)
                 self.curr_fid += 1
                 if (
                     self._initialize_no_contact_coast()
@@ -2469,6 +2653,7 @@ class Tracker:
                             self.prev_is_keyframe_flag = False
                             self.prev_frame, self.prev_header = frame, header
                             self._record_tactile_pose(self.ref_T_prev, header)
+                            self._push_keyframe_window(frame, header)
                             self.tracking_mode = TrackingMode.CONTACT_TRACKING
                         except LoseTrackError as error:
                             # Recontact does not start a new quality-rejection
@@ -2520,6 +2705,7 @@ class Tracker:
                         self.prev_frame = frame
                         self.prev_header = header
                         self._record_tactile_pose(self.ref_T_prev, header)
+                        self._push_keyframe_window(frame, header)
                         self.tracking_mode = TrackingMode.CONTACT_TRACKING
                         self.logger.info(
                             "%s -- Regular Frame: frame ID: %d"

@@ -73,6 +73,17 @@ class LoopPoseGraph:
                 self._positive('loop_pgo_rotation_sigma_rad', .01),
                 self._positive('recovery_odometry_translation_sigma_m', 1.),
             ], 3))
+        # loop_tilt_source: where a loop factor takes its rotation tilt from.
+        #   registration: the registered loop rotation as measured.
+        #   keyframe_gravity: the registered translation and rotation about the
+        #   vertical stay; the tilt is replaced so that the target up direction
+        #   maps onto the reference up direction, both from each keyframe's seed
+        #   pose and its trial-frame gravity (frontend VI). Registered rotations
+        #   miss in-plane tilt (nipper-dewalt-20261125 nipper_1: median 3.6 deg,
+        #   biased); the pose-only graph then tilted the map by 10-20 deg.
+        self.loop_tilt_source = self.config.get('loop_tilt_source', 'registration')
+        if self.loop_tilt_source not in ('registration', 'keyframe_gravity'):
+            raise ValueError("pose_graph_config.loop_tilt_source must be 'registration' or 'keyframe_gravity'")
         robust = self.config.get('loop_pgo_loop_robust')
         if robust is not None:
             width = self._positive('loop_pgo_loop_robust_width', 1.345)
@@ -186,6 +197,24 @@ class LoopPoseGraph:
             if len(connected) == previous:
                 return connected
 
+    def loop_measurement(self, reference, target, measurement):
+        """Return the loop factor measurement reference_T_target (GelSight poses).
+
+        keyframe_gravity: R = A R_reg, with A the smallest rotation that maps
+        R_reg u_target onto u_reference (u = up direction in each keyframe's
+        GelSight frame from its seed pose and trial gravity). Then R u_target =
+        u_reference, and R and R_reg have the same rotation about the vertical.
+        The registered translation is not changed. Stored loops keep the
+        registration; the replacement uses the current seeds at each solve.
+        """
+        if self.loop_tilt_source == 'registration':
+            return measurement
+        up_reference = self.local_poses[reference][:3, :3].T @ self.local_up[reference]
+        up_target = self.local_poses[target][:3, :3].T @ self.local_up[target]
+        adjusted = np.array(measurement, dtype=float)
+        adjusted[:3, :3] = align_directions(adjusted[:3, :3] @ up_target, up_reference) @ adjusted[:3, :3]
+        return adjusted
+
     def add_loop(self, reference, target, target_T_reference):
         if any(r == reference and t == target for r, t, _ in self.loops):
             return False
@@ -193,7 +222,8 @@ class LoopPoseGraph:
         component = self.component(target)
         if reference not in component:
             poses = self.map_poses()
-            shift = poses[reference] @ measurement @ np.linalg.inv(poses[target])
+            shift = (poses[reference] @ self.loop_measurement(reference, target, measurement)
+                     @ np.linalg.inv(poses[target]))
             for key in component:
                 self.corrections[key] = shift @ self.corrections[key]
                 self.velocity_corrections[key] = shift[:3, :3] @ self.velocity_corrections[key]
@@ -282,8 +312,9 @@ class LoopPoseGraph:
                 add(split_between_factor(reference, target, measurement, self.recovery_noise,
                                          self.imu_T_gel), 'recovery_odometry')
         for reference, target, measurement in self.loops:
-            add(split_between_factor(reference, target, measurement, self.loop_noise,
-                                     self.imu_T_gel), 'loop')
+            add(split_between_factor(reference, target,
+                                     self.loop_measurement(reference, target, measurement),
+                                     self.loop_noise, self.imu_T_gel), 'loop')
         initial_cost = float(graph.error(values))
         result = optimize_split_pose_graph(graph, values,
             max_iterations=int(self.config.get('max_iterations', 10)),

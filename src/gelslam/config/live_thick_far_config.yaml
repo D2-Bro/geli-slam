@@ -241,8 +241,35 @@ gelslam_config:
     # Write/publish normal RGB, contact cloud and correspondence debug images.
     # false skips their construction; tracking and frame/keyframe output continue.
     debug_visualization_enabled: false
-    # Promote a valid contact frame after this image-time gap. 0 disables it.
+    # When a keyframe is made (keyframe_rule).
+    # timed_scr: after keyframe_max_interval_s, or when SCR < scr_threshold, the
+    #   accepted frame becomes a keyframe.
+    # kernel_overlap: no deadline (Timed) keyframes. The accepted frame t becomes a
+    #   keyframe when the reference keyframe K's kernel ellipse E_K, moved into t by
+    #   the accepted poses (T_t^-1 T_K), covers less than keyframe_overlap_threshold of
+    #   t's ellipse E_t: area(E_K ∩ E_t) / area(E_t). Kernel as keyframe_selection.
+    #   SCR < scr_threshold makes no keyframe. real-objects-12 (frontend MAE):
+    #   timed_scr 2.125, kernel_overlap 0.7 2.166 mm (n.s.); 0.5 2.376 mm.
+    keyframe_rule: kernel_overlap
+    keyframe_overlap_threshold: 0.7
+    # timed_scr: promote a valid contact frame after this image-time gap. 0 disables it.
     keyframe_max_interval_s: 0.5
+    # Which frame a keyframe trigger makes the keyframe (gelslam.core.keyframe_selection).
+    # current: the newest accepted frame t. kernel_score: among the last window_size
+    # accepted contact frames after the reference keyframe (t included), the frame with
+    # the largest alpha A_m / A_peak + (1 - alpha) O(m), with A_m its eroded contact
+    # pixels and O(m) the share of t's kernel ellipse that m's ellipse covers in image
+    # t. The frontend prior retains the window poses (6D each).
+    # Kernel: indentation-weighted 3D mean and covariance of the contact pixels, moved
+    # into image t by the frontend poses; H = kernel_scale * (projected covariance +
+    # covariance_epsilon_px2 I), ellipse d^2 <= 1 (2 sigma), kernel_ellipse_vertices.
+    keyframe_selection:
+      method: kernel_score
+      window_size: 8
+      kernel_scale: 4.0
+      covariance_epsilon_px2: 0.001
+      kernel_ellipse_vertices: 32
+      kernel_score_alpha: 0.5
     # Continuous-contact quality rejections: recover from IMU after this image-time gap.
     # Recontact or missing correspondences use valid IMU immediately, without this wait.
     contact_failure_keyframe_interval_s: 0.5
@@ -266,6 +293,17 @@ gelslam_config:
     ccs_threshold: 0.3
   pose_graph_config:
     loop_pgo_rotation_sigma_rad: 0.01
+    # Rotation sigma of loop factors only (odometry keeps loop_pgo_rotation_sigma_rad).
+    loop_rotation_sigma_rad: 0.01
+    # loop_tilt_source: where a loop factor takes its rotation tilt from.
+    # registration: the registered rotation. keyframe_gravity: the registered
+    # translation and rotation about the vertical stay; the tilt maps the target's
+    # up direction onto the reference's (each keyframe's seed pose and trial
+    # gravity). Registered loop rotations miss in-plane tilt (nipper-dewalt
+    # nipper_1: median 3.6 deg); with registration the pose-only map tilted by
+    # 10-20 deg. keyframe_gravity with loop_rotation_sigma_rad 0.01: nipper final
+    # MAE 1.2-1.7 mm, real-objects-12 unchanged.
+    loop_tilt_source: keyframe_gravity
     loop_pgo_translation_sigma_m: 0.0001
     # Minimum data-time gap between loop-search targets; 0 searches every KF.
     # Skipped targets remain available as references. Not wall-clock throttling.

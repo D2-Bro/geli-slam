@@ -192,3 +192,77 @@ def test_loop_rotation_sigma_is_separate_from_the_odometry_sigma():
     assert default.loop_noise is default.noise
     with pytest.raises(ValueError, match='loop_rotation_sigma_rad'):
         LoopPoseGraph({'loop_rotation_sigma_rad': 0.})
+
+
+def _rotation(rotvec):
+    from scipy.spatial.transform import Rotation
+    return Rotation.from_rotvec(rotvec).as_matrix()
+
+
+def _pose(rotvec, position):
+    pose = np.eye(4)
+    pose[:3, :3] = _rotation(rotvec)
+    pose[:3, 3] = position
+    return pose
+
+
+def _twist(rotation, axis):
+    from scipy.spatial.transform import Rotation
+    x, y, z, w = Rotation.from_matrix(rotation).as_quat()
+    return 2. * np.arctan2(np.dot([x, y, z], axis), w)
+
+
+def test_loop_tilt_source_is_validated():
+    assert LoopPoseGraph({}).loop_tilt_source == 'registration'
+    with pytest.raises(ValueError, match='loop_tilt_source'):
+        LoopPoseGraph({'loop_tilt_source': 'gyro'})
+
+
+def test_keyframe_gravity_loop_keeps_vertical_rotation_and_translation():
+    graph = _pose_only(loop_tilt_source='keyframe_gravity')
+    local = [_pose([.05, -.02, .3], [0., 0., 0.]), _pose([-.03, .08, -.4], [.01, .002, 0.])]
+    graph.synchronize(local, loop_records(local), [(0, 1)])
+    seed = np.linalg.inv(local[0]) @ local[1]
+    up_reference = local[0][:3, :3].T @ [0., 0., 1.]
+    up_target = local[1][:3, :3].T @ [0., 0., 1.]
+    # Registration: 0.2 rad about the vertical (kept) and a 0.15 rad tilt error about GelSight x (removed).
+    registered = seed.copy()
+    registered[:3, :3] = _rotation([.15, 0., 0.]) @ _rotation(.2 * up_reference) @ seed[:3, :3]
+    registered[:3, 3] += [.0003, -.0002, .0001]
+    adjusted = graph.loop_measurement(0, 1, registered)
+    np.testing.assert_allclose(adjusted[:3, :3] @ up_target, up_reference, atol=1e-12)
+    np.testing.assert_array_equal(adjusted[:3, 3], registered[:3, 3])
+    assert np.isclose(_twist(adjusted[:3, :3] @ seed[:3, :3].T, up_reference),
+                      _twist(registered[:3, :3] @ seed[:3, :3].T, up_reference), atol=1e-12)
+    # The stored loop keeps the registration.
+    assert graph.add_loop(0, 1, np.linalg.inv(registered))
+    np.testing.assert_allclose(graph.loops[0][2], registered, atol=1e-12)
+
+
+def test_keyframe_gravity_loop_uses_each_keyframes_own_trial_gravity():
+    graph = _pose_only(loop_tilt_source='keyframe_gravity')
+    local = [_pose([.1, 0., 0.], [0., 0., 0.]), _pose([0., -.2, .5], [.03, 0., 0.])]
+    gravities = [np.array([0., 0., -9.81]), _rotation([.3, .1, 0.]) @ [0., 0., -9.81]]
+    graph.synchronize(local, loop_records(local, gravities, groups=[0, 1]), [])
+    up = [pose[:3, :3].T @ (-g / np.linalg.norm(g)) for pose, g in zip(local, gravities)]
+    registered = _pose([.2, -.1, .4], [.001, .002, 0.])
+    adjusted = graph.loop_measurement(0, 1, registered)
+    np.testing.assert_allclose(adjusted[:3, :3] @ up[1], up[0], atol=1e-12)
+    np.testing.assert_array_equal(adjusted[:3, 3], registered[:3, 3])
+
+
+@pytest.mark.parametrize('source', ['registration', 'keyframe_gravity'])
+def test_keyframe_gravity_loop_does_not_tilt_the_pose_only_map(source):
+    graph = _pose_only(loop_tilt_source=source, loop_rotation_sigma_rad=.05)
+    local = [translation(x) for x in (0., .01, .02)]
+    graph.synchronize(local, loop_records(local), [(0, 1), (1, 2)])
+    # Correct translation, 0.2 rad tilt error about GelSight x.
+    registered = _pose([.2, 0., 0.], [.02, 0., 0.])
+    assert graph.add_loop(0, 2, np.linalg.inv(registered))
+    graph.solve()
+    tilt = max(np.arccos(np.clip(pose[:3, :3][2, 2], -1., 1.)) for pose in graph.map_poses())
+    if source == 'registration':
+        assert tilt > 1e-3
+    else:
+        assert tilt < 1e-9
+        np.testing.assert_allclose(graph.map_poses(), local, atol=1e-9)

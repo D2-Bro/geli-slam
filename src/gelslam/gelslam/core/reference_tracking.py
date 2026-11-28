@@ -38,6 +38,11 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
     reference remains that first pose, later solves have 30 free dimensions.
     A later shared reference/previous pose gives 30D, retaining 21D. Changing
     the reference to the target retains 15D until the next accepted target.
+
+    Keyframe selection window: the pose blocks whose timestamps are in
+    window_pose_timestamps are also retained (6D each) so that the reference
+    can later move to one of them. No factor involves them after their own
+    solve; the prior carries their correlation with the other variables.
     """
 
     reference_marginalization = True
@@ -69,6 +74,21 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
         # Optional staged IMU coupling (imu_coupling.CouplingSchedule). None keeps
         # the full 9D IMU rows unchanged.
         self.coupling_schedule = None
+        # IMU-clock times of past accepted states whose pose blocks stay in the
+        # retained prior (tracker keyframe selection window). Empty: 21D prior.
+        self.window_pose_timestamps = ()
+
+    def _window_blocks(self, prior, exclude=()):
+        """Past pose blocks of the prior: not the reference and not its current state."""
+        current = VariableBlock("pose", float(prior.timestamp))
+        return tuple(b for b in prior.layout.blocks if b.kind == "pose"
+                     and b not in (self.reference_id, current) and b not in exclude)
+
+    def _requested_window_blocks(self, layout, exclude):
+        """Pose blocks of layout requested by window_pose_timestamps, in layout order."""
+        requested = {float(t) for t in getattr(self, "window_pose_timestamps", ())}
+        return tuple(b for b in layout.blocks if b.kind == "pose" and b.timestamp in requested
+                     and b not in exclude)
 
     def motion_row_scale(self, timestamp):
         """Scale c of the accelerometer motion rows for the interval ending here.
@@ -107,11 +127,15 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
         """At an accepted image boundary eliminate an old reference if needed."""
         prior = self._accepted_prior(state)
         reference_id = VariableBlock("pose", float(timestamp))
-        blocks = (reference_id,) + state_blocks(state.timestamp)
+        current_pose = VariableBlock("pose", float(state.timestamp))
+        window = self._requested_window_blocks(prior.layout, (reference_id, current_pose))
+        blocks = (reference_id,) + window + state_blocks(state.timestamp)
         if (reference_id == self.reference_id
                 and prior.layout.blocks == VariableLayout(blocks, prior.fixed_values).blocks):
             return
         if (reference_id not in prior.layout.blocks
+                # Unchanged fixed first-pose reference; window blocks may change.
+                and not (reference_id == self.reference_id and reference_id in prior.fixed_values)
                 and reference_id != VariableBlock("pose", state.timestamp)):
             raise ValueError("reference pose was already marginalized; cannot rename or recreate it")
         self.marginal_prior = prior.retain(blocks)
@@ -122,7 +146,8 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
         prior = self._accepted_prior(previous)
         if current.timestamp <= prior.timestamp:
             raise ValueError("IMU interval already absorbed, or target is not later than anchor")
-        layout = VariableLayout((self.reference_id,) + state_blocks(previous.timestamp)
+        layout = VariableLayout((self.reference_id,) + self._window_blocks(prior)
+                                + state_blocks(previous.timestamp)
                                 + state_blocks(current.timestamp), prior.fixed_values)
         values = {b: v.copy() for b, v in prior.values.items()}
         values.update(state_values(previous))
@@ -168,8 +193,11 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
             prior, layout, values, previous.timestamp, current.timestamp,
             (_split_imu_factor(pim), _bias_factor(pim, self.config)))
         A, rhs = np.vstack(rows), np.concatenate(right)
+        window = self._requested_window_blocks(
+            layout, (self.reference_id, VariableBlock("pose", float(current.timestamp))))
         propagated = self._compress(layout, values, A, rhs,
-                                    (self.reference_id,) + state_blocks(current.timestamp),
+                                    ((self.reference_id,) + window
+                                     + state_blocks(current.timestamp)),
                                     current.timestamp, prior.absorbed_intervals + 1,
                                     prior.fixed_values)
         # eliminate_first builds the same rows and elimination from the same
@@ -255,7 +283,9 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
             self.last_fixed_normal_reference_z_m = float(relative[2, 3])
             visual.set_fixed_reference_z(self.last_fixed_normal_reference_z_m)
         self.last_prior_source = "retained_reference_current"
-        retained_blocks = (reference_id,) + state_blocks(current.timestamp)
+        retained_blocks = ((reference_id,) + self._requested_window_blocks(
+            layout, (reference_id, current_id)) + state_blocks(current.timestamp))
+        past_window = set(self._window_blocks(prior))
         eliminated = None
         if self.previous_state_mode == "eliminate_first":
             # Same factors as propagate_prior(): prior + IMU + bias at the accepted
@@ -357,8 +387,10 @@ class ReferenceMarginalizationSolver(GtsamVisualInertialSolver):
             state_steps = [_navigation_step_norms(_expanded_step(solve_layout, state_blocks(t), step))
                            for t in (previous.timestamp, current.timestamp)]
             # Check every optimized pose, including the reference, in this mode.
+            # Past window poses follow the others through the prior; they do
+            # not decide convergence, so the iterations match a 21D prior.
             pose_steps = [step[solve_layout.slices[b]] for b in solve_layout.blocks
-                          if b.kind == "pose"]
+                          if b.kind == "pose" and b not in past_window]
             converged = (iteration + 1 >= self.min_iterations
                          and max(np.linalg.norm(s[:3]) for s in pose_steps) < self.rotation_stop
                          and max(np.linalg.norm(s[3:]) for s in pose_steps) < self.translation_stop)
