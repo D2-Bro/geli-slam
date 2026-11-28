@@ -34,7 +34,12 @@ def test_global_navigation_loop_can_update_roll_pitch_in_tilted_world_axes(world
     assert graph.add_loop(0, 2, np.linalg.inv(measured))
     graph.solve()
     assert graph.last_final_cost < graph.last_initial_cost
-    np.testing.assert_allclose(graph.map_poses()[0], local[0], atol=1e-14)
+    # Root (default root_tilt_sigma_rad): position and rotation about the
+    # vertical hold exactly; the tilt has a prior and can move.
+    root = graph.map_poses()[0]
+    np.testing.assert_allclose(root[:3, 3], local[0][:3, 3], atol=1e-10)
+    root_change = gtsam.Rot3.Logmap(gtsam.Rot3(root[:3, :3] @ local[0][:3, :3].T))
+    assert abs(up @ root_change) < 1e-9
     assert np.linalg.norm(graph.corrections[2][:3, :3] @ up - up) > 1e-4
     for key, (pose, corrected) in enumerate(zip(local, graph.map_poses())):
         assert graph.graph_result.atPose3(key).matrix().shape == (4, 4)

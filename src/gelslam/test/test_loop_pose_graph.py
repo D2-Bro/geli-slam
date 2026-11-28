@@ -370,7 +370,9 @@ def _tilt_and_yaw(rotation, reference):
 
 
 def test_root_tilt_prior_lets_imu_factors_correct_the_first_pose_tilt():
-    fixed, true_pose, seed = _tilted_stationary_graph()
+    # null: 6-DOF root equality. The tilt error of the seeds stays.
+    fixed, true_pose, seed = _tilted_stationary_graph(root_tilt_sigma_rad=None)
+    assert fixed.root_tilt_sigma is None
     fixed.solve()
     assert type(fixed.graph.at(0)).__name__ == 'NonlinearEqualityPose3'
     np.testing.assert_allclose(fixed.map_poses()[0], seed, atol=1e-12)
@@ -429,7 +431,12 @@ def test_root_tilt_factor_jacobian_matches_finite_differences():
     np.testing.assert_allclose(error(gtsam.Pose3(seed @ graph.extrinsic))[0], 0., atol=1e-12)
 
 
-def test_root_tilt_sigma_requires_imu_factors():
+def test_root_tilt_sigma_default_and_imu_factor_requirement():
+    # Default with IMU factors: tilt prior 0.01 rad. Pose-only: fixed root.
+    assert LoopPoseGraph({}).root_tilt_sigma == .01
+    assert LoopPoseGraph({'root_tilt_sigma_rad': None}).root_tilt_sigma is None
+    assert LoopPoseGraph({'imu_factors': False,
+                          'recovery_odometry_translation_sigma_m': .001}).root_tilt_sigma is None
     with pytest.raises(ValueError, match='root_tilt_sigma_rad requires imu_factors'):
         LoopPoseGraph({'imu_factors': False, 'recovery_odometry_translation_sigma_m': .001,
                        'root_tilt_sigma_rad': .01})

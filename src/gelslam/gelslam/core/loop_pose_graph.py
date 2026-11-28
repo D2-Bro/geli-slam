@@ -16,10 +16,10 @@ measurements are BetweenFactorPose3, the root of a trial group holds its anchor
 pose with NonlinearEqualityPose3, and the IMU option adds gtsam.ImuFactor, bias
 random-walk and velocity/bias priors on the same keys.
 gtsam.LevenbergMarquardtOptimizer solves it (max_iterations).
-pose_graph_config.root_tilt_sigma_rad (imu_factors true only) replaces the 6-DOF
-root equality: the GelSight position and the rotation about the vertical stay
-exact, the tilt gets a Gaussian prior, so the gravity in the IMU factors can
-correct the root tilt.
+With imu_factors true, pose_graph_config.root_tilt_sigma_rad (default 0.01 rad)
+replaces the 6-DOF root equality: the GelSight position and the rotation about
+the vertical stay exact, the tilt gets a Gaussian prior, so the gravity in the
+IMU factors can correct the root tilt. null keeps the 6-DOF equality.
 """
 import gtsam
 import numpy as np
@@ -47,19 +47,21 @@ class LoopPoseGraph:
                                  'link would have no factor')
             self.degrees_of_freedom = 6
         # root_tilt_sigma_rad: constraint on the root keyframe of a trial group.
-        #   null (default): the root holds its anchor pose exactly (6 DOF).
-        #   sigma [rad]: the root GelSight position and its rotation about the
-        #   vertical hold exactly (4 DOF; these are not observable). The tilt has a
-        #   Gaussian prior with this sigma at the anchor tilt. The gravity in the
-        #   IMU factors can then correct a tilt error of the first pose.
-        # A pose-only graph has no gravity measurement, so the option needs
-        # imu_factors true.
+        #   sigma [rad] (imu_factors true; default 0.01): the root GelSight
+        #   position and its rotation about the vertical hold exactly (4 DOF;
+        #   these are not observable). The tilt has a Gaussian prior with this
+        #   sigma at the anchor tilt. The gravity in the IMU factors can then
+        #   correct a tilt error of the first pose.
+        #   null: the root holds its anchor pose exactly (6 DOF).
+        # A pose-only graph has no gravity measurement: with imu_factors false
+        # the root is always fixed (6 DOF) and a sigma is an error.
         self.root_tilt_sigma = None
-        if self.config.get('root_tilt_sigma_rad') is not None:
-            if not self.imu_factors:
-                raise ValueError('pose_graph_config.root_tilt_sigma_rad requires imu_factors '
-                                 'true: a pose-only graph does not observe the root tilt')
-            self.root_tilt_sigma = self._positive('root_tilt_sigma_rad', .01)
+        if self.imu_factors:
+            if self.config.get('root_tilt_sigma_rad', .01) is not None:
+                self.root_tilt_sigma = self._positive('root_tilt_sigma_rad', .01)
+        elif self.config.get('root_tilt_sigma_rad') is not None:
+            raise ValueError('pose_graph_config.root_tilt_sigma_rad requires imu_factors '
+                             'true: a pose-only graph does not observe the root tilt')
         # Optional backend-only IMU integration sigma (default: imu_config value).
         # A stiff frontend integration sigma (0.001) made each first global solve
         # move whole trajectories to absorb stale keyframe velocities.

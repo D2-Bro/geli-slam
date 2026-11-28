@@ -295,25 +295,28 @@ gelslam_config:
     # group are excluded. 1 and true: original GelSLAM (10 and false until 2026-11-27).
     loop_search_exclude_recent_keyframes: 1
     loop_search_exclude_same_trial_only: true
+    # true: 15D global graph (IMU pose, velocity, biases per keyframe) with IMU
+    # and bias random-walk factors; the root uses root_tilt_sigma_rad.
     # false: pose-only global graph. No IMU factor, bias random-walk factor,
     # velocity/bias variable or velocity/bias prior; contact odometry, recovery
-    # odometry and loops remain. Offline batch ablation on 12 real-objects graphs
-    # (keyframe RMSE): with IMU 2.54 mm, without 2.59 mm
-    # (output/real_batch_20261030/BK_dump_20261120/backend_ablation_30_*.json).
-    # Requires recovery_odometry_translation_sigma_m. true restores the 15D graph;
-    # the next four keys and imu_integration_sigma_m are then used again.
-    imu_factors: false
+    # odometry and loops remain; requires recovery_odometry_translation_sigma_m.
+    # Batch solve of the 12 real-objects backend graphs of main 8e3d6160
+    # (keyframe RMSE / MAE; output/real_batch_20261030/GTN_20261128/bk_gtsam/
+    # root_tilt_check.json): false 2.76 / 1.20 mm, true with fixed root
+    # 2.66 / 1.16 mm, true with root tilt sigma 0.01 rad 2.65 / 1.16 mm.
+    imu_factors: true
     # IMU/bias noise densities use imu_config; reject uncovered/gapped intervals.
     imu_max_sample_gap_s: 0.05
     initial_velocity_sigma_mps: 0.1
     initial_accel_bias_sigma_mps2: 0.1
     initial_gyro_bias_sigma_rps: 0.01
-    # Root keyframe of a trial group. null: the root holds its anchor pose
-    # exactly (6 DOF). A sigma [rad] (imu_factors true only): position and
-    # rotation about the vertical hold exactly; the tilt has a Gaussian prior at
-    # the anchor tilt, so the gravity in the IMU factors can correct the tilt of
-    # the first pose. Not allowed with imu_factors false.
-    root_tilt_sigma_rad: null
+    # Root keyframe of a trial group (imu_factors true). A sigma [rad]: the
+    # GelSight position and the rotation about the vertical hold exactly; the
+    # tilt has a Gaussian prior at the anchor tilt, so the gravity in the IMU
+    # factors can correct the tilt of the first pose. null: the root holds its
+    # anchor pose exactly (6 DOF). With imu_factors false the root is always
+    # fixed and a sigma is an error.
+    root_tilt_sigma_rad: 0.01
     max_iterations: 10
     coverage_graph_overlap_threshold: 50
     # Loop search skips references that the coverage graph deactivated (covered by
